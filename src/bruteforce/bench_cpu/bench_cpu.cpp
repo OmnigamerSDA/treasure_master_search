@@ -7,7 +7,8 @@
 //   nway             tm_8 N-way interleaved (NWAY_BATCH candidates in lockstep)
 //   avx_r128s_8      tm_avx_r128s_8 (AVX1, 128-bit; historically fastest on Intel)
 //   avx_r256s_8      tm_avx_r256s_8 (AVX1, 256-bit)
-//   avx2_r256s_8     tm_avx2_r256s_8 (AVX2, 256-bit; fastest on Zen 5)
+//   avx2_r256s_8     tm_avx2_r256s_8 (AVX2, 256-bit universal-table kernel)
+//   avx2_r256_map_8  tm_avx2_r256_map_8 (AVX2, 256-bit map-mode kernel)
 //   avx512_r512s_8   tm_avx512_r512s_8 (AVX-512, 512-bit; viable on Sapphire Rapids+)
 //
 // Legacy flags --avx2 and --nway are kept as aliases for "--impl avx2_r256s_8"
@@ -36,6 +37,7 @@
 #include "../cpu/tm_avx_r128s_8.h"
 #include "../cpu/tm_avx_r256s_8.h"
 #include "../cpu/tm_avx2_r256s_8.h"
+#include "../cpu/tm_avx2_r256_map_8.h"
 #include "../cpu/tm_avx512_r512s_8.h"
 
 namespace
@@ -52,6 +54,7 @@ namespace
         AvxR128s,
         AvxR256s,
         Avx2R256s,
+        Avx2R256Map,
         Avx512R512s,
     };
 
@@ -63,6 +66,7 @@ namespace
             case Impl::AvxR128s:    return "tm_avx_r128s_8";
             case Impl::AvxR256s:    return "tm_avx_r256s_8";
             case Impl::Avx2R256s:   return "tm_avx2_r256s_8";
+            case Impl::Avx2R256Map: return "tm_avx2_r256_map_8";
             case Impl::Avx512R512s: return "tm_avx512_r512s_8";
         }
         return "?";
@@ -75,6 +79,7 @@ namespace
         if (s == "avx_r128s_8")     return Impl::AvxR128s;
         if (s == "avx_r256s_8")     return Impl::AvxR256s;
         if (s == "avx2_r256s_8")    return Impl::Avx2R256s;
+        if (s == "avx2_r256_map_8") return Impl::Avx2R256Map;
         if (s == "avx512_r512s_8")  return Impl::Avx512R512s;
         throw std::runtime_error("Unknown --impl value: " + s);
     }
@@ -140,6 +145,7 @@ namespace
                     << "                          avx_r128s_8\n"
                     << "                          avx_r256s_8\n"
                     << "                          avx2_r256s_8\n"
+                    << "                          avx2_r256_map_8 (port of micro500 map-mode kernel)\n"
                     << "                          avx512_r512s_8\n"
                     << "  --avx2                legacy alias for --impl avx2_r256s_8\n"
                     << "  --nway                legacy alias for --impl nway\n";
@@ -301,6 +307,11 @@ namespace
             }
             case Impl::Avx2R256s: {
                 tm_avx2_r256s_8 tm(rng);
+                native_screen_worker(tm, key_id, warmup_start, warmup_count, timed_start, timed_count, schedule, bar, out);
+                break;
+            }
+            case Impl::Avx2R256Map: {
+                tm_avx2_r256_map_8 tm(rng);
                 native_screen_worker(tm, key_id, warmup_start, warmup_count, timed_start, timed_count, schedule, bar, out);
                 break;
             }

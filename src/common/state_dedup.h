@@ -152,8 +152,19 @@ void forward_block_with_dedup(
     std::uint32_t window,
     const key_schedule& schedule,
     FlatTable& out_table,
-    FlatTable& scratch_table)
+    FlatTable& scratch_table,
+    std::uint32_t dedup_every_maps = 1)
 {
+    if (dedup_every_maps == 0) dedup_every_maps = 1;
+
+    // Optional hook for impls that precompute per-schedule data (map-mode
+    // kernel). No-op for universal-table impls. Passes the parent schedule
+    // so the impl can compute map_idx from entry pointer arithmetic in the
+    // run_one_map loop below.
+#ifndef DEDUP_NO_BIND_SCHEDULE
+    tm.bind_schedule(schedule);
+#endif
+
     // Build initial frontier from window consecutive expand() calls.
     out_table.reset(window);
     for (std::uint32_t i = 0; i < window; i++)
@@ -162,21 +173,28 @@ void forward_block_with_dedup(
         out_table.insert(tm.state_raw(), 1u);
     }
 
-    // Advance through each schedule boundary, double-buffering between
-    // out_table (current frontier) and scratch_table (next frontier).
-    for (auto entry_it = schedule.entries.begin();
-         entry_it != schedule.entries.end();
-         ++entry_it)
+    // Advance through schedule boundaries, double-buffering between out_table
+    // (current frontier) and scratch_table (next frontier). The default
+    // dedup_every_maps=1 dedups after every map. Larger values run multiple
+    // maps before the next merge, which trades less hash-table work for less
+    // intermediate collision collapse.
+    for (std::size_t entry_idx = 0; entry_idx < schedule.entries.size(); )
     {
+        const std::size_t group_end = std::min<std::size_t>(
+            schedule.entries.size(), entry_idx + dedup_every_maps);
         scratch_table.reset(static_cast<std::uint32_t>(out_table.pool.size()));
         for (std::size_t pi = 0; pi < out_table.pool.size(); pi++)
         {
             const FlatTable::Entry& entry = out_table.pool[pi];
             tm.load_state_raw(entry.state.data());
-            tm.run_one_map(*entry_it);
+            for (std::size_t map_idx = entry_idx; map_idx < group_end; map_idx++)
+            {
+                tm.run_one_map(schedule.entries[map_idx]);
+            }
             scratch_table.insert(tm.state_raw(), entry.multiplicity);
         }
         std::swap(out_table, scratch_table);
+        entry_idx = group_end;
     }
 }
 
@@ -189,11 +207,12 @@ inline void forward_block_with_dedup(
     std::uint32_t data_start,
     std::uint32_t window,
     const key_schedule& schedule,
-    FlatTable& out_table)
+    FlatTable& out_table,
+    std::uint32_t dedup_every_maps = 1)
 {
     FlatTable scratch;
     forward_block_with_dedup(tm, key, data_start, window, schedule,
-                             out_table, scratch);
+                             out_table, scratch, dedup_every_maps);
 }
 
 } // namespace state_dedup

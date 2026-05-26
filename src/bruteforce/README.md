@@ -44,13 +44,13 @@ Primary current CPU implementation:
 
 ```sh
 ./src/bruteforce/bench_cpu/bench_cpu \
-  --impl avx2_r256s_8 --threads 1 --workunit_size 1048576
+  --impl avx2_r256_map_8 --threads 1 --workunit_size 1048576
 ```
 
 Recent release-candidate profiling on a Ryzen 9 9900X measured roughly
-`0.52 M candidates/s/thread` for the production non-dedup AVX2 screen path.
-Scaling remains useful through high concurrency, but per-thread throughput
-falls after about 8 to 12 threads from shared cache/table pressure.
+`0.55 M candidates/s/thread` for the production non-dedup AVX2 map screen
+path. Scaling remains useful through high concurrency, but per-thread
+throughput falls after about 8 to 12 threads from shared cache/table pressure.
 
 The CPU state-dedup route is useful when many data values converge to the
 same final states. The fast production shape is:
@@ -64,7 +64,20 @@ This tool runs flat/no-origin dedup, screens unique final states for checksum
 and machine-code flags, and reports both unique-state counts and original
 multiplicity counts. Use `--strict-invalid-mask` to control which flags
 disqualify a strict `ALL_ENTRIES_VALID` result. The default rejects
-unofficial NOPs, illegal opcodes, and JAM.
+unofficial NOPs, illegal opcodes, and JAM. The current flat-dedup winner is
+the AVX2 r256s kernel, not the map kernel. On a 512-key representative sample,
+flat/no-origin dedup plus full flag screening measured 6.373 M candidates/s
+total on 12 Ryzen 9 9900X threads at window 4096, about 0.531 M/s/thread.
+`--dedup-every-maps 2` is available as a tuning knob for large-window/high-
+concurrency runs, while the default `1` dedups after every schedule entry.
+
+Window size is the primary throughput/coverage tradeoff. `--window 4096` is
+the conservative general-purpose setting. A fixed-work sweep over 64 sampled
+CNF-forward keys found the best observed 12-thread throughput at
+`--window 65536`, around 9.0-9.5 M candidates/s total, but larger windows did
+not keep improving. Use 4096 for the most tested baseline; use 65536 as the
+first larger-window trial when CPU throughput matters and the workload is
+similar to the sampled candidate-key distribution.
 
 Origin tracking is available separately:
 

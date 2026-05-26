@@ -10,6 +10,19 @@ L3, GCC with `-O3 -march=native -mtune=native`.
 
 ## CPU Forward Profiling
 
+Update from the 2026-05-26 AVX2 map-kernel followup: for plain non-dedup
+`run_bruteforce_data` screening, `tm_avx2_r256_map_8` should be included in
+comparisons and is the current AVX2 contender after the dispatch-switch fix.
+The `0.67+ M/s/thread` rows below are state-dedup/windowed measurements, not a
+separate plain forward implementation.
+
+Final 2026-05-26 cleanup note: `tm_avx2_r256_map_8` is the recommended
+plain/non-dedup CPU sweep path. The state-dedup winner remains the flat AVX2
+r256s path; the map kernel was exposed in the dedup matrix for comparison but
+did not beat r256s there. The remaining plausible CPU-side improvement with
+more than low-single-digit upside is boundary/interleaving work, which is
+invasive enough that it should not block this release candidate.
+
 Hardware-counter profiling was run with `perf_event_paranoid=1`, using
 `perf stat -d` and sampled `perf record` on the AVX2 native screen path.
 
@@ -80,6 +93,9 @@ Individual follow-up experiments:
 | PGO build target | 0.563 M/s/thread on range 0; 0.349 M/s/thread on high-hit range; 0.556 M/s/thread on 4M range | Positive; available via `make pgo` in `src/bruteforce/bench_cpu` |
 | Linux `MADV_HUGEPAGE` for large aligned allocations | 0.523 M/s/thread; dTLB miss rate fell from 2.92% to 0.52% | Promoted |
 | Direct AVX2 checksum-byte extraction | 0.459 M/s/thread on 4M run | Negative/noisy; reverted |
+| AVX2 map-mode port + switch dispatch | about 0.55 M/s/thread on plain 4M sweeps | Promoted for plain non-dedup CPU sweeps |
+| Dedup every-K-maps merge knob | K=2 modestly helped large-window/high-concurrency runs; K>=4 was negative | Keep as `--dedup-every-maps`, default `1` |
+| Dedup prefetch and alg0/alg6 bit packing | neutral or slower | Reverted from release code |
 
 Correctness checks performed:
 
@@ -190,6 +206,12 @@ Larger-window AVX2 flat-dedup smoke, 64 random CNF-FP keys, parity matched:
 | 8192 | 0.705 | 2.412x | 0.279 | 7 |
 | 16384 | 0.706 | 2.564x | 0.267 | 40 |
 
+The flat dedup driver also exposes `--dedup-every-maps N`, which merges the
+frontier every N schedule entries instead of after every entry. Testing showed
+K=2 can give a small throughput bump on larger windows at higher concurrency,
+but K>=4 loses too much collision collapse. Keep the default at K=1 and treat
+K=2 as a workload/hardware tuning option.
+
 Origin-tracking smoke on 16 random CNF-FP keys, all origins verified:
 
 | Window | Median M/s/thread | Median final unique/window | Best-window count |
@@ -235,6 +257,26 @@ Representative flat/no-origin screen sweep, 512 random CNF-FP keys,
 | 8192 | 16 | 6.869 | 0.572 | 21,038,540 | 638 | 1,581 | 2 | 3 | 2 |
 | 16384 | 8 | 7.334 | 0.611 | 19,321,421 | 598 | 1,581 | 2 | 3 | 2 |
 
+Superwindow no-origin screen sweep, 64 random CNF-FP keys, same first
+1,048,576 data values per key for every row, 67,108,864 original candidates
+per row, 12 threads:
+
+| Window | Windows/key | Total M/s | M/s/thread | Unique states | Unique/candidate | Checksum unique | Checksum windows | All-entries windows |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4096 | 256 | 6.905 | 0.575 | 21,297,469 | 0.317 | 722 | 683 | 0 |
+| 16384 | 64 | 7.576 | 0.631 | 18,798,581 | 0.280 | 628 | 554 | 0 |
+| 65536 | 16 | 9.450 | 0.787 | 13,173,192 | 0.196 | 442 | 319 | 0 |
+| 131072 | 8 | 8.997 | 0.750 | 12,081,964 | 0.180 | 396 | 233 | 0 |
+| 262144 | 4 | 8.320 | 0.693 | 11,485,476 | 0.171 | 374 | 157 | 0 |
+| 524288 | 2 | 7.670 | 0.639 | 11,185,543 | 0.167 | 362 | 97 | 0 |
+| 1048576 | 1 | 6.782 | 0.565 | 10,917,315 | 0.163 | 351 | 55 | 0 |
+
+This shows real cross-window collapse: the same candidate span drops from
+31.7% unique final states at 4096 to 19.6% at 65536 and 16.3% at 1048576.
+Throughput peaks around 65536 in this no-origin run; beyond that, larger
+tables continue reducing duplicate state work but lose enough locality and
+scheduling granularity to fall back toward the default-window rate.
+
 Longer default-window screen sweep, 512 random CNF-FP keys, window 4096,
 128 windows/key, 268,435,456 original candidates, 12 threads:
 
@@ -269,12 +311,13 @@ non-dedup scan to recover exact `key,data,flags` records.
 Interpretation: dynamic window sizing is worth considering, but not as a
 release-candidate default. `4096` remains the conservative trusted default:
 it is good across the representative distribution and keeps memory, origin
-lists, latency, and scheduling granularity bounded. Some high-collapse keys
-benefit from `8192` or `16384`, but the gain is not monotonic; origin-list
-cost can erase the flat-dedup win. A future adaptive router should first run
-a cheap probe window, estimate collapse rate and origin fanout, and only
-promote a key to a larger window when the probe predicts a clear margin over
-the default.
+lists, latency, and scheduling granularity bounded. The no-origin superwindow
+probe found a stronger flat-screen knee around `65536`, so a future adaptive
+router should first run a cheap probe window, estimate collapse rate and
+origin fanout, and only promote a key to a larger window when the probe
+predicts a clear margin over the default. Before changing production defaults,
+the `65536` candidate should be retested on a broader key sample and with the
+origin-replay path included for strict-passing windows.
 
 ## GPU Forward Status
 

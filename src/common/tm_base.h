@@ -53,6 +53,12 @@ public:
 
 	virtual void run_all_maps(const key_schedule& schedule_entries) = 0;
 
+	// Optional hook: impls that precompute per-schedule data (e.g. the map-mode
+	// kernel's per-seed RNG tables) can override this to do that work once,
+	// outside the dedup hot loop. Default is a no-op for impls that read state
+	// directly from universal tables on each alg call.
+	virtual void bind_schedule(const key_schedule& /*schedule_entries*/) {}
+
 	virtual void run_bruteforce_data(uint32 key, uint32 data, const key_schedule& schedule_entries, uint32 amount_to_run, void(*report_progress)(double), uint8* result_data, uint32 result_max_size, uint32* result_size);
 
 	void print_working_code();

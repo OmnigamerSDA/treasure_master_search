@@ -33,6 +33,7 @@ struct Args
     uint32 data_start = 0;
     uint32 window = 4096;
     uint32 windows_per_key = 1;
+    uint32 dedup_every_maps = 1;
     uint8 strict_invalid_mask = USES_UNOFFICIAL_NOPS | USES_ILLEGAL_OPCODES | USES_JAM;
     int threads = 1;
     std::size_t limit = 0;
@@ -62,6 +63,7 @@ Args parse_args(int argc, char** argv)
         else if (s == "--data-start")      a.data_start = parse_u<uint32>(nxt(i, "--data-start"));
         else if (s == "--window")          a.window = parse_u<uint32>(nxt(i, "--window"));
         else if (s == "--windows-per-key") a.windows_per_key = parse_u<uint32>(nxt(i, "--windows-per-key"));
+        else if (s == "--dedup-every-maps") a.dedup_every_maps = parse_u<uint32>(nxt(i, "--dedup-every-maps"));
         else if (s == "--strict-invalid-mask") a.strict_invalid_mask = parse_u<uint8>(nxt(i, "--strict-invalid-mask"));
         else if (s == "--threads")         a.threads = std::stoi(nxt(i, "--threads"));
         else if (s == "--limit")           a.limit = static_cast<std::size_t>(std::stoull(nxt(i, "--limit")));
@@ -81,6 +83,7 @@ Args parse_args(int argc, char** argv)
                 << "  --limit N                maximum keys from --keys\n"
                 << "  --window N               data values per dedup block\n"
                 << "  --windows-per-key N      consecutive windows sampled per key\n"
+                << "  --dedup-every-maps N     merge frontier every N schedule entries (default 1)\n"
                 << "  --strict-invalid-mask N   flags rejected for strict all-entry count\n"
                 << "  --threads N\n"
                 << "  --data-start UINT32\n"
@@ -92,6 +95,7 @@ Args parse_args(int argc, char** argv)
     }
     if (a.window == 0) throw std::runtime_error("--window must be > 0");
     if (a.windows_per_key == 0) throw std::runtime_error("--windows-per-key must be > 0");
+    if (a.dedup_every_maps == 0) throw std::runtime_error("--dedup-every-maps must be > 0");
     if (a.threads < 1) throw std::runtime_error("--threads must be >= 1");
     return a;
 }
@@ -329,7 +333,7 @@ Counts run_sweep(const Args& a, const std::vector<uint32>& keys, std::vector<Win
 
                 const auto w0 = std::chrono::high_resolution_clock::now();
                 state_dedup::forward_block_with_dedup(
-                    tm, key, start, a.window, schedule, out, scratch);
+                    tm, key, start, a.window, schedule, out, scratch, a.dedup_every_maps);
                 Counts wc = screen_table(tm, out, a.strict_invalid_mask);
                 wc.windows = 1;
                 wc.candidates = a.window;
@@ -385,6 +389,7 @@ void print_summary(const Args& a, const std::vector<uint32>& keys, const Counts&
     std::cout << "  keys:                 " << keys.size() << "\n";
     std::cout << "  window:               " << a.window << "\n";
     std::cout << "  windows/key:          " << a.windows_per_key << "\n";
+    std::cout << "  dedup every maps:     " << a.dedup_every_maps << "\n";
     std::cout << "  threads:              " << a.threads << "\n";
     std::cout << "  windows:              " << c.windows << "\n";
     std::cout << "  candidates:           " << c.candidates << "\n";

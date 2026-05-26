@@ -37,7 +37,7 @@ CPU:
 
 ```sh
 ./src/bruteforce/bench_cpu/bench_cpu \
-  --impl avx2_r256s_8 --threads 1 --workunit_size 1048576
+  --impl avx2_r256_map_8 --threads 1 --workunit_size 1048576
 ```
 
 CPU flat-dedup screen:
@@ -78,15 +78,29 @@ small local checks but can understate full-key production throughput.
 | OpenCL | RTX 5090, `--ilp6` | 86.5 M/s | ~50 s | 74.9 M/s |
 | OpenCL | RTX 5090, baseline | 37.0 M/s | ~1.9 min | 33.4 M/s |
 | OpenCL | RTX PRO 6000 Blackwell Max-Q, `--ilp6` | 72.2 M/s | ~60 s | ~62 M/s |
-| CPU AVX2 | Ryzen 9 9900X, 24 threads, non-dedup | 7.406 M/s | ~9.7 min | same |
-| CPU AVX2 | Ryzen 9 9900X, 12 threads, non-dedup | 5.440 M/s | ~13.2 min | same |
-| CPU AVX2 | Ryzen 9 9900X, 1 thread, non-dedup | 0.520 M/s | ~2.3 h | same |
+| CPU AVX2 flat dedup | Ryzen 9 9900X, 12 threads, window 4096 | 6.373 M/s (~0.531/thread) | distribution-dependent | same |
+| CPU AVX2 flat dedup | Ryzen 9 9900X, 12 threads, window 65536 | ~9.0-9.5 M/s (~0.75-0.79/thread) | distribution-dependent | same |
+| CPU AVX2 map | Ryzen 9 9900X, 24 threads, non-dedup | ~7.2 M/s | ~9.9 min | same |
+| CPU AVX2 map | Ryzen 9 9900X, 12 threads, non-dedup | ~5.1 M/s | ~14.1 min | same |
+| CPU AVX2 map | Ryzen 9 9900X, 1 thread, non-dedup | ~0.55 M/s | ~2.2 h | same |
 
 CPU state dedup is key-distribution dependent. On a 512-key representative
 sample from prior forward-search candidates, flat/no-origin dedup plus full
-flag screening measured 6.373 M/s on 12 threads at window 4096. Use it as a
-routing/screening tool, not as a universal replacement for the GPU full-key
-sweep.
+flag screening measured 6.373 M/s on 12 threads at window 4096. This is the
+main CPU path to try for candidate routing because it avoids replaying
+duplicate final states. Use it as a routing/screening tool, not as a universal
+replacement for the GPU full-key sweep. The flat dedup path uses the AVX2
+r256s kernel; `--dedup-every-maps 2` can help modestly on larger windows/high
+thread counts, while the default of `1` is the conservative setting.
+
+Window size is the main CPU dedup tuning knob. `--window 4096` is the
+conservative default used for broad representative testing. In a fixed-work
+sweep over 64 sampled CNF-forward keys, larger windows improved throughput up
+to `--window 65536`, which measured about 9.0-9.5 M/s total on 12 Ryzen 9
+9900X threads. Larger windows were not monotonically better: 131072 remained
+strong, while 262144 and above slowed back down. For general operation, start
+with 4096 when you want the most trusted behavior, and try 65536 when you want
+maximum CPU throughput on a representative batch for the same workload.
 
 ## Layout
 

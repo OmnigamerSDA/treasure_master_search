@@ -15,7 +15,8 @@
 //   tm_8                  scalar reference
 //   tm_avx_r128s_8        128-bit AVX, narrow (X3D-friendly)
 //   tm_avx_r256s_8        256-bit AVX without AVX2
-//   tm_avx2_r256s_8       256-bit AVX2 (Zen 5 winner per 5/23 audit)
+//   tm_avx2_r256s_8       256-bit AVX2 universal-table kernel
+//   tm_avx2_r256_map_8    256-bit AVX2 map-mode kernel
 //   tm_avx512_r512s_8     512-bit AVX-512 (Sapphire/Granite Rapids target)
 
 #include "rng_obj.h"
@@ -27,6 +28,7 @@
 #include "../cpu/tm_avx_r128s_8.h"
 #include "../cpu/tm_avx_r256s_8.h"
 #include "../cpu/tm_avx2_r256s_8.h"
+#include "../cpu/tm_avx2_r256_map_8.h"
 #include "../cpu/tm_avx512_r512s_8.h"
 
 #include <algorithm>
@@ -156,7 +158,7 @@ Args parse_args(int argc, char** argv)
     if (a.keys_path.empty()) throw std::runtime_error("--keys required");
     if (a.out_path.empty())  throw std::runtime_error("--out required");
     if (a.windows.empty())   throw std::runtime_error("--windows required");
-    if (a.impls.empty())     a.impls = {"tm_8", "tm_avx_r128s_8", "tm_avx_r256s_8", "tm_avx2_r256s_8", "tm_avx512_r512s_8"};
+    if (a.impls.empty())     a.impls = {"tm_8", "tm_avx_r128s_8", "tm_avx_r256s_8", "tm_avx2_r256s_8", "tm_avx2_r256_map_8", "tm_avx512_r512s_8"};
     return a;
 }
 
@@ -290,6 +292,11 @@ int main(int argc, char** argv)
             else if (impl_name == "tm_avx2_r256s_8")
             {
                 tm_avx2_r256s_8 tm(&rng);
+                bench_impl(impl_name, tm, keys, windows_sorted, a.data_start, a.repeats, a.map_kind, out, parity_mismatches);
+            }
+            else if (impl_name == "tm_avx2_r256_map_8")
+            {
+                tm_avx2_r256_map_8 tm(&rng);
                 bench_impl(impl_name, tm, keys, windows_sorted, a.data_start, a.repeats, a.map_kind, out, parity_mismatches);
             }
             else if (impl_name == "tm_avx512_r512s_8")
