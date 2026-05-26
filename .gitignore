@@ -1,0 +1,46 @@
+# Build artifacts
+build/
+*.o
+*.obj
+*.fatbin
+*.exe
+*.exp
+*.lib
+*.pdb
+*.ilk
+*.idb
+*.dll
+*.so
+*.dylib
+*.a
+tm_cuda
+tm_opencl_forward
+
+# Profiler outputs
+*.ncu-rep
+*.nsys-rep
+*.qdrep
+*.sqlite
+
+# IDE / editor
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local results that shouldn't be committed
+results/
+common/results/
+common/reverse_outputs/
+artifacts/
