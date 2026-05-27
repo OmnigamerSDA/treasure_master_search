@@ -27,6 +27,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
+#include <cstddef>
 #include <vector>
 
 #include "data_sizes.h"
@@ -97,6 +98,48 @@ struct Tables
         for (int i = 0; i < n; i++)
             nibble_selectors[i] = schedule_entries.entries[i].nibble_selector;
         entries_data = schedule_entries.entries.data();
+    }
+
+    void bind_range(RNG* rng, const key_schedule& schedule_entries, std::size_t begin, std::size_t end)
+    {
+        if (begin > schedule_entries.entries.size()) begin = schedule_entries.entries.size();
+        if (end > schedule_entries.entries.size()) end = schedule_entries.entries.size();
+        if (end < begin) end = begin;
+        const int n = static_cast<int>(end - begin);
+
+        bool changed = (n != entry_count) || (static_cast<int>(seeds.size()) != n);
+        if (!changed) {
+            for (int i = 0; i < n; i++) {
+                const auto& e = schedule_entries.entries[begin + static_cast<std::size_t>(i)];
+                uint16 s = static_cast<uint16>((e.rng1 << 8) | e.rng2);
+                if (seeds[i] != s) { changed = true; break; }
+            }
+        }
+
+        if (changed) {
+            if (static_cast<size_t>(n) > capacity_entries) {
+                std::free(reg_table);  std::free(alg0_table);  std::free(alg6_table);
+                if (posix_memalign((void**)&reg_table,  32, n * 2048) != 0) reg_table  = nullptr;
+                if (posix_memalign((void**)&alg0_table, 32, n * ALG06_BYTES_PER_ENTRY) != 0) alg0_table = nullptr;
+                if (posix_memalign((void**)&alg6_table, 32, n * ALG06_BYTES_PER_ENTRY) != 0) alg6_table = nullptr;
+                capacity_entries = static_cast<size_t>(n);
+            }
+            seeds.resize(n);
+            for (int i = 0; i < n; i++) {
+                const auto& e = schedule_entries.entries[begin + static_cast<std::size_t>(i)];
+                uint16 s = static_cast<uint16>((e.rng1 << 8) | e.rng2);
+                seeds[i] = s;
+                generate_regular_rng_values_for_seed_8(reg_table  + i * 2048, s, rng->rng_table);
+                generate_alg0_values_for_seed_8(alg0_table + i * ALG06_BYTES_PER_ENTRY, s, rng->rng_table);
+                generate_alg6_values_for_seed_8(alg6_table + i * ALG06_BYTES_PER_ENTRY, s, rng->rng_table);
+            }
+            entry_count = n;
+        }
+
+        nibble_selectors.resize(n);
+        for (int i = 0; i < n; i++)
+            nibble_selectors[i] = schedule_entries.entries[begin + static_cast<std::size_t>(i)].nibble_selector;
+        entries_data = schedule_entries.entries.data() + begin;
     }
 };
 

@@ -10,6 +10,7 @@
 #include <immintrin.h>
 
 #include <cstdint>
+#include <cstddef>
 #include <vector>
 
 #include "data_sizes.h"
@@ -50,7 +51,10 @@ public:
 
 	void run_one_map(const key_schedule::key_schedule_entry& schedule_entry) override;
 	void run_all_maps(const key_schedule& schedule_entries) override;
+	void run_maps_range(const key_schedule& schedule_entries, std::size_t begin, std::size_t end);
 	void bind_schedule(const key_schedule& schedule_entries) override;
+	void bind_dedup_schedule(const key_schedule& schedule_entries);
+	void bind_maps_range(const key_schedule& schedule_entries, std::size_t begin, std::size_t end);
 
 	// state_dedup interface (compile-time concept; no virtual). The map kernel
 	// uses natural layout, so state_raw bytes are the canonical 128-byte state.
@@ -86,6 +90,7 @@ private:
 	              const uint8* reg_base, const uint8* alg0_base, const uint8* alg6_base);
 
 	void _run_one_map(__m256i& wc0, __m256i& wc1, __m256i& wc2, __m256i& wc3, int map_idx);
+	void _run_maps_fixed(__m256i& wc0, __m256i& wc1, __m256i& wc2, __m256i& wc3, int map_idx, int count);
 	void _run_all_maps(__m256i& wc0, __m256i& wc1, __m256i& wc2, __m256i& wc3);
 
 	void _load_from_mem(__m256i& wc0, __m256i& wc1, __m256i& wc2, __m256i& wc3);

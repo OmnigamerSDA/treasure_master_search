@@ -61,6 +61,40 @@ void tm_avx2_r256_map_8::bind_schedule(const key_schedule& schedule_entries)
     _bind_schedule(schedule_entries);
 }
 
+void tm_avx2_r256_map_8::bind_dedup_schedule(const key_schedule& /*schedule_entries*/)
+{
+    // Dedup calls run_maps_range() for every checkpoint group. In owned-table
+    // mode that method binds only the requested range, avoiding an upfront
+    // full-schedule table build for sparse checkpoint policies.
+    if (_shared != nullptr)
+    {
+        // Shared-table mode still expects the caller-provided table to be bound.
+        return;
+    }
+}
+
+void tm_avx2_r256_map_8::bind_maps_range(const key_schedule& schedule_entries, std::size_t begin, std::size_t end)
+{
+    if (end > schedule_entries.entries.size())
+        end = schedule_entries.entries.size();
+    if (begin > end)
+        begin = end;
+
+    if (_shared == nullptr)
+    {
+        _owned.bind_range(rng, schedule_entries, begin, end);
+    }
+    else
+    {
+        const auto& t = _t();
+        if (t.entries_data != schedule_entries.entries.data() ||
+            t.entry_count != static_cast<int>(schedule_entries.entries.size()))
+        {
+            _bind_schedule(schedule_entries);
+        }
+    }
+}
+
 __forceinline void tm_avx2_r256_map_8::_load_from_mem(__m256i& wc0, __m256i& wc1, __m256i& wc2, __m256i& wc3)
 {
     wc0 = _mm256_load_si256((__m256i*)(working_code_data));
@@ -328,6 +362,30 @@ __forceinline void tm_avx2_r256_map_8::_run_one_map(__m256i& wc0, __m256i& wc1, 
     }
 }
 
+__forceinline void tm_avx2_r256_map_8::_run_maps_fixed(
+    __m256i& wc0, __m256i& wc1, __m256i& wc2, __m256i& wc3,
+    int map_idx, int count)
+{
+    // Map-count dispatch. We keep only the count=1 specialization (used by
+    // the first-dedup-maps=1 group) and fall through to the loop for all
+    // other spans.
+    //
+    // History: an earlier version specialized counts 1,2,3,4,6,7,9 as fully
+    // inlined sequences of `_run_one_map` calls. Each `_run_one_map` already
+    // unrolls its 16-iter inner loop (#pragma GCC unroll 16), so a 3-map
+    // span produced 3 × 16 × 8-alg-switch = ~384 inlined dispatch sites in
+    // one function. `perf stat -e L1-icache-load-misses` showed 3.5 billion
+    // i-cache misses on the K=3 case vs 28 million on K=5 (which fell
+    // through to the loop) — a 125× difference that pushed frontend stalls
+    // from 28% (loop) to 44% (unrolled). The loop reuses the same
+    // instruction range across iterations, so the i-cache stays hot.
+    if (count == 1)
+        _run_one_map(wc0, wc1, wc2, wc3, map_idx);
+    else
+        for (int i = 0; i < count; i++)
+            _run_one_map(wc0, wc1, wc2, wc3, map_idx + i);
+}
+
 void tm_avx2_r256_map_8::run_alg(int /*algorithm_id*/, uint16* /*rng_seed*/, int /*iterations*/)
 {
     // Not used by bench_cpu / run_bruteforce_data. Left unimplemented for the port.
@@ -375,10 +433,44 @@ void tm_avx2_r256_map_8::run_one_map(const key_schedule::key_schedule_entry& sch
 void tm_avx2_r256_map_8::run_all_maps(const key_schedule& schedule_entries)
 {
     _bind_schedule(schedule_entries);
+    run_maps_range(schedule_entries, 0, schedule_entries.entries.size());
+}
+
+void tm_avx2_r256_map_8::run_maps_range(const key_schedule& schedule_entries, std::size_t begin, std::size_t end)
+{
+    if (end > schedule_entries.entries.size())
+        end = schedule_entries.entries.size();
+    if (begin > end)
+        begin = end;
+
+    std::size_t local_begin = begin;
+    std::size_t local_end = end;
+    if (_shared == nullptr)
+    {
+        if (_owned.entries_data != schedule_entries.entries.data() + begin ||
+            _owned.entry_count != static_cast<int>(end - begin))
+        {
+            _owned.bind_range(rng, schedule_entries, begin, end);
+        }
+        local_begin = 0;
+        local_end = end - begin;
+    }
+    else
+    {
+        const auto& t = _t();
+        if (t.entries_data != schedule_entries.entries.data() ||
+            t.entry_count != static_cast<int>(schedule_entries.entries.size()))
+        {
+            _bind_schedule(schedule_entries);
+        }
+    }
 
     __m256i wc0, wc1, wc2, wc3;
     _load_from_mem(wc0, wc1, wc2, wc3);
-    _run_all_maps(wc0, wc1, wc2, wc3);
+    _run_maps_fixed(
+        wc0, wc1, wc2, wc3,
+        static_cast<int>(local_begin),
+        static_cast<int>(local_end - local_begin));
     _store_to_mem(wc0, wc1, wc2, wc3);
 }
 

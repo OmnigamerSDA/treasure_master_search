@@ -81,8 +81,12 @@ double run_flat(TM& tm, uint32 key, uint32 data_start, uint32 window,
     typedef std::chrono::high_resolution_clock clock;
     const auto t0 = clock::now();
 
+    // dedup_expanded_states=true preserves the legacy "expand -> dedup -> map -> ..."
+    // policy this bench's speedup characterization was originally produced under.
     state_dedup::forward_block_with_dedup(
-        tm, key, data_start, window, schedule, out_table, scratch_table);
+        tm, key, data_start, window, schedule, out_table, scratch_table,
+        /*dedup_every_maps=*/1, /*first_dedup_maps=*/0,
+        /*checkpoint_entries=*/nullptr, /*dedup_expanded_states=*/true);
 
     std::uint64_t parity = 0;
     for (std::size_t pi = 0; pi < out_table.pool.size(); pi++)

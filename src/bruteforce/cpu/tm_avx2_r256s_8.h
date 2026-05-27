@@ -11,6 +11,8 @@
 #include <immintrin.h> //AVX
 //#include <zmmintrin.h> //AVX512
 
+#include <cstddef>
+
 #include "data_sizes.h"
 #include "alignment2.h"
 #include "rng_obj.h"
@@ -40,6 +42,7 @@ public:
 	virtual void run_one_map(const key_schedule::key_schedule_entry& schedule_entry);
 
 	virtual void run_all_maps(const key_schedule& schedule_entries);
+	void run_maps_range(const key_schedule& schedule_entries, std::size_t begin, std::size_t end);
 
 	// Raw internal-state accessors for dedup POCs. The layout is the impl's
 	// shuffled representation, NOT canonical — but it's invariant across

@@ -429,6 +429,11 @@ void tm_avx2_r256s_8::run_one_map(const key_schedule::key_schedule_entry& schedu
 
 void tm_avx2_r256s_8::run_all_maps(const key_schedule& schedule_entries)
 {
+	run_maps_range(schedule_entries, 0, schedule_entries.entries.size());
+}
+
+void tm_avx2_r256s_8::run_maps_range(const key_schedule& schedule_entries, std::size_t begin, std::size_t end)
+{
 	__m256i working_code0;
 	__m256i working_code1;
 	__m256i working_code2;
@@ -444,7 +449,12 @@ void tm_avx2_r256s_8::run_all_maps(const key_schedule& schedule_entries)
 	__m256i mask_top_01 = _mm256_set_epi16(0x0100, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 	__m256i mask_top_80 = _mm256_set_epi16(0x8000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 
-	_run_all_maps(working_code0, working_code1, working_code2, working_code3, schedule_entries, mask_FF, mask_FE, mask_7F, mask_80, mask_01, mask_top_01, mask_top_80);
+	if (end > schedule_entries.entries.size())
+		end = schedule_entries.entries.size();
+	for (std::size_t map_idx = begin; map_idx < end; map_idx++)
+	{
+		_run_map_entry(working_code0, working_code1, working_code2, working_code3, schedule_entries.entries[map_idx], mask_FF, mask_FE, mask_7F, mask_80, mask_01, mask_top_01, mask_top_80);
+	}
 
 	_store_to_mem(working_code0, working_code1, working_code2, working_code3);
 }

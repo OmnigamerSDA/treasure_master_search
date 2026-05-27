@@ -57,6 +57,20 @@ State dedup: `src/common/state_dedup.h`, origin tracking in
 unique final states for checksum and machine-code flags, then re-run only rare
 strict-passing windows with origins to recover exact data values.
 
+The flat-dedup default merge policy is `--first-dedup-maps 1
+--dedup-every-maps 4` ("f1k4") — dedup once after MAP1 to capture the ~52%
+entry-0 collapse, then merge after every 4 maps (7 merges total). This is
+the universal bathtub-bottom policy: it wins on both the r256s and map_8
+kernels and at both small (4096) and large (65536) windows from 1 to 24
+threads. Aggregate uplift over the previous K=1 default at the documented
+production shape (window=4096, threads=12-24) is **+9-14%**.
+
+The investigation behind this choice — geometric per-map collapse curve,
+per-stage threshold rule, concurrency-scaling sweep, and the i-cache
+pressure fix in `tm_avx2_r256_map_8::_run_maps_fixed` that was load-bearing
+for the f1k4 verdict — is in
+`docs/hybrid_dedup_architecture_notes_20260527.md`.
+
 CUDA offset-stream screen:
 
 | GPU                                 | Screen rate | Full-key screen time |

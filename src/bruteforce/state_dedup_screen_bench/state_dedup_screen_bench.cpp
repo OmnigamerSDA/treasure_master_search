@@ -13,6 +13,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <map>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -25,6 +26,44 @@ namespace
 
 constexpr uint8 OTHER_WORLD_FLAG = 0x01;
 
+struct BoundaryAccum
+{
+    std::uint64_t calls = 0;
+    std::uint64_t sum_frontier_in = 0;
+    std::uint64_t sum_frontier_out = 0;
+    std::uint64_t sum_map_ns = 0;
+    std::uint64_t sum_hash_ns = 0;
+};
+
+using BoundaryKey = std::pair<std::uint32_t, std::uint32_t>;
+using BoundaryAggregate = std::map<BoundaryKey, BoundaryAccum>;
+
+void fold_boundary_stats(BoundaryAggregate& dst, const state_dedup::BoundaryStats& src)
+{
+    for (const auto& rec : src.records)
+    {
+        BoundaryAccum& a = dst[{rec.entry_begin, rec.entry_end}];
+        a.calls += 1;
+        a.sum_frontier_in += rec.frontier_in;
+        a.sum_frontier_out += rec.frontier_out;
+        a.sum_map_ns += rec.map_ns;
+        a.sum_hash_ns += rec.hash_ns;
+    }
+}
+
+void merge_boundary_stats(BoundaryAggregate& dst, const BoundaryAggregate& src)
+{
+    for (const auto& kv : src)
+    {
+        BoundaryAccum& a = dst[kv.first];
+        a.calls += kv.second.calls;
+        a.sum_frontier_in += kv.second.sum_frontier_in;
+        a.sum_frontier_out += kv.second.sum_frontier_out;
+        a.sum_map_ns += kv.second.sum_map_ns;
+        a.sum_hash_ns += kv.second.sum_hash_ns;
+    }
+}
+
 struct Args
 {
     std::string keys_path;
@@ -33,7 +72,26 @@ struct Args
     uint32 data_start = 0;
     uint32 window = 4096;
     uint32 windows_per_key = 1;
-    uint32 dedup_every_maps = 1;
+    // Default policy: first_dedup_maps=1, dedup_every_maps=4 ("first=1,K=4").
+    // This dedups after MAP1 (captures the ~52% entry-0 collapse), then runs
+    // K=4 merges over the rest of the schedule (7 merges total).
+    //
+    // Wins ~+10-14% over the historical K=1 default at the documented
+    // production shape (window=4096, threads=12-24). Wins both
+    // tm_avx2_r256s_8 and tm_avx2_r256_map_8 at small and large windows.
+    //
+    // See docs/hybrid_dedup_architecture_notes_20260527.md for the full
+    // policy / per-window / scaling analysis. The architecture notes also
+    // describe the i-cache pressure fix in `tm_avx2_r256_map_8::_run_maps_fixed`
+    // that was load-bearing for this default — the multi-map unrolled cases
+    // (count=3..9) caused billions of L1i misses on map mode; stripping them
+    // and letting count > 1 fall through to the loop dropped L1i misses 100×
+    // and re-balanced the policy bathtub onto f1k4 as the universal winner.
+    uint32 dedup_every_maps = 4;
+    uint32 first_dedup_maps = 1;
+    std::vector<uint32> checkpoint_entries;
+    bool dedup_expanded_states = false;
+    std::string boundary_stats_path;
     uint8 strict_invalid_mask = USES_UNOFFICIAL_NOPS | USES_ILLEGAL_OPCODES | USES_JAM;
     int threads = 1;
     std::size_t limit = 0;
@@ -44,6 +102,21 @@ template <typename T>
 T parse_u(const std::string& s)
 {
     return static_cast<T>(std::stoull(s, nullptr, 0));
+}
+
+std::vector<uint32> parse_checkpoints(const std::string& text)
+{
+    std::vector<uint32> checkpoints;
+    std::stringstream ss(text);
+    std::string token;
+    while (std::getline(ss, token, ','))
+    {
+        if (token.empty()) continue;
+        checkpoints.push_back(parse_u<uint32>(token));
+    }
+    std::sort(checkpoints.begin(), checkpoints.end());
+    checkpoints.erase(std::unique(checkpoints.begin(), checkpoints.end()), checkpoints.end());
+    return checkpoints;
 }
 
 Args parse_args(int argc, char** argv)
@@ -64,6 +137,11 @@ Args parse_args(int argc, char** argv)
         else if (s == "--window")          a.window = parse_u<uint32>(nxt(i, "--window"));
         else if (s == "--windows-per-key") a.windows_per_key = parse_u<uint32>(nxt(i, "--windows-per-key"));
         else if (s == "--dedup-every-maps") a.dedup_every_maps = parse_u<uint32>(nxt(i, "--dedup-every-maps"));
+        else if (s == "--first-dedup-maps") a.first_dedup_maps = parse_u<uint32>(nxt(i, "--first-dedup-maps"));
+        else if (s == "--dedup-checkpoints") a.checkpoint_entries = parse_checkpoints(nxt(i, "--dedup-checkpoints"));
+        else if (s == "--skip-expand-dedup") a.dedup_expanded_states = false;  // legacy / no-op (now default)
+        else if (s == "--dedup-expand-states") a.dedup_expanded_states = true;  // opt back into legacy behaviour
+        else if (s == "--boundary-stats")  a.boundary_stats_path = nxt(i, "--boundary-stats");
         else if (s == "--strict-invalid-mask") a.strict_invalid_mask = parse_u<uint8>(nxt(i, "--strict-invalid-mask"));
         else if (s == "--threads")         a.threads = std::stoi(nxt(i, "--threads"));
         else if (s == "--limit")           a.limit = static_cast<std::size_t>(std::stoull(nxt(i, "--limit")));
@@ -83,7 +161,15 @@ Args parse_args(int argc, char** argv)
                 << "  --limit N                maximum keys from --keys\n"
                 << "  --window N               data values per dedup block\n"
                 << "  --windows-per-key N      consecutive windows sampled per key\n"
-                << "  --dedup-every-maps N     merge frontier every N schedule entries (default 1)\n"
+                << "  --dedup-every-maps N     merge frontier every N entries (default 4; universal bathtub-bottom)\n"
+                << "                           Lower values increase merge density; higher values reduce L3\n"
+                << "                           pressure but add map work between merges.\n"
+                << "  --first-dedup-maps N     first merge group size; 0 uses --dedup-every-maps. Default 1\n"
+                << "                           (captures the ~52% post-MAP1 collapse on its own merge step).\n"
+                << "  --dedup-checkpoints LIST comma-separated map-entry cut points; overrides every/first\n"
+                << "  --skip-expand-dedup      (default) run first map group before the first dedup merge\n"
+                << "  --dedup-expand-states    opt back into the legacy expand-then-dedup behaviour\n"
+                << "  --boundary-stats FILE    append per-boundary frontier sizes + map/hash wall to CSV\n"
                 << "  --strict-invalid-mask N   flags rejected for strict all-entry count\n"
                 << "  --threads N\n"
                 << "  --data-start UINT32\n"
@@ -304,6 +390,8 @@ Counts run_sweep(const Args& a, const std::vector<uint32>& keys, std::vector<Win
         static_cast<std::uint64_t>(keys.size()) * static_cast<std::uint64_t>(a.windows_per_key);
     std::atomic<std::uint64_t> next{0};
     std::vector<Counts> thread_counts(static_cast<std::size_t>(a.threads));
+    std::vector<BoundaryAggregate> thread_boundary(static_cast<std::size_t>(a.threads));
+    const bool collect_boundary_stats = !a.boundary_stats_path.empty();
     std::vector<WindowRow> local_rows;
     std::mutex rows_mu;
     std::vector<std::thread> workers;
@@ -319,6 +407,8 @@ Counts run_sweep(const Args& a, const std::vector<uint32>& keys, std::vector<Win
             state_dedup::FlatTable out, scratch;
             Counts local_total;
             std::vector<WindowRow> mine;
+            BoundaryAggregate boundary_local;
+            state_dedup::BoundaryStats boundary_buf;
 
             while (true)
             {
@@ -332,8 +422,14 @@ Counts run_sweep(const Args& a, const std::vector<uint32>& keys, std::vector<Win
                 key_schedule schedule(key, a.map_kind);
 
                 const auto w0 = std::chrono::high_resolution_clock::now();
+                if (collect_boundary_stats) boundary_buf.clear();
                 state_dedup::forward_block_with_dedup(
-                    tm, key, start, a.window, schedule, out, scratch, a.dedup_every_maps);
+                    tm, key, start, a.window, schedule, out, scratch,
+                    a.dedup_every_maps, a.first_dedup_maps,
+                    a.checkpoint_entries.empty() ? nullptr : &a.checkpoint_entries,
+                    a.dedup_expanded_states,
+                    collect_boundary_stats ? &boundary_buf : nullptr);
+                if (collect_boundary_stats) fold_boundary_stats(boundary_local, boundary_buf);
                 Counts wc = screen_table(tm, out, a.strict_invalid_mask);
                 wc.windows = 1;
                 wc.candidates = a.window;
@@ -354,6 +450,8 @@ Counts run_sweep(const Args& a, const std::vector<uint32>& keys, std::vector<Win
             }
 
             thread_counts[static_cast<std::size_t>(tid)] = local_total;
+            if (collect_boundary_stats)
+                thread_boundary[static_cast<std::size_t>(tid)] = std::move(boundary_local);
             if (!mine.empty())
             {
                 std::lock_guard<std::mutex> lock(rows_mu);
@@ -363,6 +461,36 @@ Counts run_sweep(const Args& a, const std::vector<uint32>& keys, std::vector<Win
     }
 
     for (auto& worker : workers) worker.join();
+
+    if (collect_boundary_stats)
+    {
+        BoundaryAggregate merged;
+        for (const auto& tb : thread_boundary) merge_boundary_stats(merged, tb);
+
+        std::ofstream bs(a.boundary_stats_path);
+        if (!bs) throw std::runtime_error("could not open boundary stats file: " + a.boundary_stats_path);
+        bs << "entry_begin,entry_end,calls,avg_frontier_in,avg_frontier_out,collapse_ratio,total_map_ns,total_hash_ns,map_per_state_ns,hash_per_state_ns,hash_share\n";
+        for (const auto& kv : merged)
+        {
+            const auto& acc = kv.second;
+            const double avg_in = acc.calls ? static_cast<double>(acc.sum_frontier_in) / acc.calls : 0.0;
+            const double avg_out = acc.calls ? static_cast<double>(acc.sum_frontier_out) / acc.calls : 0.0;
+            const double collapse = avg_in > 0.0 ? avg_out / avg_in : 0.0;
+            const double map_per_state = acc.sum_frontier_in > 0
+                ? static_cast<double>(acc.sum_map_ns) / static_cast<double>(acc.sum_frontier_in) : 0.0;
+            const double hash_per_state = acc.sum_frontier_in > 0
+                ? static_cast<double>(acc.sum_hash_ns) / static_cast<double>(acc.sum_frontier_in) : 0.0;
+            const double total = static_cast<double>(acc.sum_map_ns + acc.sum_hash_ns);
+            const double hash_share = total > 0.0 ? static_cast<double>(acc.sum_hash_ns) / total : 0.0;
+            bs << kv.first.first << ',' << kv.first.second << ',' << acc.calls << ','
+               << std::fixed << std::setprecision(2) << avg_in << ',' << avg_out << ','
+               << std::setprecision(4) << collapse << ','
+               << acc.sum_map_ns << ',' << acc.sum_hash_ns << ','
+               << std::setprecision(2) << map_per_state << ',' << hash_per_state << ','
+               << std::setprecision(4) << hash_share << '\n';
+        }
+        std::cout << "  boundary stats:       " << a.boundary_stats_path << "\n";
+    }
     elapsed_s = std::chrono::duration<double>(
         std::chrono::high_resolution_clock::now() - t0).count();
 
@@ -390,6 +518,15 @@ void print_summary(const Args& a, const std::vector<uint32>& keys, const Counts&
     std::cout << "  window:               " << a.window << "\n";
     std::cout << "  windows/key:          " << a.windows_per_key << "\n";
     std::cout << "  dedup every maps:     " << a.dedup_every_maps << "\n";
+    std::cout << "  first dedup maps:     " << a.first_dedup_maps << "\n";
+    std::cout << "  dedup expanded states:" << (a.dedup_expanded_states ? " yes" : " no") << "\n";
+    if (!a.checkpoint_entries.empty())
+    {
+        std::cout << "  dedup checkpoints:    ";
+        for (std::size_t i = 0; i < a.checkpoint_entries.size(); i++)
+            std::cout << (i == 0 ? "" : ",") << a.checkpoint_entries[i];
+        std::cout << "\n";
+    }
     std::cout << "  threads:              " << a.threads << "\n";
     std::cout << "  windows:              " << c.windows << "\n";
     std::cout << "  candidates:           " << c.candidates << "\n";

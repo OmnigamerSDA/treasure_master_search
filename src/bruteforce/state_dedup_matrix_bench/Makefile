@@ -1,5 +1,5 @@
 CXX      := g++
-CXXFLAGS := -O3 -std=c++20 -m64 -march=native -mtune=native -I../../common -I..
+CXXFLAGS := -O3 -std=c++20 -m64 -march=native -mtune=native -I../../common -I.. -pthread
 SRC_COMMON := ../../common
 
 SRCS := state_dedup_matrix_bench.cpp \
@@ -20,7 +20,7 @@ TARGET := state_dedup_matrix_bench
 all: $(TARGET)
 
 $(TARGET): $(SRCS)
-	$(CXX) $(CXXFLAGS) -o $@ $^
+	$(CXX) $(CXXFLAGS) -o $@ $^ -pthread
 
 clean:
 	rm -f $(TARGET)
