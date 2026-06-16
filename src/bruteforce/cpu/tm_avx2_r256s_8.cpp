@@ -475,8 +475,11 @@ __forceinline void tm_avx2_r256s_8::_run_map_entry(__m256i& working_code0, __m25
 	// Next, the working code is processed with the same steps 16 times.
 	// #pragma GCC unroll 16 enables _mm_extract_epi8 to receive compile-time
 	// constant indices so we can read the algorithm-select byte directly from
-	// AVX registers without a store+load round-trip.
+	// AVX registers without a store+load round-trip. MSVC does not honor that
+	// pragma, so it gets explicit immediate-index cases below.
+#if defined(__GNUC__)
 #pragma GCC unroll 16
+#endif
 	for (int i = 0; i < 16; i++)
 	{
 		// Get the highest bit of the nibble selector to use as a flag
@@ -487,9 +490,34 @@ __forceinline void tm_avx2_r256s_8::_run_map_entry(__m256i& working_code0, __m25
 		// Extract byte directly from register (avoids 2 AVX2 stores per iteration).
 		// shuffle_8(i, 256) for i=0..15: even i -> byte i/2 of working_code0,
 		//                                odd i -> byte (i-1)/2 of working_code1.
-		unsigned char current_byte = ((i & 1) == 0)
+		unsigned char current_byte = 0;
+#if defined(_MSC_VER) || defined(__clang__)
+		const __m128i working_code0_low = _mm256_castsi256_si128(working_code0);
+		const __m128i working_code1_low = _mm256_castsi256_si128(working_code1);
+		switch (i)
+		{
+			case 0: current_byte = (unsigned char)_mm_extract_epi8(working_code0_low, 0); break;
+			case 1: current_byte = (unsigned char)_mm_extract_epi8(working_code1_low, 0); break;
+			case 2: current_byte = (unsigned char)_mm_extract_epi8(working_code0_low, 1); break;
+			case 3: current_byte = (unsigned char)_mm_extract_epi8(working_code1_low, 1); break;
+			case 4: current_byte = (unsigned char)_mm_extract_epi8(working_code0_low, 2); break;
+			case 5: current_byte = (unsigned char)_mm_extract_epi8(working_code1_low, 2); break;
+			case 6: current_byte = (unsigned char)_mm_extract_epi8(working_code0_low, 3); break;
+			case 7: current_byte = (unsigned char)_mm_extract_epi8(working_code1_low, 3); break;
+			case 8: current_byte = (unsigned char)_mm_extract_epi8(working_code0_low, 4); break;
+			case 9: current_byte = (unsigned char)_mm_extract_epi8(working_code1_low, 4); break;
+			case 10: current_byte = (unsigned char)_mm_extract_epi8(working_code0_low, 5); break;
+			case 11: current_byte = (unsigned char)_mm_extract_epi8(working_code1_low, 5); break;
+			case 12: current_byte = (unsigned char)_mm_extract_epi8(working_code0_low, 6); break;
+			case 13: current_byte = (unsigned char)_mm_extract_epi8(working_code1_low, 6); break;
+			case 14: current_byte = (unsigned char)_mm_extract_epi8(working_code0_low, 7); break;
+			case 15: current_byte = (unsigned char)_mm_extract_epi8(working_code1_low, 7); break;
+		}
+#else
+		current_byte = ((i & 1) == 0)
 			? (unsigned char)_mm_extract_epi8(_mm256_castsi256_si128(working_code0), i >> 1)
 			: (unsigned char)_mm_extract_epi8(_mm256_castsi256_si128(working_code1), (i - 1) >> 1);
+#endif
 
 		if (nibble == 1)
 		{
@@ -538,6 +566,225 @@ __forceinline void tm_avx2_r256s_8::_run_map_entry(__m256i& working_code0, __m25
 				break;
 		}
 	}
+}
+
+// PROTOTYPE: one schedule entry over two interleaved states. Mirrors
+// _run_map_entry's per-step extract/dispatch exactly, but runs both states'
+// dependency chains adjacently so the OOO engine overlaps state 0's RNG-load /
+// dependent-SIMD latency with state 1's independent work. nibble_selector is
+// shared (same schedule entry for both states); the two RNG seeds are separate.
+// tier-1 il alg variants — build only the 1-2 needed broadcast constants
+// locally so they rematerialize under register pressure. 0xFE=~0x01 and
+// 0x7F=~0x80 are produced with _mm256_andnot_si256 (vpandn, same op count as
+// vpand), 0xFFFF with _mm256_cmpeq_epi8 (no load), so the persistent pinned
+// mask set in the 2-way loop is empty.
+__forceinline void tm_avx2_r256s_8::alg_0_il(__m256i& w0, __m256i& w1, __m256i& w2, __m256i& w3, uint16* rng_seed)
+{
+	uint8* rng_start = rng->alg0_values_256_8_shuffled + ((*rng_seed) * 128);
+	const __m256i m01 = _mm256_set1_epi16(0x0101);
+	w0 = _mm256_or_si256(_mm256_andnot_si256(m01, _mm256_slli_epi16(w0, 1)), _mm256_load_si256((__m256i*)(rng_start)));
+	w1 = _mm256_or_si256(_mm256_andnot_si256(m01, _mm256_slli_epi16(w1, 1)), _mm256_load_si256((__m256i*)(rng_start + 32)));
+	w2 = _mm256_or_si256(_mm256_andnot_si256(m01, _mm256_slli_epi16(w2, 1)), _mm256_load_si256((__m256i*)(rng_start + 64)));
+	w3 = _mm256_or_si256(_mm256_andnot_si256(m01, _mm256_slli_epi16(w3, 1)), _mm256_load_si256((__m256i*)(rng_start + 96)));
+}
+
+__forceinline void tm_avx2_r256s_8::alg_6_il(__m256i& w0, __m256i& w1, __m256i& w2, __m256i& w3, uint16* rng_seed)
+{
+	uint8* rng_start = rng->alg6_values_256_8_shuffled + ((*rng_seed) * 128);
+	const __m256i m80 = _mm256_set1_epi16(0x8080);
+	w0 = _mm256_or_si256(_mm256_andnot_si256(m80, _mm256_srli_epi16(w0, 1)), _mm256_load_si256((__m256i*)(rng_start)));
+	w1 = _mm256_or_si256(_mm256_andnot_si256(m80, _mm256_srli_epi16(w1, 1)), _mm256_load_si256((__m256i*)(rng_start + 32)));
+	w2 = _mm256_or_si256(_mm256_andnot_si256(m80, _mm256_srli_epi16(w2, 1)), _mm256_load_si256((__m256i*)(rng_start + 64)));
+	w3 = _mm256_or_si256(_mm256_andnot_si256(m80, _mm256_srli_epi16(w3, 1)), _mm256_load_si256((__m256i*)(rng_start + 96)));
+}
+
+__forceinline void tm_avx2_r256s_8::alg_7_il(__m256i& w0, __m256i& w1, __m256i& w2, __m256i& w3)
+{
+	const __m256i ones = _mm256_cmpeq_epi8(w0, w0);
+	w0 = _mm256_xor_si256(w0, ones);
+	w1 = _mm256_xor_si256(w1, ones);
+	w2 = _mm256_xor_si256(w2, ones);
+	w3 = _mm256_xor_si256(w3, ones);
+}
+
+__forceinline void tm_avx2_r256s_8::alg_2_sub_il(__m256i& working_a, __m256i& working_b, __m256i& carry)
+{
+	const __m256i m01 = _mm256_set1_epi16(0x0101);
+	const __m256i m80 = _mm256_set1_epi16(0x8080);
+	__m256i cur_val1_most = _mm256_andnot_si256(m80, _mm256_srli_epi16(working_a, 1)); // & 0x7F
+	__m256i cur_val2_most = _mm256_andnot_si256(m01, _mm256_slli_epi16(working_b, 1)); // & 0xFE
+	__m256i cur_val2_masked = _mm256_and_si256(working_b, m80);
+	__m256i cur_val1_bit = _mm256_and_si256(working_a, m01);
+
+	__m256i mask = _mm256_permute2x128_si256(cur_val1_bit, cur_val1_bit, _MM_SHUFFLE(3, 0, 0, 3));
+	__m256i cur_val1_srl = _mm256_alignr_epi8(mask, cur_val1_bit, 1);
+	__m256i cur_val1_srl_w_carry = _mm256_or_si256(cur_val1_srl, carry);
+
+	__m256i lo_to_hi = _mm256_permute2x128_si256(cur_val1_bit, cur_val1_bit, _MM_SHUFFLE(0, 0, 3, 0));
+	__m256i next_carry = _mm256_bslli_epi128(lo_to_hi, 15);
+
+	working_a = _mm256_or_si256(cur_val1_most, cur_val2_masked);
+	working_b = _mm256_or_si256(cur_val2_most, cur_val1_srl_w_carry);
+	carry = next_carry;
+}
+
+__forceinline void tm_avx2_r256s_8::alg_2_il(__m256i& w0, __m256i& w1, __m256i& w2, __m256i& w3, uint16* rng_seed)
+{
+	__m256i carry = _mm256_load_si256((__m256i*)(rng->alg2_values_256_8 + ((*rng_seed) * 32)));
+	alg_2_sub_il(w2, w3, carry);
+	alg_2_sub_il(w0, w1, carry);
+}
+
+__forceinline void tm_avx2_r256s_8::alg_5_sub_il(__m256i& working_a, __m256i& working_b, __m256i& carry)
+{
+	const __m256i m01 = _mm256_set1_epi16(0x0101);
+	const __m256i m80 = _mm256_set1_epi16(0x8080);
+	__m256i cur_val1_most = _mm256_andnot_si256(m01, _mm256_slli_epi16(working_a, 1)); // & 0xFE
+	__m256i cur_val2_most = _mm256_andnot_si256(m80, _mm256_srli_epi16(working_b, 1)); // & 0x7F
+	__m256i cur_val2_masked = _mm256_and_si256(working_b, m01);
+	__m256i cur_val1_bit = _mm256_and_si256(working_a, m80);
+
+	__m256i mask = _mm256_permute2x128_si256(cur_val1_bit, cur_val1_bit, _MM_SHUFFLE(3, 0, 0, 3));
+	__m256i cur_val1_srl = _mm256_alignr_epi8(mask, cur_val1_bit, 1);
+	__m256i cur_val1_srl_w_carry = _mm256_or_si256(cur_val1_srl, carry);
+
+	__m256i lo_to_hi = _mm256_permute2x128_si256(cur_val1_bit, cur_val1_bit, _MM_SHUFFLE(0, 0, 3, 0));
+	__m256i next_carry = _mm256_bslli_epi128(lo_to_hi, 15);
+
+	working_a = _mm256_or_si256(cur_val1_most, cur_val2_masked);
+	working_b = _mm256_or_si256(cur_val2_most, cur_val1_srl_w_carry);
+	carry = next_carry;
+}
+
+__forceinline void tm_avx2_r256s_8::alg_5_il(__m256i& w0, __m256i& w1, __m256i& w2, __m256i& w3, uint16* rng_seed)
+{
+	__m256i carry = _mm256_load_si256((__m256i*)(rng->alg5_values_256_8 + ((*rng_seed) * 32)));
+	alg_5_sub_il(w2, w3, carry);
+	alg_5_sub_il(w0, w1, carry);
+}
+
+__forceinline void tm_avx2_r256s_8::_run_map_entry_x2(
+	__m256i& a0, __m256i& a1, __m256i& a2, __m256i& a3,
+	__m256i& b0, __m256i& b1, __m256i& b2, __m256i& b3,
+	const key_schedule::key_schedule_entry& schedule_entry)
+{
+	uint16 seed_a = (schedule_entry.rng1 << 8) | schedule_entry.rng2;
+	uint16 seed_b = seed_a;
+	uint16 nibble_selector = schedule_entry.nibble_selector;
+
+	// Unrolled (×16). Counter-intuitively, NOT unrolling this 2-way kernel was
+	// measured SLOWER: a switch(i) jump-table removes the modest icache pressure
+	// (5.4M→429K L1i) but doubles branch-misses (97M→212M) on the rotating
+	// 16-way indirect target, a net loss (unlike the AVX-512 4-way, whose icache
+	// problem was severe enough that no-unroll won). So keep the unroll here; the
+	// immediate-index extract it enables avoids the per-step branch entirely.
+#if defined(__GNUC__)
+#pragma GCC unroll 16
+#endif
+	for (int i = 0; i < 16; i++)
+	{
+		unsigned char nibble = (nibble_selector >> 15) & 0x01;
+		nibble_selector = nibble_selector << 1;
+
+		unsigned char byte_a = 0, byte_b = 0;
+#if defined(_MSC_VER) || defined(__clang__)
+		const __m128i a0_low = _mm256_castsi256_si128(a0);
+		const __m128i a1_low = _mm256_castsi256_si128(a1);
+		const __m128i b0_low = _mm256_castsi256_si128(b0);
+		const __m128i b1_low = _mm256_castsi256_si128(b1);
+#define TM_X2_EXTRACT(out, r0, r1) \
+		switch (i) { \
+			case 0:  out=(unsigned char)_mm_extract_epi8(r0,0); break; \
+			case 1:  out=(unsigned char)_mm_extract_epi8(r1,0); break; \
+			case 2:  out=(unsigned char)_mm_extract_epi8(r0,1); break; \
+			case 3:  out=(unsigned char)_mm_extract_epi8(r1,1); break; \
+			case 4:  out=(unsigned char)_mm_extract_epi8(r0,2); break; \
+			case 5:  out=(unsigned char)_mm_extract_epi8(r1,2); break; \
+			case 6:  out=(unsigned char)_mm_extract_epi8(r0,3); break; \
+			case 7:  out=(unsigned char)_mm_extract_epi8(r1,3); break; \
+			case 8:  out=(unsigned char)_mm_extract_epi8(r0,4); break; \
+			case 9:  out=(unsigned char)_mm_extract_epi8(r1,4); break; \
+			case 10: out=(unsigned char)_mm_extract_epi8(r0,5); break; \
+			case 11: out=(unsigned char)_mm_extract_epi8(r1,5); break; \
+			case 12: out=(unsigned char)_mm_extract_epi8(r0,6); break; \
+			case 13: out=(unsigned char)_mm_extract_epi8(r1,6); break; \
+			case 14: out=(unsigned char)_mm_extract_epi8(r0,7); break; \
+			case 15: out=(unsigned char)_mm_extract_epi8(r1,7); break; \
+		}
+		TM_X2_EXTRACT(byte_a, a0_low, a1_low);
+		TM_X2_EXTRACT(byte_b, b0_low, b1_low);
+#undef TM_X2_EXTRACT
+#else
+		if ((i & 1) == 0)
+		{
+			byte_a = (unsigned char)_mm_extract_epi8(_mm256_castsi256_si128(a0), i >> 1);
+			byte_b = (unsigned char)_mm_extract_epi8(_mm256_castsi256_si128(b0), i >> 1);
+		}
+		else
+		{
+			byte_a = (unsigned char)_mm_extract_epi8(_mm256_castsi256_si128(a1), (i - 1) >> 1);
+			byte_b = (unsigned char)_mm_extract_epi8(_mm256_castsi256_si128(b1), (i - 1) >> 1);
+		}
+#endif
+		if (nibble == 1) { byte_a = byte_a >> 4; byte_b = byte_b >> 4; }
+		const unsigned char alg_a = (byte_a >> 1) & 0x07;
+		const unsigned char alg_b = (byte_b >> 1) & 0x07;
+
+		switch (alg_a)
+		{
+			case 0: alg_0_il(a0, a1, a2, a3, &seed_a); seed_a = rng->seed_forward_128[seed_a]; break;
+			case 1: add_alg(a0, a1, a2, a3, &seed_a, rng->regular_rng_values_256_8_shuffled); seed_a = rng->seed_forward_128[seed_a]; break;
+			case 2: alg_2_il(a0, a1, a2, a3, &seed_a); seed_a = rng->seed_forward_1[seed_a]; break;
+			case 3: alg_3(a0, a1, a2, a3, &seed_a); seed_a = rng->seed_forward_128[seed_a]; break;
+			case 4: sub_alg(a0, a1, a2, a3, &seed_a, rng->regular_rng_values_256_8_shuffled); seed_a = rng->seed_forward_128[seed_a]; break;
+			case 5: alg_5_il(a0, a1, a2, a3, &seed_a); seed_a = rng->seed_forward_1[seed_a]; break;
+			case 6: alg_6_il(a0, a1, a2, a3, &seed_a); seed_a = rng->seed_forward_128[seed_a]; break;
+			default: alg_7_il(a0, a1, a2, a3); break;
+		}
+		switch (alg_b)
+		{
+			case 0: alg_0_il(b0, b1, b2, b3, &seed_b); seed_b = rng->seed_forward_128[seed_b]; break;
+			case 1: add_alg(b0, b1, b2, b3, &seed_b, rng->regular_rng_values_256_8_shuffled); seed_b = rng->seed_forward_128[seed_b]; break;
+			case 2: alg_2_il(b0, b1, b2, b3, &seed_b); seed_b = rng->seed_forward_1[seed_b]; break;
+			case 3: alg_3(b0, b1, b2, b3, &seed_b); seed_b = rng->seed_forward_128[seed_b]; break;
+			case 4: sub_alg(b0, b1, b2, b3, &seed_b, rng->regular_rng_values_256_8_shuffled); seed_b = rng->seed_forward_128[seed_b]; break;
+			case 5: alg_5_il(b0, b1, b2, b3, &seed_b); seed_b = rng->seed_forward_1[seed_b]; break;
+			case 6: alg_6_il(b0, b1, b2, b3, &seed_b); seed_b = rng->seed_forward_128[seed_b]; break;
+			default: alg_7_il(b0, b1, b2, b3); break;
+		}
+	}
+}
+
+void tm_avx2_r256s_8::run_maps_range_x2(const key_schedule& schedule_entries, std::size_t begin, std::size_t end,
+                                        const uint8* in0, const uint8* in1, uint8* out0, uint8* out1)
+{
+	// Pool entries are not 32-byte aligned; use unaligned load/store (no penalty
+	// on aligned data on Zen, correct on unaligned).
+	__m256i a0 = _mm256_loadu_si256((const __m256i*)(in0));
+	__m256i a1 = _mm256_loadu_si256((const __m256i*)(in0 + 32));
+	__m256i a2 = _mm256_loadu_si256((const __m256i*)(in0 + 64));
+	__m256i a3 = _mm256_loadu_si256((const __m256i*)(in0 + 96));
+	__m256i b0 = _mm256_loadu_si256((const __m256i*)(in1));
+	__m256i b1 = _mm256_loadu_si256((const __m256i*)(in1 + 32));
+	__m256i b2 = _mm256_loadu_si256((const __m256i*)(in1 + 64));
+	__m256i b3 = _mm256_loadu_si256((const __m256i*)(in1 + 96));
+
+	if (end > schedule_entries.entries.size())
+		end = schedule_entries.entries.size();
+	for (std::size_t map_idx = begin; map_idx < end; map_idx++)
+	{
+		_run_map_entry_x2(a0, a1, a2, a3, b0, b1, b2, b3,
+		                  schedule_entries.entries[map_idx]);
+	}
+
+	_mm256_storeu_si256((__m256i*)(out0), a0);
+	_mm256_storeu_si256((__m256i*)(out0 + 32), a1);
+	_mm256_storeu_si256((__m256i*)(out0 + 64), a2);
+	_mm256_storeu_si256((__m256i*)(out0 + 96), a3);
+	_mm256_storeu_si256((__m256i*)(out1), b0);
+	_mm256_storeu_si256((__m256i*)(out1 + 32), b1);
+	_mm256_storeu_si256((__m256i*)(out1 + 64), b2);
+	_mm256_storeu_si256((__m256i*)(out1 + 96), b3);
 }
 
 void tm_avx2_r256s_8::decrypt_carnival_world()

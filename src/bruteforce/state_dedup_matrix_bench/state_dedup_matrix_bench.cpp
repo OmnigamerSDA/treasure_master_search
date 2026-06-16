@@ -23,6 +23,7 @@
 #include "key_schedule.h"
 #include "key_file.h"
 #include "state_dedup.h"
+#include "state_dedup_il.h"
 
 #include "../cpu/tm_8.h"
 #include "../cpu/tm_avx_r128s_8.h"
@@ -30,6 +31,8 @@
 #include "../cpu/tm_avx2_r256s_8.h"
 #include "../cpu/tm_avx2_r256_map_8.h"
 #include "../cpu/tm_avx512_r512s_8.h"
+#include "../cpu/tm_avx512_r512_map_8.h"
+#include "../cpu/tm_avx512_r512s_map_8.h"
 
 #include <algorithm>
 #include <atomic>
@@ -51,6 +54,20 @@
 namespace
 {
 
+// Tier-1 front-cache size in bits (2^N entries); 0 = disabled. Set from
+// --front-cache-bits and read at FlatTable creation sites (enable_front_cache).
+unsigned g_front_cache_bits = 0;
+
+// Dynamic table sizing (slots+pool track the frontier, not the window). Set from
+// --dynamic-table, applied at FlatTable creation sites (set_dynamic).
+bool g_dynamic_table = false;
+
+// Skip the cache-priming warm-up pass (--no-warmup). final_unique is
+// timing-invariant, so for characterization surveys (esp. very large windows
+// where the warm-up doubles wall time and can trip a memory guard) the warm-up
+// is pure waste. Default off → production/timing runs keep the warm-up.
+bool g_no_warmup = false;
+
 std::uint64_t parity_hash(const std::uint8_t* bytes)
 {
     std::uint64_t h = 1469598103934665603ull;
@@ -71,12 +88,12 @@ double bench_baseline(TM& tm, std::uint32_t key, std::uint32_t data_start,
     typedef std::chrono::high_resolution_clock clock;
     const auto t0 = clock::now();
     std::uint64_t parity = 0;
-    for (std::uint32_t i = 0; i < window; i++)
+    state_dedup::for_each_window_index(window, [&](std::uint32_t i)
     {
         tm.expand(key, data_start + i);
         tm.run_all_maps(schedule);
         parity ^= parity_hash(tm.state_raw());
-    }
+    });
     parity_out = parity;
     return std::chrono::duration<double>(clock::now() - t0).count();
 }
@@ -106,6 +123,12 @@ void fold_boundary_stats(BoundaryAggregate& dst, const state_dedup::BoundaryStat
     }
 }
 
+// Experiment knob (1-way path only): stride between consecutive window data
+// values. stride=1 sweeps the low data bytes; stride=2^8/2^16 redirects the
+// window onto higher byte positions. Default 1 = production behaviour.
+std::uint32_t g_data_stride = 1;
+std::string g_win_policy;   // empty/"linear" => linear scan; else squeeze/backfill/... (production window bit-selection)
+
 template <typename TM>
 double bench_flat(TM& tm, std::uint32_t key, std::uint32_t data_start,
                   std::uint32_t window, const key_schedule& schedule,
@@ -116,16 +139,136 @@ double bench_flat(TM& tm, std::uint32_t key, std::uint32_t data_start,
                   const std::vector<std::uint32_t>* checkpoint_entries,
                   bool dedup_expanded_states,
                   state_dedup::BoundaryStats* stats = nullptr,
-                  bool skip_final_hash = false)
+                  bool skip_final_hash = false,
+                  bool use_il4 = false,
+                  bool use_il6 = false,
+                  bool use_il8 = false,
+                  bool use_il10 = false,
+                  bool use_il12 = false,
+                  bool use_il14 = false,
+                  bool use_il2 = false)
 {
     typedef std::chrono::high_resolution_clock clock;
     const auto t0 = clock::now();
+    const bool full_window = state_dedup::is_full_u32_window(window);
 
     if (stats != nullptr) stats->clear();
-    state_dedup::forward_block_with_dedup(
-        tm, key, data_start, window, schedule, out, scratch,
-        dedup_every_maps, first_dedup_maps, checkpoint_entries,
-        dedup_expanded_states, stats, skip_final_hash);
+    if (!full_window && use_il14)
+    {
+        if constexpr (requires { &TM::run_maps_range_x14; })
+            state_dedup::forward_block_with_dedup_il14(
+                tm, key, data_start, window, schedule, out, scratch,
+                dedup_every_maps, first_dedup_maps, stats);
+        else
+            state_dedup::forward_block_with_dedup(
+                tm, key, data_start, window, schedule, out, scratch,
+                dedup_every_maps, first_dedup_maps, checkpoint_entries,
+                dedup_expanded_states, stats, skip_final_hash);
+    }
+    else if (!full_window && use_il12)
+    {
+        if constexpr (requires { &TM::run_maps_range_x12; })
+            state_dedup::forward_block_with_dedup_il12(
+                tm, key, data_start, window, schedule, out, scratch,
+                dedup_every_maps, first_dedup_maps, stats);
+        else
+            state_dedup::forward_block_with_dedup(
+                tm, key, data_start, window, schedule, out, scratch,
+                dedup_every_maps, first_dedup_maps, checkpoint_entries,
+                dedup_expanded_states, stats, skip_final_hash);
+    }
+    else if (!full_window && use_il10)
+    {
+        if constexpr (requires { &TM::run_maps_range_x10; })
+            state_dedup::forward_block_with_dedup_il10(
+                tm, key, data_start, window, schedule, out, scratch,
+                dedup_every_maps, first_dedup_maps, stats);
+        else
+            state_dedup::forward_block_with_dedup(
+                tm, key, data_start, window, schedule, out, scratch,
+                dedup_every_maps, first_dedup_maps, checkpoint_entries,
+                dedup_expanded_states, stats, skip_final_hash);
+    }
+    else if (!full_window && use_il8)
+    {
+        if constexpr (requires { &TM::run_maps_range_x8; })
+            state_dedup::forward_block_with_dedup_il8(
+                tm, key, data_start, window, schedule, out, scratch,
+                dedup_every_maps, first_dedup_maps, stats);
+        else
+            state_dedup::forward_block_with_dedup(
+                tm, key, data_start, window, schedule, out, scratch,
+                dedup_every_maps, first_dedup_maps, checkpoint_entries,
+                dedup_expanded_states, stats, skip_final_hash);
+    }
+    else if (!full_window && use_il6)
+    {
+        // PROTOTYPE: 6-way interleaved frontier replay (f1k4 default shape).
+        // Only impls exposing run_maps_range_x6 (AVX-512) take this path; others
+        // fall back to the standard driver.
+        if constexpr (requires { &TM::run_maps_range_x6; })
+            state_dedup::forward_block_with_dedup_il6(
+                tm, key, data_start, window, schedule, out, scratch,
+                dedup_every_maps, first_dedup_maps, stats);
+        else
+            state_dedup::forward_block_with_dedup(
+                tm, key, data_start, window, schedule, out, scratch,
+                dedup_every_maps, first_dedup_maps, checkpoint_entries,
+                dedup_expanded_states, stats, skip_final_hash);
+    }
+    else if (!full_window && use_il4)
+    {
+        // PROTOTYPE: 4-way interleaved frontier replay (f1k4 default shape).
+        // Only impls exposing run_maps_range_x4 (AVX-512) take this path; others
+        // fall back to the standard driver.
+        if constexpr (requires { &TM::run_maps_range_x4; })
+            state_dedup::forward_block_with_dedup_il4(
+                tm, key, data_start, window, schedule, out, scratch,
+                dedup_every_maps, first_dedup_maps, stats);
+        else
+            state_dedup::forward_block_with_dedup(
+                tm, key, data_start, window, schedule, out, scratch,
+                dedup_every_maps, first_dedup_maps, checkpoint_entries,
+                dedup_expanded_states, stats, skip_final_hash);
+    }
+    else if (!full_window && use_il2)
+    {
+        if constexpr (requires { &TM::run_maps_range_x2; })
+            state_dedup::forward_block_with_dedup_il2(
+                tm, key, data_start, window, schedule, out, scratch,
+                dedup_every_maps, first_dedup_maps, stats);
+        else
+            state_dedup::forward_block_with_dedup(
+                tm, key, data_start, window, schedule, out, scratch,
+                dedup_every_maps, first_dedup_maps, checkpoint_entries,
+                dedup_expanded_states, stats, skip_final_hash);
+    }
+    else
+    {
+        extern std::uint32_t g_data_stride;
+        extern std::string g_win_policy;
+        // Production window bit-selection (squeeze/backfill/...): scan data =
+        // deposit_bits32(idx, mask) over a power-of-2 sub-2^32 window. Default (empty/linear) is the
+        // contiguous low-bit scan. mask depends on log2(window), so it is built here per window.
+        state_dedup::DataEnumerationConfig data_enum;
+        if (!g_win_policy.empty() && g_win_policy != "linear" && !full_window &&
+            (window & (window - 1u)) == 0u)
+        {
+            std::uint32_t bits = 0; while ((1u << bits) < window) bits++;
+            data_enum.enabled = true;
+            data_enum.variable_mask = tm_window_policy::make_bit_mask(
+                tm_window_policy::parse_policy(g_win_policy), bits);
+            data_enum.fixed_value = 0u;
+            data_enum.source_multiplicity = 1u;
+        }
+        state_dedup::forward_block_with_dedup(
+            tm, key, data_start, window, schedule, out, scratch,
+            dedup_every_maps, first_dedup_maps, checkpoint_entries,
+            dedup_expanded_states, stats, skip_final_hash,
+            /*map1_source_prefilter=*/nullptr, /*batch_inserts=*/true,
+            /*data_stride=*/g_data_stride,
+            /*data_enumeration=*/data_enum.enabled ? &data_enum : nullptr);
+    }
 
     std::uint64_t parity = 0;
     for (std::size_t pi = 0; pi < out.pool.size(); pi++)
@@ -181,6 +324,16 @@ struct Args
     std::string label;        // optional label written to scaling CSV
     bool scaling = false;     // emit aggregate-per-impl scaling row instead of per-cell rows
     bool skip_final_hash = false;
+    bool interleave2 = false;  // 2-way interleaved frontier replay (AVX2 map kernel; run_maps_range_x2)
+    bool interleave4 = false;  // PROTOTYPE: 4-way interleaved frontier replay (AVX-512 only)
+    bool interleave6 = false;  // PROTOTYPE: 6-way interleaved frontier replay (AVX-512 only)
+    bool interleave8 = false;  // PROTOTYPE: 8-way interleaved frontier replay (AVX-512 only)
+    bool interleave10 = false; // PROTOTYPE: 10-way interleaved frontier replay (AVX-512 only)
+    bool interleave12 = false; // PROTOTYPE: 12-way interleaved frontier replay (AVX-512 only; width ceiling probe)
+    bool interleave14 = false; // PROTOTYPE: 14-way interleaved frontier replay (AVX-512 only; spill confirmation)
+    unsigned front_cache_bits = 0; // tier-1 front cache: 2^N entries (0 = disabled)
+    bool dynamic_table = false;    // size dedup table to frontier, not window
+    bool no_warmup = false;        // skip cache-priming warm-up pass (survey speed)
 };
 
 Args parse_args(int argc, char** argv)
@@ -196,6 +349,8 @@ Args parse_args(int argc, char** argv)
         if      (s == "--keys")       a.keys_path = nxt(i, "--keys");
         else if (s == "--out")        a.out_path = nxt(i, "--out");
         else if (s == "--data-start") a.data_start = static_cast<std::uint32_t>(std::stoul(nxt(i, "--data-start"), nullptr, 0));
+        else if (s == "--data-stride") g_data_stride = static_cast<std::uint32_t>(std::stoul(nxt(i, "--data-stride"), nullptr, 0));
+        else if (s == "--win-policy") g_win_policy = nxt(i, "--win-policy");   // squeeze/backfill/lowbits (production window bit-selection)
         else if (s == "--dedup-every-maps") a.dedup_every_maps = static_cast<std::uint32_t>(std::stoul(nxt(i, "--dedup-every-maps"), nullptr, 0));
         else if (s == "--first-dedup-maps") a.first_dedup_maps = static_cast<std::uint32_t>(std::stoul(nxt(i, "--first-dedup-maps"), nullptr, 0));
         else if (s == "--dedup-checkpoints") a.checkpoint_entries = parse_checkpoints(nxt(i, "--dedup-checkpoints"));
@@ -209,6 +364,16 @@ Args parse_args(int argc, char** argv)
         else if (s == "--label")      a.label = nxt(i, "--label");
         else if (s == "--scaling")    a.scaling = true;
         else if (s == "--skip-final-hash") a.skip_final_hash = true;
+        else if (s == "--interleave2") a.interleave2 = true;
+        else if (s == "--interleave4") a.interleave4 = true;
+        else if (s == "--interleave6") a.interleave6 = true;
+        else if (s == "--interleave8") a.interleave8 = true;
+        else if (s == "--interleave10") a.interleave10 = true;
+        else if (s == "--interleave12") a.interleave12 = true;
+        else if (s == "--interleave14") a.interleave14 = true;
+        else if (s == "--front-cache-bits") a.front_cache_bits = static_cast<unsigned>(std::stoul(nxt(i, "--front-cache-bits")));
+        else if (s == "--dynamic-table") a.dynamic_table = true;
+        else if (s == "--no-warmup") a.no_warmup = true;
         else if (s == "--schedule")
         {
             std::string mode = nxt(i, "--schedule");
@@ -254,9 +419,26 @@ void bench_impl(const std::string& impl_name, TM& tm,
                 std::size_t& parity_mismatches_out,
                 BoundaryAggregate* boundary_agg,
                 bool flat_only,
-                bool skip_final_hash)
+                bool skip_final_hash,
+                bool use_il4,
+                bool use_il6 = false,
+                bool use_il8 = false,
+                bool use_il10 = false,
+                bool use_il12 = false,
+                bool use_il14 = false,
+                bool use_il2 = false)
 {
     state_dedup::FlatTable dedup_out, dedup_scratch;
+    if (g_front_cache_bits)
+    {
+        dedup_out.enable_front_cache(g_front_cache_bits);
+        dedup_scratch.enable_front_cache(g_front_cache_bits);
+    }
+    if (g_dynamic_table)
+    {
+        dedup_out.set_dynamic(true);
+        dedup_scratch.set_dynamic(true);
+    }
     state_dedup::BoundaryStats boundary_buf;
 
     typedef std::chrono::high_resolution_clock clock;
@@ -271,20 +453,22 @@ void bench_impl(const std::string& impl_name, TM& tm,
         for (std::size_t w_idx = 0; w_idx < windows.size(); w_idx++)
         {
             const std::uint32_t window = windows[w_idx];
-            if (window == 0) continue;
+            const std::uint64_t effective_window = state_dedup::effective_window_count(window);
 
             std::vector<double> ts_base, ts_flat;
             std::uint64_t parity_base = 0, parity_flat = 0;
             std::size_t unique = 0;
 
-            // Warm-up to prime caches.
+            // Warm-up to prime caches (skipped under --no-warmup; final_unique is
+            // timing-invariant, so surveys avoid the doubled work / guard trip).
+            if (!g_no_warmup)
             {
                 std::uint64_t p; std::size_t u;
                 if (!flat_only) (void)bench_baseline(tm, key, data_start, window, schedule, p);
                 (void)bench_flat    (tm, key, data_start, window, schedule, dedup_out, dedup_scratch, p, u,
                                      dedup_every_maps, first_dedup_maps,
                                      checkpoint_entries.empty() ? nullptr : &checkpoint_entries,
-                                     dedup_expanded_states, nullptr, skip_final_hash);
+                                     dedup_expanded_states, nullptr, skip_final_hash, use_il4, use_il6, use_il8, use_il10, use_il12, use_il14, use_il2);
             }
 
             for (int r = 0; r < repeats; r++)
@@ -296,14 +480,14 @@ void bench_impl(const std::string& impl_name, TM& tm,
                                                 checkpoint_entries.empty() ? nullptr : &checkpoint_entries,
                                                 dedup_expanded_states,
                                                 boundary_agg ? &boundary_buf : nullptr,
-                                                skip_final_hash));
+                                                skip_final_hash, use_il4, use_il6, use_il8, use_il10, use_il12, use_il14, use_il2));
                 if (boundary_agg) fold_boundary_stats(*boundary_agg, boundary_buf);
             }
 
             const double m_base = flat_only ? 0.0 : median(ts_base);
             const double m_flat = median(ts_flat);
-            const double cps_base = m_base > 0 ? static_cast<double>(window) / m_base : 0;
-            const double cps_flat = m_flat > 0 ? static_cast<double>(window) / m_flat : 0;
+            const double cps_base = m_base > 0 ? static_cast<double>(effective_window) / m_base : 0;
+            const double cps_flat = m_flat > 0 ? static_cast<double>(effective_window) / m_flat : 0;
             const double dedup_speedup = m_flat > 0 && m_base > 0 ? m_base / m_flat : 0;
             const bool parity_ok = flat_only ? true : (parity_base == parity_flat);
             if (!parity_ok) parity_mismatches_out++;
@@ -350,7 +534,14 @@ void bench_impl_threaded(const std::string& impl_name,
                          bool dedup_expanded_states,
                          key_schedule::map_list_type map_kind,
                          std::ofstream& scaling_out,
-                         bool skip_final_hash)
+                         bool skip_final_hash,
+                         bool use_il4 = false,
+                         bool use_il6 = false,
+                         bool use_il8 = false,
+                         bool use_il10 = false,
+                         bool use_il12 = false,
+                         bool use_il14 = false,
+                         bool use_il2 = false)
 {
     const std::size_t total_tasks = keys.size() * windows.size();
     if (total_tasks == 0) return;
@@ -363,6 +554,16 @@ void bench_impl_threaded(const std::string& impl_name,
         auto tm_holder = make_tm();
         auto& tm = *tm_holder;
         state_dedup::FlatTable out, scratch;
+        if (g_front_cache_bits)
+        {
+            out.enable_front_cache(g_front_cache_bits);
+            scratch.enable_front_cache(g_front_cache_bits);
+        }
+        if (g_dynamic_table)
+        {
+            out.set_dynamic(true);
+            scratch.set_dynamic(true);
+        }
 
         while (true)
         {
@@ -372,7 +573,7 @@ void bench_impl_threaded(const std::string& impl_name,
             const std::size_t w_idx = static_cast<std::size_t>(task % windows.size());
             const std::uint32_t key = keys[k_idx];
             const std::uint32_t window = windows[w_idx];
-            if (window == 0) continue;
+            const std::uint64_t effective_window = state_dedup::effective_window_count(window);
             key_schedule schedule(key, map_kind);
 
             std::uint64_t total_states_this_task = 0;
@@ -382,8 +583,8 @@ void bench_impl_threaded(const std::string& impl_name,
                 (void)bench_flat(tm, key, data_start, window, schedule, out, scratch,
                                  p, u, dedup_every_maps, first_dedup_maps,
                                  checkpoint_entries.empty() ? nullptr : &checkpoint_entries,
-                                 dedup_expanded_states, nullptr, skip_final_hash);
-                total_states_this_task += window;
+                                 dedup_expanded_states, nullptr, skip_final_hash, use_il4, use_il6, use_il8, use_il10, use_il12, use_il14, use_il2);
+                total_states_this_task += effective_window;
             }
             per_thread_states[static_cast<std::size_t>(tid)] += total_states_this_task;
         }
@@ -419,11 +620,17 @@ int main(int argc, char** argv)
     try
     {
         Args a = parse_args(argc, argv);
+        g_front_cache_bits = a.front_cache_bits;
+        g_dynamic_table = a.dynamic_table;
+        g_no_warmup = a.no_warmup;
         std::vector<std::uint32_t> keys = key_file::read_keys(a.keys_path, a.limit);
         if (keys.empty()) throw std::runtime_error("no keys parsed from: " + a.keys_path);
 
         std::vector<std::uint32_t> windows_sorted(a.windows);
-        std::sort(windows_sorted.begin(), windows_sorted.end());
+        std::sort(windows_sorted.begin(), windows_sorted.end(),
+                  [](std::uint32_t lhs, std::uint32_t rhs) {
+                      return state_dedup::effective_window_count(lhs) < state_dedup::effective_window_count(rhs);
+                  });
 
         std::ofstream out;
         if (!a.scaling)
@@ -443,7 +650,13 @@ int main(int argc, char** argv)
                   << "  dedup_expanded_states: " << (a.dedup_expanded_states ? "yes" : "no") << "\n"
                   << "  windows:    ";
         for (std::size_t i = 0; i < windows_sorted.size(); i++)
-            std::cerr << (i == 0 ? "" : ",") << windows_sorted[i];
+        {
+            std::cerr << (i == 0 ? "" : ",");
+            if (state_dedup::is_full_u32_window(windows_sorted[i]))
+                std::cerr << "0(full-2^32)";
+            else
+                std::cerr << windows_sorted[i];
+        }
         if (!a.checkpoint_entries.empty())
         {
             std::cerr << "\n  dedup_checkpoints: ";
@@ -502,7 +715,44 @@ int main(int argc, char** argv)
                     bench_impl_threaded(impl_name, label, make_tm, keys, windows_sorted,
                         a.data_start, a.repeats, a.threads, a.dedup_every_maps,
                         a.first_dedup_maps, a.checkpoint_entries,
-                        a.dedup_expanded_states, a.map_kind, scaling, a.skip_final_hash);
+                        a.dedup_expanded_states, a.map_kind, scaling, a.skip_final_hash,
+                        false, false, false, false, false, false, a.interleave2);  // AVX2 map: --interleave2 -> run_maps_range_x2
+                }
+                else if (impl_name == "tm_avx512_r512s_8")
+                {
+                    auto make_tm = [&](){
+                        static thread_local RNG trng;
+                        return std::make_unique<tm_avx512_r512s_8>(&trng);
+                    };
+                    bench_impl_threaded(impl_name, label, make_tm, keys, windows_sorted,
+                        a.data_start, a.repeats, a.threads, a.dedup_every_maps,
+                        a.first_dedup_maps, a.checkpoint_entries,
+                        a.dedup_expanded_states, a.map_kind, scaling, a.skip_final_hash,
+                        a.interleave4, a.interleave6, a.interleave8, a.interleave10, a.interleave12, a.interleave14);  // --interleaveN routes AVX-512 through the N-way kernel
+                }
+                else if (impl_name == "tm_avx512_r512_map_8")
+                {
+                    auto make_tm = [&](){
+                        static thread_local RNG trng;
+                        return std::make_unique<tm_avx512_r512_map_8>(&trng);
+                    };
+                    bench_impl_threaded(impl_name, label, make_tm, keys, windows_sorted,
+                        a.data_start, a.repeats, a.threads, a.dedup_every_maps,
+                        a.first_dedup_maps, a.checkpoint_entries,
+                        a.dedup_expanded_states, a.map_kind, scaling, a.skip_final_hash,
+                        a.interleave4, a.interleave6, a.interleave8, a.interleave10, a.interleave12, a.interleave14);  // natural map now has x8/x12/x14
+                }
+                else if (impl_name == "tm_avx512_r512s_map_8")
+                {
+                    auto make_tm = [&](){
+                        static thread_local RNG trng;
+                        return std::make_unique<tm_avx512_r512s_map_8>(&trng);
+                    };
+                    bench_impl_threaded(impl_name, label, make_tm, keys, windows_sorted,
+                        a.data_start, a.repeats, a.threads, a.dedup_every_maps,
+                        a.first_dedup_maps, a.checkpoint_entries,
+                        a.dedup_expanded_states, a.map_kind, scaling, a.skip_final_hash,
+                        a.interleave4);  // --interleave4 routes AVX-512 through the 4-way kernel
                 }
                 else
                 {
@@ -519,32 +769,42 @@ int main(int argc, char** argv)
             if (impl_name == "tm_8")
             {
                 tm_8 tm(&rng);
-                bench_impl(impl_name, tm, keys, windows_sorted, a.data_start, a.repeats, a.dedup_every_maps, a.first_dedup_maps, a.checkpoint_entries, a.dedup_expanded_states, a.map_kind, out, parity_mismatches, agg, a.flat_only, a.skip_final_hash);
+                bench_impl(impl_name, tm, keys, windows_sorted, a.data_start, a.repeats, a.dedup_every_maps, a.first_dedup_maps, a.checkpoint_entries, a.dedup_expanded_states, a.map_kind, out, parity_mismatches, agg, a.flat_only, a.skip_final_hash, a.interleave4);
             }
             else if (impl_name == "tm_avx_r128s_8")
             {
                 tm_avx_r128s_8 tm(&rng);
-                bench_impl(impl_name, tm, keys, windows_sorted, a.data_start, a.repeats, a.dedup_every_maps, a.first_dedup_maps, a.checkpoint_entries, a.dedup_expanded_states, a.map_kind, out, parity_mismatches, agg, a.flat_only, a.skip_final_hash);
+                bench_impl(impl_name, tm, keys, windows_sorted, a.data_start, a.repeats, a.dedup_every_maps, a.first_dedup_maps, a.checkpoint_entries, a.dedup_expanded_states, a.map_kind, out, parity_mismatches, agg, a.flat_only, a.skip_final_hash, a.interleave4);
             }
             else if (impl_name == "tm_avx_r256s_8")
             {
                 tm_avx_r256s_8 tm(&rng);
-                bench_impl(impl_name, tm, keys, windows_sorted, a.data_start, a.repeats, a.dedup_every_maps, a.first_dedup_maps, a.checkpoint_entries, a.dedup_expanded_states, a.map_kind, out, parity_mismatches, agg, a.flat_only, a.skip_final_hash);
+                bench_impl(impl_name, tm, keys, windows_sorted, a.data_start, a.repeats, a.dedup_every_maps, a.first_dedup_maps, a.checkpoint_entries, a.dedup_expanded_states, a.map_kind, out, parity_mismatches, agg, a.flat_only, a.skip_final_hash, a.interleave4);
             }
             else if (impl_name == "tm_avx2_r256s_8")
             {
                 tm_avx2_r256s_8 tm(&rng);
-                bench_impl(impl_name, tm, keys, windows_sorted, a.data_start, a.repeats, a.dedup_every_maps, a.first_dedup_maps, a.checkpoint_entries, a.dedup_expanded_states, a.map_kind, out, parity_mismatches, agg, a.flat_only, a.skip_final_hash);
+                bench_impl(impl_name, tm, keys, windows_sorted, a.data_start, a.repeats, a.dedup_every_maps, a.first_dedup_maps, a.checkpoint_entries, a.dedup_expanded_states, a.map_kind, out, parity_mismatches, agg, a.flat_only, a.skip_final_hash, a.interleave4);
             }
             else if (impl_name == "tm_avx2_r256_map_8")
             {
                 tm_avx2_r256_map_8 tm(&rng);
-                bench_impl(impl_name, tm, keys, windows_sorted, a.data_start, a.repeats, a.dedup_every_maps, a.first_dedup_maps, a.checkpoint_entries, a.dedup_expanded_states, a.map_kind, out, parity_mismatches, agg, a.flat_only, a.skip_final_hash);
+                bench_impl(impl_name, tm, keys, windows_sorted, a.data_start, a.repeats, a.dedup_every_maps, a.first_dedup_maps, a.checkpoint_entries, a.dedup_expanded_states, a.map_kind, out, parity_mismatches, agg, a.flat_only, a.skip_final_hash, a.interleave4, false, false, false, false, false, a.interleave2);
             }
             else if (impl_name == "tm_avx512_r512s_8")
             {
                 tm_avx512_r512s_8 tm(&rng);
-                bench_impl(impl_name, tm, keys, windows_sorted, a.data_start, a.repeats, a.dedup_every_maps, a.first_dedup_maps, a.checkpoint_entries, a.dedup_expanded_states, a.map_kind, out, parity_mismatches, agg, a.flat_only, a.skip_final_hash);
+                bench_impl(impl_name, tm, keys, windows_sorted, a.data_start, a.repeats, a.dedup_every_maps, a.first_dedup_maps, a.checkpoint_entries, a.dedup_expanded_states, a.map_kind, out, parity_mismatches, agg, a.flat_only, a.skip_final_hash, a.interleave4, a.interleave6, a.interleave8, a.interleave10, a.interleave12, a.interleave14);
+            }
+            else if (impl_name == "tm_avx512_r512_map_8")
+            {
+                tm_avx512_r512_map_8 tm(&rng);
+                bench_impl(impl_name, tm, keys, windows_sorted, a.data_start, a.repeats, a.dedup_every_maps, a.first_dedup_maps, a.checkpoint_entries, a.dedup_expanded_states, a.map_kind, out, parity_mismatches, agg, a.flat_only, a.skip_final_hash, a.interleave4, a.interleave6, a.interleave8, a.interleave10, a.interleave12, a.interleave14);
+            }
+            else if (impl_name == "tm_avx512_r512s_map_8")
+            {
+                tm_avx512_r512s_map_8 tm(&rng);
+                bench_impl(impl_name, tm, keys, windows_sorted, a.data_start, a.repeats, a.dedup_every_maps, a.first_dedup_maps, a.checkpoint_entries, a.dedup_expanded_states, a.map_kind, out, parity_mismatches, agg, a.flat_only, a.skip_final_hash, a.interleave4);
             }
             else
             {
@@ -594,6 +854,7 @@ int main(int argc, char** argv)
     {
         std::cerr << "error: " << e.what() << "\n";
         std::cerr << "usage: state_dedup_matrix_bench --keys FILE --out CSV --windows W1,W2,... "
+                     "(use W=0 for exact 2^32/W4B) "
                      "[--impl tm_8,tm_avx2_r256s_8,...] [--data-start HEX] [--repeats R] "
                      "[--dedup-every-maps N] [--first-dedup-maps N] [--dedup-checkpoints LIST] "
                      "[--skip-expand-dedup] [--dedup-expand-states] [--boundary-stats CSV] "

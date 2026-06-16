@@ -10,8 +10,9 @@ forward maps, then screen the final state against the target worlds.
 From the repository root:
 
 ```sh
-make cpu
-make cpu-dedup
+make raceway    # PRODUCTION CPU engine (bounded-wave forward dedup)
+make cpu        # research: native AVX/SIMD throughput benchmark
+make cpu-dedup  # research: state-dedup characterization tools
 make cuda
 make opencl
 ```
@@ -27,11 +28,12 @@ cd src/bruteforce/state_dedup_screen_bench && make
 
 ```text
 cpu/                         Scalar + SIMD forward kernels
-bench_cpu/                   Native CPU throughput benchmark
-state_dedup_speedup_bench/   Flat dedup speedup smoke/parity tool
-state_dedup_matrix_bench/    Representative-key/window matrix tool
-state_dedup_screen_bench/    Flat/no-origin dedup plus full flag screening
-state_dedup_origin_bench/    Origin-tracking dedup benchmark
+cpu_raceway/                 PRODUCTION CPU engine — bounded-wave forward dedup
+bench_cpu/                   research: native CPU throughput benchmark
+state_dedup_speedup_bench/   research: flat dedup speedup smoke/parity tool
+state_dedup_matrix_bench/    research: representative-key/window matrix tool
+state_dedup_screen_bench/    research: flat/no-origin dedup plus full flag screening
+state_dedup_origin_bench/    research: origin-tracking dedup benchmark
 ```
 
 The consolidated public repo exposes the cleaned GPU releases as top-level
@@ -40,7 +42,17 @@ staged under `release_staging/tm_cuda/` and `release_staging/opencl_public/`.
 
 ## CPU
 
-Primary current CPU implementation:
+**Production CPU engine (2026-06-16): the bounded-wave raceway** (`cpu_raceway/`) — best
+across BOTH throughput and memory, the default for any host. It auto-selects the right ISA
+build (AVX-512 natmap / AVX2 legacy) and a host-appropriate wave/cap:
+
+```sh
+cd src/bruteforce/cpu_raceway && ./raceway_autoconfig.sh --build
+./cpu_raceway <key> 0 <threads>        # 0 = full 2^32 window (needs PRODUCER_CAP=1)
+```
+
+The tools below (`bench_cpu`, `state_dedup_*_bench`) are **research / characterization**
+harnesses (throughput, dedup-collapse, parity), not the production search path:
 
 ```sh
 ./src/bruteforce/bench_cpu/bench_cpu \
@@ -48,9 +60,9 @@ Primary current CPU implementation:
 ```
 
 Recent release-candidate profiling on a Ryzen 9 9900X measured roughly
-`0.55 M candidates/s/thread` for the production non-dedup AVX2 map screen
-path. Scaling remains useful through high concurrency, but per-thread
-throughput falls after about 8 to 12 threads from shared cache/table pressure.
+`0.55 M candidates/s/thread` for the non-dedup AVX2 map screen path. Scaling remains useful
+through high concurrency, but per-thread throughput falls after about 8 to 12 threads from
+shared cache/table pressure.
 
 The CPU state-dedup route is useful when many data values converge to the
 same final states. The fast production shape is:
@@ -151,12 +163,12 @@ Short benchmark:
 ```sh
 ./tm_cuda --device 0 --key_id 0x2CA5B42D --range_start 0 \
   --workunit_size 16777216 --batch_size 1048576 --warmup_batches 1 \
-  --screen-offsets --ilp 8
+  --screen-offsets --ilp 6
 ```
 
-The current production screen path is the offset-stream kernel. Recent
-measurements were about `132 M candidates/s` on RTX 5090 and about
-`105 M candidates/s` on RTX PRO 6000 Blackwell Max-Q.
+The current production screen path is the offset-stream kernel at ILP6.
+Recent measurements were about `135 M candidates/s` on RTX 5090 and about
+`110 M candidates/s` on RTX PRO 6000 Blackwell Max-Q.
 
 ## OpenCL
 

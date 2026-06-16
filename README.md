@@ -109,6 +109,7 @@ src/
   bruteforce/
     bench_cpu/                 CPU SIMD throughput benchmark
     cpu/                       Scalar, SSE, AVX, AVX2, AVX-512 kernels
+    cpu_raceway/               Bounded-wave forward dedup (single-host full-2^32 search)
     state_dedup_*_bench/       CPU state-dedup tools
   common/                      RNG, key schedule, target data, shared types
 cuda/                          Public-clean CUDA forward verifier

@@ -29,6 +29,9 @@
 #include <cstdlib>
 #include <cstddef>
 #include <vector>
+#if defined(_WIN32)
+#include <malloc.h>
+#endif
 
 #include "data_sizes.h"
 #include "rng.h"
@@ -37,6 +40,26 @@
 
 namespace map_tables_shared
 {
+
+inline void free_aligned(void* p)
+{
+#if defined(_WIN32)
+    _aligned_free(p);
+#else
+    std::free(p);
+#endif
+}
+
+inline uint8* allocate_aligned_32(std::size_t bytes)
+{
+#if defined(_WIN32)
+    return static_cast<uint8*>(_aligned_malloc(bytes, 32));
+#else
+    void* p = nullptr;
+    if (posix_memalign(&p, 32, bytes) != 0) return nullptr;
+    return static_cast<uint8*>(p);
+#endif
+}
 
 struct Tables
 {
@@ -75,10 +98,10 @@ struct Tables
 
         if (changed) {
             if (static_cast<size_t>(n) > capacity_entries) {
-                std::free(reg_table);  std::free(alg0_table);  std::free(alg6_table);
-                if (posix_memalign((void**)&reg_table,  32, n * 2048) != 0) reg_table  = nullptr;
-                if (posix_memalign((void**)&alg0_table, 32, n * ALG06_BYTES_PER_ENTRY) != 0) alg0_table = nullptr;
-                if (posix_memalign((void**)&alg6_table, 32, n * ALG06_BYTES_PER_ENTRY) != 0) alg6_table = nullptr;
+                free_aligned(reg_table);  free_aligned(alg0_table);  free_aligned(alg6_table);
+                reg_table = allocate_aligned_32(static_cast<std::size_t>(n) * 2048);
+                alg0_table = allocate_aligned_32(static_cast<std::size_t>(n) * ALG06_BYTES_PER_ENTRY);
+                alg6_table = allocate_aligned_32(static_cast<std::size_t>(n) * ALG06_BYTES_PER_ENTRY);
                 capacity_entries = static_cast<size_t>(n);
             }
             seeds.resize(n);
@@ -118,10 +141,10 @@ struct Tables
 
         if (changed) {
             if (static_cast<size_t>(n) > capacity_entries) {
-                std::free(reg_table);  std::free(alg0_table);  std::free(alg6_table);
-                if (posix_memalign((void**)&reg_table,  32, n * 2048) != 0) reg_table  = nullptr;
-                if (posix_memalign((void**)&alg0_table, 32, n * ALG06_BYTES_PER_ENTRY) != 0) alg0_table = nullptr;
-                if (posix_memalign((void**)&alg6_table, 32, n * ALG06_BYTES_PER_ENTRY) != 0) alg6_table = nullptr;
+                free_aligned(reg_table);  free_aligned(alg0_table);  free_aligned(alg6_table);
+                reg_table = allocate_aligned_32(static_cast<std::size_t>(n) * 2048);
+                alg0_table = allocate_aligned_32(static_cast<std::size_t>(n) * ALG06_BYTES_PER_ENTRY);
+                alg6_table = allocate_aligned_32(static_cast<std::size_t>(n) * ALG06_BYTES_PER_ENTRY);
                 capacity_entries = static_cast<size_t>(n);
             }
             seeds.resize(n);

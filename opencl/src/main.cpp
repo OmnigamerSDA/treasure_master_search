@@ -2,16 +2,41 @@
 //
 // Compiles and dispatches the kernels in `tm.cl` against an OpenCL device.
 // Builds checksum-screen, expansion, stats, and full-process kernels and
-// reports survivors plus throughput. Used as the legacy GPU path before
-// the CUDA implementation in `../test_cuda/`.
+// reports survivors plus throughput.  Cross-vendor portable (OpenCL 1.2+).
 //
-// Build:  `make`                (uses GNU make; see Makefile)
-// Invoke: `./tm_opencl_32_8_test --device <id> --key_id 0x...`
+// PRODUCTION ENGINE (2026-06-16): the bounded-wave raceway (cross-vendor; best across
+// BOTH throughput and memory). This OpenCL port of the raceway runs at ~70% of the CUDA
+// raceway and is the recommended path for non-NVIDIA devices. The flat checksum-screen
+// and on-GPU compaction kernels are RESEARCH / A-B paths (the screen is also the parity
+// reference). For NVIDIA devices prefer the CUDA build (../test_cuda/).
+// Watchdog-safe: per-launch candidate counts are scaled by CU count (small iGPUs run the
+// same NDRange for seconds and would trip a GPU recovery), see wd_chunk_cands below.
+//
+// Build:    make                    (see Makefile)
+// Invoke:   ./tm_opencl_32_8_test --device <id> --key_id 0x...
+//
+// Key flags:
+//   --map-list all|skip-car   choose ALL_MAPS or SKIP_CAR schedule variant
+//   --raceway-direct-offset   PRODUCTION bounded-wave raceway (+ --raceway-cap-bits/-ways,
+//                             --raceway-direct-wave-span-ilp, --raceway-cap-boundaries)
+//   --calibrate               (research) measure screen-vs-compaction + write tm_compaction.conf
+//   --parity <N>              cross-check N candidates between screen variants
+//   --compaction-bench        on-GPU VRAM compaction architecture (research / A-B)
 //
 // Companion variant: ../tm_opencl_32_16_test (alternate 16-bit lane width).
+//
+// Sections (within the anonymous namespace below):
+//   - Kernel screen-flag bit definitions
+//   - Opcode tables (6502 instruction set for machine-code validation)
+//   - Data structures (Args, KernelAssets, SurvivorRecord, ValidationSummary)
+//   - Argument parsing
+//   - OpenCL utilities (error checking, kernel source loading, asset allocation)
+//   - Machine-code validation (check_machine_code, hash_state, checksums)
+//   - Output formatting (print_summary)
 
 #include <CL/cl.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <cstdint>
@@ -19,6 +44,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -31,65 +57,17 @@
 namespace
 {
 	static const uint32_t kDefaultBatchSize = 1u << 20;
+	static const uint32_t kRacewayDefaultCapIlp = 4u;
+	static const uint32_t kRacewayDefaultPersistentGroups = 65536u;
 	static const uint8_t kMapList[26] = {
 		0x00, 0x02, 0x05, 0x04, 0x03, 0x1D, 0x1C, 0x1E, 0x1B,
 		0x07, 0x08, 0x06, 0x09, 0x0C, 0x20, 0x21, 0x22, 0x23,
 		0x24, 0x25, 0x26, 0x0E, 0x0F, 0x10, 0x12, 0x11
 	};
 
-	static const uint8_t CHECKSUM_SENTINEL = 0x08;
-	static const uint8_t OTHER_WORLD = 0x01;
-	static const uint8_t FIRST_ENTRY_VALID = 0x02;
-	static const uint8_t ALL_ENTRIES_VALID = 0x04;
-	static const uint8_t USES_NOP = 0x10;
-	static const uint8_t USES_UNOFFICIAL_NOPS = 0x20;
-	static const uint8_t USES_ILLEGAL_OPCODES = 0x40;
-	static const uint8_t USES_JAM = 0x80;
+	#include "opencl_opcodes.h"
 
-	static const uint8_t OP_JAM = 0x01;
-	static const uint8_t OP_ILLEGAL = 0x02;
-	static const uint8_t OP_NOP2 = 0x04;
-	static const uint8_t OP_NOP = 0x08;
-	static const uint8_t OP_JUMP = 0x10;
-
-	static const uint8_t kOpcodeBytesUsed[0x100] = {
-		1,2,0,0,2,2,2,0,1,2,1,0,3,3,3,0,
-		2,2,0,0,2,2,2,0,1,3,1,0,2,3,3,0,
-		3,2,0,0,2,2,2,0,1,2,1,0,3,3,3,0,
-		2,2,0,0,2,2,2,0,1,3,1,0,2,3,3,0,
-		1,2,0,0,2,2,2,0,1,2,1,0,3,3,3,0,
-		2,2,0,0,2,2,2,0,1,3,1,0,2,3,3,0,
-		1,2,0,0,2,2,2,0,1,2,1,0,3,3,3,0,
-		2,2,0,0,2,2,2,0,1,3,1,0,2,3,3,0,
-		2,2,2,0,2,2,2,0,1,2,1,0,3,3,3,0,
-		2,2,0,0,2,2,2,0,1,3,1,0,0,3,0,0,
-		2,2,2,0,2,2,2,0,1,2,1,0,3,3,3,0,
-		2,2,0,0,2,2,2,0,1,3,1,0,3,3,3,0,
-		2,2,2,0,2,2,2,0,1,2,1,0,3,3,3,0,
-		2,2,0,0,2,2,2,0,1,3,1,0,2,3,3,0,
-		2,2,2,0,2,2,2,0,1,2,1,0,3,3,3,0,
-		2,2,0,0,2,2,2,0,1,3,1,0,2,3,3,0
-	};
-
-	static const uint8_t kOpcodeType[0x100] = {
-		0, 0, OP_JAM, OP_ILLEGAL, OP_NOP2, 0, 0, OP_ILLEGAL, 0, 0, 0, OP_ILLEGAL, OP_NOP2, 0, 0, OP_ILLEGAL,
-		OP_JUMP, 0, OP_JAM, OP_ILLEGAL, OP_NOP2, 0, 0, OP_ILLEGAL, 0, 0, OP_NOP2, OP_ILLEGAL, OP_NOP2, 0, 0, OP_ILLEGAL,
-		OP_JUMP, 0, OP_JAM, OP_ILLEGAL, 0, 0, 0, OP_ILLEGAL, 0, 0, 0, OP_ILLEGAL, 0, 0, 0, OP_ILLEGAL,
-		OP_JUMP, 0, OP_JAM, OP_ILLEGAL, OP_NOP2, 0, 0, OP_ILLEGAL, 0, 0, OP_NOP2, OP_ILLEGAL, OP_NOP2, 0, 0, OP_ILLEGAL,
-		OP_JUMP, 0, OP_JAM, OP_ILLEGAL, OP_NOP2, 0, 0, OP_ILLEGAL, 0, 0, 0, OP_ILLEGAL, OP_JUMP, 0, 0, OP_ILLEGAL,
-		OP_JUMP, 0, OP_JAM, OP_ILLEGAL, OP_NOP2, 0, 0, OP_ILLEGAL, 0, 0, OP_NOP2, OP_ILLEGAL, OP_NOP2, 0, 0, OP_ILLEGAL,
-		OP_JUMP, 0, OP_JAM, OP_ILLEGAL, OP_NOP2, 0, 0, OP_ILLEGAL, 0, 0, 0, OP_ILLEGAL, OP_JUMP, 0, 0, OP_ILLEGAL,
-		OP_JUMP, 0, OP_JAM, OP_ILLEGAL, OP_NOP2, 0, 0, OP_ILLEGAL, 0, 0, OP_NOP2, OP_ILLEGAL, OP_NOP2, 0, 0, OP_ILLEGAL,
-		OP_NOP2, 0, OP_NOP2, OP_ILLEGAL, 0, 0, 0, OP_ILLEGAL, 0, OP_NOP2, 0, OP_ILLEGAL, 0, 0, 0, OP_ILLEGAL,
-		OP_JUMP, 0, OP_JAM, OP_ILLEGAL, 0, 0, 0, OP_ILLEGAL, 0, 0, 0, OP_ILLEGAL, OP_ILLEGAL, 0, OP_ILLEGAL, OP_ILLEGAL,
-		0, 0, 0, OP_ILLEGAL, 0, 0, 0, OP_ILLEGAL, 0, 0, 0, OP_ILLEGAL, 0, 0, 0, OP_ILLEGAL,
-		OP_JUMP, 0, OP_JAM, OP_ILLEGAL, 0, 0, 0, OP_ILLEGAL, 0, 0, 0, OP_ILLEGAL, 0, 0, 0, OP_ILLEGAL,
-		0, 0, OP_NOP2, OP_ILLEGAL, 0, 0, 0, OP_ILLEGAL, 0, 0, 0, OP_ILLEGAL, 0, 0, 0, OP_ILLEGAL,
-		OP_JUMP, 0, OP_JAM, OP_ILLEGAL, OP_NOP2, 0, 0, OP_ILLEGAL, 0, 0, OP_NOP2, OP_ILLEGAL, OP_NOP2, 0, 0, OP_ILLEGAL,
-		0, 0, OP_NOP2, OP_ILLEGAL, 0, 0, 0, OP_ILLEGAL, 0, 0, OP_NOP, OP_ILLEGAL, 0, 0, 0, OP_ILLEGAL,
-		OP_JUMP, 0, OP_JAM, OP_ILLEGAL, OP_NOP2, 0, 0, OP_ILLEGAL, 0, 0, OP_NOP2, OP_ILLEGAL, OP_NOP2, 0, 0, OP_ILLEGAL
-	};
-
+	// ── Data structures ──────────────────────────────────────────────────────────
 	struct Args
 	{
 		uint32_t key_id = 0x2CA5B42Du;
@@ -102,6 +80,28 @@ namespace
 		std::string output_csv_path;
 		bool use_ilp6 = false;       // Use offset-stream + ILP6 + preids screen kernel
 		uint32_t parity_count = 0u;  // Run parity vs baseline screen on N candidates and exit
+		uint32_t compaction_count = 0u;  // Run on-GPU compaction pipeline on N candidates vs ilp6 screen
+		uint32_t compaction_ilp = 8u;    // span dedup window W = SPAN_ILP (single-warp); build-time -D. W=8 optimal.
+		bool compaction_auto_tile = false;  // size the tile from device VRAM / max-alloc
+		bool calibrate = false;             // measure host-optimal engine/ilp and write config
+		std::string config_path = "tm_compaction.conf";  // calibration config file
+		bool raceway_cap_mark = false;      // Run direct offset-stream boundary-cap mark pass and exit
+		bool raceway_wave_cap_mark = false; // Run state-saving cap spans with compaction between boundaries
+		uint32_t raceway_cap_bits = 0u;     // 0 disables caps for all-alive launch/parity smoke
+		uint32_t raceway_cap_ways = 4u;
+		uint32_t raceway_cap_count = 1u;
+		uint32_t raceway_first_cap_map = 1u;
+		std::string raceway_cap_boundaries;
+		bool raceway_cap_force_fp32 = false;
+		bool raceway_cap_force_fp64 = false;
+		uint32_t raceway_bench_repeats = 1u;
+		std::string raceway_profile_csv_path;
+		bool raceway_persistent = true;
+		uint32_t raceway_persistent_groups = 0u;
+		uint32_t raceway_cap_ilp = kRacewayDefaultCapIlp;
+		bool raceway_subgroup = false;   // register-resident + sub_group_broadcast inner loop (AMD LDS-relief prototype)
+		bool raceway_cap_plain_store = false;  // lever #2: benign-race non-atomic cap insert (FN-safe over-keep)
+		bool raceway_lds_rng = false;    // LDS-resident RNG staging (x1 collapse; stage regular, derive alg0/alg6)
 	};
 
 	struct KernelAssets
@@ -147,7 +147,8 @@ namespace
 
 	const char* kKernelPaths[] = {
 		"./tm.cl",
-		"src/bruteforce/tm_opencl_32_8_test/tm.cl",
+		"src/tm.cl",                                  // public package layout (binary beside src/)
+		"src/bruteforce/tm_opencl_32_8_test/tm.cl",   // dev tree (run from repo root)
 		"tm_opencl_32_8_test/tm.cl"
 	};
 
@@ -165,6 +166,63 @@ namespace
 		return static_cast<T>(parsed);
 	}
 
+	std::vector<uint32_t> parse_u32_list(const std::string& text, const char* name)
+	{
+		std::vector<uint32_t> out;
+		std::stringstream ss(text);
+		std::string token;
+		while (std::getline(ss, token, ','))
+		{
+			if (token.empty()) continue;
+			char* end = nullptr;
+			const unsigned long parsed = std::strtoul(token.c_str(), &end, 0);
+			if (end == token.c_str() || *end != '\0')
+			{
+				std::ostringstream message;
+				message << "Invalid numeric value in " << name << ": " << token;
+				throw std::runtime_error(message.str());
+			}
+			out.push_back(static_cast<uint32_t>(parsed));
+		}
+		if (out.empty())
+		{
+			throw std::runtime_error(std::string(name) + " must contain at least one value");
+		}
+		return out;
+	}
+
+	std::vector<uint32_t> build_raceway_cap_maps(const Args& args)
+	{
+		std::vector<uint32_t> maps;
+		if (!args.raceway_cap_boundaries.empty())
+		{
+			maps = parse_u32_list(args.raceway_cap_boundaries, "--raceway-cap-boundaries");
+			for (uint32_t& completed_map : maps)
+			{
+				if (completed_map == 0u || completed_map >= 27u)
+				{
+					throw std::runtime_error("--raceway-cap-boundaries entries must be completed map numbers in [1,26]");
+				}
+				completed_map -= 1u;
+			}
+			std::sort(maps.begin(), maps.end());
+			maps.erase(std::unique(maps.begin(), maps.end()), maps.end());
+		}
+		else
+		{
+			for (uint32_t i = 0u; i < args.raceway_cap_count; i++)
+			{
+				maps.push_back(args.raceway_first_cap_map + i);
+			}
+		}
+		if (args.raceway_cap_bits == 0u)
+		{
+			maps.clear();
+		}
+		return maps;
+	}
+
+	// ── Argument parsing ─────────────────────────────────────────────────────────
 	Args parse_args(int argc, char** argv)
 	{
 		Args args;
@@ -211,6 +269,96 @@ namespace
 			{
 				args.parity_count = numeric_arg<uint32_t>(argv[++i], "--parity");
 			}
+			else if (arg == "--compaction" && i + 1 < argc)
+			{
+				args.compaction_count = numeric_arg<uint32_t>(argv[++i], "--compaction");
+			}
+			else if (arg == "--compaction-ilp" && i + 1 < argc)
+			{
+				args.compaction_ilp = numeric_arg<uint32_t>(argv[++i], "--compaction-ilp");
+			}
+			else if (arg == "--compaction-auto-tile")
+			{
+				args.compaction_auto_tile = true;
+				if (args.compaction_count == 0u) args.compaction_count = 1u;  // placeholder; set from VRAM
+			}
+			else if (arg == "--calibrate")
+			{
+				args.calibrate = true;
+				if (i + 1 < argc && argv[i + 1][0] != '-') args.config_path = argv[++i];
+			}
+			else if (arg == "--config" && i + 1 < argc)
+			{
+				args.config_path = argv[++i];
+			}
+			else if (arg == "--raceway-cap-mark")
+			{
+				args.raceway_cap_mark = true;
+			}
+			else if (arg == "--raceway-wave-cap-mark")
+			{
+				args.raceway_wave_cap_mark = true;
+			}
+			else if (arg == "--raceway-cap-bits" && i + 1 < argc)
+			{
+				args.raceway_cap_bits = numeric_arg<uint32_t>(argv[++i], "--raceway-cap-bits");
+			}
+			else if (arg == "--raceway-cap-ways" && i + 1 < argc)
+			{
+				args.raceway_cap_ways = numeric_arg<uint32_t>(argv[++i], "--raceway-cap-ways");
+			}
+			else if (arg == "--raceway-cap-count" && i + 1 < argc)
+			{
+				args.raceway_cap_count = numeric_arg<uint32_t>(argv[++i], "--raceway-cap-count");
+			}
+			else if (arg == "--raceway-first-cap-map" && i + 1 < argc)
+			{
+				args.raceway_first_cap_map = numeric_arg<uint32_t>(argv[++i], "--raceway-first-cap-map");
+			}
+			else if (arg == "--raceway-cap-boundaries" && i + 1 < argc)
+			{
+				args.raceway_cap_boundaries = argv[++i];
+			}
+			else if (arg == "--raceway-cap-fp32")
+			{
+				args.raceway_cap_force_fp32 = true;
+			}
+			else if (arg == "--raceway-cap-fp64")
+			{
+				args.raceway_cap_force_fp64 = true;
+			}
+			else if (arg == "--raceway-subgroup")
+			{
+				args.raceway_subgroup = true;
+			}
+			else if (arg == "--raceway-cap-plain-store")
+			{
+				args.raceway_cap_plain_store = true;
+			}
+			else if (arg == "--raceway-lds-rng")
+			{
+				args.raceway_lds_rng = true;
+			}
+			else if (arg == "--raceway-bench-repeats" && i + 1 < argc)
+			{
+				args.raceway_bench_repeats = numeric_arg<uint32_t>(argv[++i], "--raceway-bench-repeats");
+			}
+			else if (arg == "--raceway-profile-csv" && i + 1 < argc)
+			{
+				args.raceway_profile_csv_path = argv[++i];
+			}
+			else if (arg == "--raceway-static-groups")
+			{
+				args.raceway_persistent = false;
+			}
+			else if (arg == "--raceway-persistent-groups" && i + 1 < argc)
+			{
+				args.raceway_persistent_groups = numeric_arg<uint32_t>(argv[++i], "--raceway-persistent-groups");
+			}
+			else if (arg == "--raceway-cap-ilp" && i + 1 < argc)
+			{
+				args.raceway_cap_ilp = numeric_arg<uint32_t>(argv[++i], "--raceway-cap-ilp");
+			}
 			else if (arg == "--help" || arg == "-h")
 			{
 				std::cout
@@ -232,6 +380,24 @@ namespace
 					<< "Diagnostics:\n"
 					<< "  --parity <count>            Compare baseline screen vs --ilp6 screen over <count>\n"
 					<< "                              candidates flag-by-flag, then exit. Reports speedup + PASS/FAIL.\n"
+					<< "  --raceway-cap-mark          Run OpenCL direct offset-stream boundary-cap mark pass, then exit.\n"
+					<< "  --raceway-wave-cap-mark     Run state-saving cap spans with compacted survivors between boundaries.\n"
+					<< "  --raceway-cap-bits <bits>   Cap bucket bits; 0 disables caps for all-alive smoke (default 0).\n"
+					<< "                              Uses fp64 caps when cl_khr_int64_base_atomics is available.\n"
+					<< "  --raceway-cap-ways <ways>   Cap ways per bucket (default 4).\n"
+					<< "  --raceway-cap-count <count> Consecutive completed-map boundaries to probe (default 1).\n"
+					<< "  --raceway-first-cap-map <m> First completed map index to probe; MAP2 is 1 (default 1).\n"
+					<< "  --raceway-cap-boundaries <L> CUDA-style completed-map list, e.g. 2,4,8,14,20.\n"
+					<< "  --raceway-cap-fp32          Force portable fp32 cap even if fp64 atomics are available.\n"
+					<< "  --raceway-cap-fp64          Require fp64 cap; errors if the device lacks 64-bit atomics.\n"
+					<< "  --raceway-subgroup          Register-resident inner loop via sub_group_broadcast (AMD LDS-relief prototype).\n"
+					<< "  --raceway-cap-plain-store   Benign-race non-atomic cap insert (FN-safe over-keep; drops the global atomic).\n"
+					<< "  --raceway-lds-rng           LDS-resident RNG staging: stage regular rows in LDS, derive alg0/alg6 (use with --raceway-cap-ilp 16..64).\n"
+					<< "  --raceway-bench-repeats <n> Timed cap-mark repeats with fresh cap table each run (default 1).\n"
+					<< "  --raceway-profile-csv <p>   Append raceway cap-mark timing/counter row to CSV path.\n"
+					<< "  --raceway-static-groups     Disable persistent queue; launch one work-group per ILP span.\n"
+					<< "  --raceway-persistent-groups <n> Persistent queue work-groups (default min(spans, 65536)).\n"
+					<< "  --raceway-cap-ilp <n>       Candidates per 32-lane work-group for cap mark (default 4).\n"
 					<< "  --output_csv <path>         Optional CSV output of validated survivors\n";
 				std::exit(0);
 			}
@@ -251,10 +417,46 @@ namespace
 		{
 			throw std::runtime_error("--workunit_size must be greater than zero");
 		}
+		if (args.raceway_cap_ways == 0u)
+		{
+			throw std::runtime_error("--raceway-cap-ways must be greater than zero");
+		}
+		if (args.raceway_cap_bits > 32u)
+		{
+			throw std::runtime_error("--raceway-cap-bits must be <= 32");
+		}
+		if (args.raceway_first_cap_map >= 27u)
+		{
+			throw std::runtime_error("--raceway-first-cap-map must be < 27");
+		}
+		if (args.raceway_cap_boundaries.empty() && args.raceway_cap_count > 27u - args.raceway_first_cap_map)
+		{
+			throw std::runtime_error("--raceway-cap-count extends past the 27-map schedule");
+		}
+		if (args.raceway_cap_force_fp32 && args.raceway_cap_force_fp64)
+		{
+			throw std::runtime_error("--raceway-cap-fp32 and --raceway-cap-fp64 are mutually exclusive");
+		}
+		if (args.raceway_bench_repeats == 0u)
+		{
+			throw std::runtime_error("--raceway-bench-repeats must be greater than zero");
+		}
+		// The LDS-staging path amortizes the per-map RNG stage over the candidates
+		// resident in a work-group, so it needs ILP well above the global-read path's
+		// MLP-saturated [1,8] (break-even ~9; sweep 16/32/64). LDS budget is checked at
+		// build time by the kernel's __local arrays vs the 64 KB limit.
+		const uint32_t max_cap_ilp = args.raceway_lds_rng ? 64u : 8u;
+		if (args.raceway_cap_ilp == 0u || args.raceway_cap_ilp > max_cap_ilp)
+		{
+			throw std::runtime_error(args.raceway_lds_rng
+				? "--raceway-cap-ilp must be in [1,64] with --raceway-lds-rng"
+				: "--raceway-cap-ilp must be in [1,8]");
+		}
 
 		return args;
 	}
 
+	// ── OpenCL utilities ─────────────────────────────────────────────────────────
 	void throw_if_error(cl_int status, const char* what)
 	{
 		if (status == CL_SUCCESS)
@@ -291,6 +493,20 @@ namespace
 			value.resize(value.size() - 1);
 		}
 		return value;
+	}
+
+	bool has_opencl_extension(const std::string& extensions, const std::string& needle)
+	{
+		std::size_t pos = extensions.find(needle);
+		while (pos != std::string::npos)
+		{
+			const bool left_ok = (pos == 0) || extensions[pos - 1] == ' ';
+			const std::size_t end = pos + needle.size();
+			const bool right_ok = (end == extensions.size()) || extensions[end] == ' ';
+			if (left_ok && right_ok) return true;
+			pos = extensions.find(needle, pos + 1);
+		}
+		return false;
 	}
 
 	std::string load_kernel_source()
@@ -496,205 +712,9 @@ namespace
 		clReleaseMemObject(assets.carnival_data);
 	}
 
-	int reverse_offset(int offset)
-	{
-		return 127 - offset;
-	}
+	#include "opencl_validate.h"
 
-	uint64_t hash_state(const uint8_t* data)
-	{
-		uint64_t hash = 1469598103934665603ull;
-		for (int i = 0; i < 128; i++)
-		{
-			hash ^= static_cast<uint64_t>(data[i]);
-			hash *= 1099511628211ull;
-		}
-		return hash;
-	}
-
-	uint16_t calculate_checksum_from_decrypted(const uint8_t* data, bool other_world)
-	{
-		const int code_length = other_world ? 0x53 : 0x72;
-		const int checksum_start = 130 - code_length;
-		uint16_t sum = 0;
-		for (int i = checksum_start; i < 128; i++)
-		{
-			sum = static_cast<uint16_t>(sum + data[i]);
-		}
-		return sum;
-	}
-
-	uint16_t fetch_checksum_value_from_decrypted(const uint8_t* data, bool other_world)
-	{
-		const int code_length = other_world ? 0x53 : 0x72;
-		return static_cast<uint16_t>((static_cast<uint16_t>(data[reverse_offset(code_length - 1)]) << 8)
-			| static_cast<uint16_t>(data[reverse_offset(code_length - 2)]));
-	}
-
-	uint8_t check_machine_code(const uint8_t* data, bool other_world)
-	{
-		uint8_t code_length = other_world ? 0x53 : 0x72;
-		uint8_t entry_addrs[7];
-		int entry_count = 0;
-		if (!other_world)
-		{
-			entry_count = 4;
-			entry_addrs[0] = 0x00;
-			entry_addrs[1] = 0x2B;
-			entry_addrs[2] = 0x33;
-			entry_addrs[3] = 0x3E;
-			entry_addrs[4] = 0xFF;
-			entry_addrs[5] = 0xFF;
-			entry_addrs[6] = 0xFF;
-		}
-		else
-		{
-			entry_count = 6;
-			entry_addrs[0] = 0x00;
-			entry_addrs[1] = 0x05;
-			entry_addrs[2] = 0x0A;
-			entry_addrs[3] = 0x28;
-			entry_addrs[4] = 0x40;
-			entry_addrs[5] = 0x50;
-			entry_addrs[6] = 0xFF;
-		}
-
-		uint8_t active_entries[7] = { 0, 0, 0, 0, 0, 0, 0 };
-		uint8_t hit_entries[7] = { 0, 0, 0, 0, 0, 0, 0 };
-		uint8_t valid_entries[7] = { 0, 0, 0, 0, 0, 0, 0 };
-		int last_entry = -1;
-		uint8_t result = 0;
-		uint8_t next_entry_addr = entry_addrs[0];
-
-		for (int i = 0; i < code_length - 2; i++)
-		{
-			if (i == next_entry_addr)
-			{
-				last_entry++;
-				hit_entries[last_entry] = 1;
-				active_entries[last_entry] = 1;
-				next_entry_addr = entry_addrs[last_entry + 1];
-			}
-			else if (i > next_entry_addr)
-			{
-				last_entry++;
-				next_entry_addr = entry_addrs[last_entry + 1];
-			}
-
-			const uint8_t opcode = data[reverse_offset(i)];
-			if (kOpcodeType[opcode] & OP_JAM)
-			{
-				result |= USES_JAM;
-				break;
-			}
-			else if (kOpcodeType[opcode] & OP_ILLEGAL)
-			{
-				result |= USES_ILLEGAL_OPCODES;
-				break;
-			}
-			else if (kOpcodeType[opcode] & OP_NOP2)
-			{
-				result |= USES_UNOFFICIAL_NOPS;
-			}
-			else if (kOpcodeType[opcode] & OP_NOP)
-			{
-				result |= USES_NOP;
-			}
-			else if (kOpcodeType[opcode] & OP_JUMP)
-			{
-				for (int j = 0; j < entry_count; j++)
-				{
-					if (active_entries[j] == 1)
-					{
-						active_entries[j] = 0;
-						valid_entries[j] = 1;
-					}
-				}
-			}
-
-			i += kOpcodeBytesUsed[opcode] - 1;
-		}
-
-		bool all_entries_valid = true;
-		for (int i = 0; i < entry_count; i++)
-		{
-			if (hit_entries[i] == 1)
-			{
-				if (valid_entries[i] != 1)
-				{
-					all_entries_valid = false;
-					break;
-				}
-			}
-			else if (entry_addrs[i] != 0xFF)
-			{
-				for (int j = entry_addrs[i]; j < code_length - 2; j++)
-				{
-					const uint8_t opcode = data[reverse_offset(j)];
-					if ((kOpcodeType[opcode] & OP_JAM) || (kOpcodeType[opcode] & OP_ILLEGAL))
-					{
-						all_entries_valid = false;
-						break;
-					}
-					else if (kOpcodeType[opcode] & OP_JUMP)
-					{
-						break;
-					}
-
-					j += kOpcodeBytesUsed[opcode] - 1;
-				}
-			}
-		}
-
-		if (all_entries_valid)
-		{
-			result |= ALL_ENTRIES_VALID;
-		}
-		if (valid_entries[0] == 1)
-		{
-			result |= FIRST_ENTRY_VALID;
-		}
-
-		return result;
-	}
-
-	void accumulate_validation_summary(ValidationSummary& summary, uint8_t machine_flags, bool other_world)
-	{
-		summary.total++;
-		if (other_world)
-		{
-			summary.other++;
-		}
-		else
-		{
-			summary.carnival++;
-		}
-		if ((machine_flags & FIRST_ENTRY_VALID) != 0)
-		{
-			summary.first_entry_valid++;
-		}
-		if ((machine_flags & ALL_ENTRIES_VALID) != 0)
-		{
-			summary.all_entries_valid++;
-		}
-		if ((machine_flags & USES_NOP) != 0)
-		{
-			summary.uses_nop++;
-		}
-		if ((machine_flags & USES_UNOFFICIAL_NOPS) != 0)
-		{
-			summary.uses_unofficial_nops++;
-		}
-		if ((machine_flags & USES_ILLEGAL_OPCODES) != 0)
-		{
-			summary.uses_illegal++;
-		}
-		if ((machine_flags & USES_JAM) != 0)
-		{
-			summary.uses_jam++;
-		}
-	}
-
+	// ── Output formatting ────────────────────────────────────────────────────────
 	void print_summary(const Args& args,
 		const std::string& platform_name,
 		const std::string& device_name,
@@ -750,6 +770,7 @@ namespace
 	}
 }
 
+// ── Entry point ──────────────────────────────────────────────────────────────
 int main(int argc, char** argv)
 {
 	try
@@ -791,6 +812,77 @@ int main(int argc, char** argv)
 
 		const cl_device_id device = devices[args.device_index];
 		const std::string device_name = get_device_string(device, CL_DEVICE_NAME);
+		const std::string device_extensions = get_device_string(device, CL_DEVICE_EXTENSIONS);
+		const bool device_has_int64_atomics = has_opencl_extension(device_extensions, "cl_khr_int64_base_atomics");
+		const bool raceway_mode = args.raceway_cap_mark || args.raceway_wave_cap_mark;
+		if (raceway_mode && args.raceway_cap_force_fp64 && !device_has_int64_atomics)
+		{
+			throw std::runtime_error("--raceway-cap-fp64 requires cl_khr_int64_base_atomics");
+		}
+		const bool raceway_cap_fp64 = args.raceway_cap_force_fp64
+			|| (!args.raceway_cap_force_fp32 && device_has_int64_atomics);
+		if (raceway_mode && !raceway_cap_fp64 && args.raceway_cap_bits > 30u)
+		{
+			throw std::runtime_error("--raceway-cap-bits > 30 requires cl_khr_int64_base_atomics for the fp64 cap path");
+		}
+
+		// Device characteristics that govern the compaction-vs-screen tradeoff.
+		// The key one is L2 size: the per-key offset streams are ~21.6 MB, so a
+		// device whose L2 (CL_DEVICE_GLOBAL_MEM_CACHE_SIZE) is below that thrashes,
+		// pushing both kernels DRAM-bound and eroding compaction's extra-gather margin.
+		cl_ulong dev_global_mem = 0, dev_l2 = 0, dev_max_alloc = 0;
+		cl_uint  dev_cus = 0;
+		clGetDeviceInfo(device, CL_DEVICE_GLOBAL_MEM_SIZE,       sizeof(dev_global_mem), &dev_global_mem, nullptr);
+		clGetDeviceInfo(device, CL_DEVICE_GLOBAL_MEM_CACHE_SIZE, sizeof(dev_l2),         &dev_l2,         nullptr);
+		clGetDeviceInfo(device, CL_DEVICE_MAX_MEM_ALLOC_SIZE,    sizeof(dev_max_alloc),  &dev_max_alloc,  nullptr);
+		clGetDeviceInfo(device, CL_DEVICE_MAX_COMPUTE_UNITS,     sizeof(dev_cus),        &dev_cus,        nullptr);
+		// Watchdog-safe sub-launch budget. A big dGPU swallows multi-million-candidate
+		// NDRanges in well under the GPU compute watchdog, but a 2-CU iGPU runs the same
+		// launch for multiple seconds and trips a hard GPU recovery. Scale the per-launch
+		// candidate count by CU count (~64K cand/CU), clamped to [256K, 8M]; both the
+		// chunked screen and the calibration span size their sub-launches from this.
+		size_t wd_chunk_cands = (size_t)dev_cus * (64u * 1024u);
+		if (wd_chunk_cands < (256u * 1024u)) wd_chunk_cands = 256u * 1024u;
+		if (wd_chunk_cands > (8u * 1024u * 1024u)) wd_chunk_cands = 8u * 1024u * 1024u;
+		const double OFFSET_STREAM_MB = 21.6;  // per-key offset-stream working set
+		const bool l2_fits_streams = (double)dev_l2 / (1024.0 * 1024.0) >= OFFSET_STREAM_MB;
+		std::cout << "Device: " << device_name << "  CUs=" << dev_cus
+		          << "  VRAM=" << (dev_global_mem >> 20) << " MB"
+		          << "  L2=" << (dev_l2 >> 20) << " MB"
+		          << "  maxAlloc=" << (dev_max_alloc >> 20) << " MB\n";
+		// NOTE: CL_DEVICE_GLOBAL_MEM_CACHE_SIZE is unreliable on some drivers (NVIDIA
+		// reports ~5 MB even for large-L2 Blackwell), so this is a rough hint only —
+		// the authoritative engine choice is an empirical calibration run.
+		std::cout << "  engine hint (heuristic, verify by calibration): "
+		          << (l2_fits_streams ? "compaction" : "flat screen — but reported L2 may be under-stated; measure")
+		          << "\n";
+		if (raceway_mode)
+		{
+			std::cout << "  raceway cap mode: "
+			          << (raceway_cap_fp64 ? "fp64 (cl_khr_int64_base_atomics)" : "fp32 fallback")
+			          << (args.raceway_subgroup ? "  [inner loop: sub_group_broadcast, register-resident]" : "")
+			          << (args.raceway_cap_plain_store ? "  [cap insert: benign-race plain store]" : "")
+			          << "\n";
+		}
+		// Look up a calibrated config for this exact device (fingerprint-keyed).
+		{
+			std::ostringstream fpk;
+			fpk << "opencl|" << device_name << "|" << (dev_global_mem >> 20) << "MB|" << dev_cus << "CU";
+			std::ifstream cfg(args.config_path);
+			std::string l; bool found = false;
+			while (std::getline(cfg, l))
+			{
+				if (l.empty() || l[0] == '#') continue;
+				if (l.substr(0, l.find('\t')) == fpk.str())
+				{
+					std::cout << "  calibrated config: " << l.substr(l.find('\t') + 1)
+					          << "  (from " << args.config_path << ")\n";
+					found = true; break;
+				}
+			}
+			if (!found)
+				std::cout << "  no calibrated config for this device — run --calibrate (defaults to flat screen until then)\n";
+		}
 
 		cl_int status = CL_SUCCESS;
 		cl_context context = clCreateContext(nullptr, 1, &device, nullptr, nullptr, &status);
@@ -805,7 +897,22 @@ int main(int argc, char** argv)
 		cl_program program = clCreateProgramWithSource(context, 1, &source_ptr, &source_size, &status);
 		throw_if_error(status, "clCreateProgramWithSource");
 
-		status = clBuildProgram(program, 1, &device, nullptr, nullptr, nullptr);
+		// -cl-std=CL1.2 pins the OpenCL C language version for cross-vendor determinism
+		// (matches CL_TARGET_OPENCL_VERSION=120). No FP flags — this is an integer/bitwise
+		// kernel, so -cl-fast-relaxed-math / -cl-mad-enable are no-ops; optimization is on
+		// by default (no -cl-opt-disable).
+		// The subgroup variant needs the OpenCL C 2.0 subgroup builtins
+		// (sub_group_broadcast); the cl_khr_subgroups pragma alone does not expose
+		// them under CL1.2 on the AMD comgr front-end. The rest of the source is
+		// CL1.2-compatible and compiles unchanged under CL2.0.
+		const std::string cl_std = args.raceway_subgroup ? "-cl-std=CL2.0" : "-cl-std=CL1.2";
+		const std::string build_opts = cl_std + " -DSPAN_ILP=" + std::to_string(args.compaction_ilp)
+			+ " -DRACEWAY_CAP_ILP=" + std::to_string(args.raceway_cap_ilp)
+			+ (raceway_cap_fp64 ? " -DRACEWAY_CAP_FP64=1" : "")
+			+ (args.raceway_subgroup ? " -DRACEWAY_SUBGROUP=1" : "")
+			+ (args.raceway_cap_plain_store ? " -DRACEWAY_CAP_NONATOMIC=1" : "")
+			+ (args.raceway_lds_rng ? " -DRACEWAY_LDS_RNG=1 -DSTAGE_ROWS=160" : "");
+		status = clBuildProgram(program, 1, &device, build_opts.c_str(), nullptr, nullptr);
 		if (status != CL_SUCCESS)
 		{
 			size_t log_size = 0;
@@ -821,11 +928,39 @@ int main(int argc, char** argv)
 		throw_if_error(status, "clCreateKernel(tm_materialize_survivors)");
 		cl_kernel screen_ilp6_kernel = clCreateKernel(program, "tm_checksum_screen_offset_ilp6", &status);
 		throw_if_error(status, "clCreateKernel(tm_checksum_screen_offset_ilp6)");
+		cl_kernel span_kernel = nullptr, compact_kernel = nullptr, resolve_kernel = nullptr;
+		cl_kernel raceway_cap_mark_kernel = nullptr;
+		cl_kernel raceway_wave_first_kernel = nullptr;
+		cl_kernel raceway_wave_span_kernel = nullptr;
+		if (args.compaction_count > 0u || args.calibrate || args.raceway_wave_cap_mark)
+		{
+			span_kernel    = clCreateKernel(program, "run_span_dedup", &status);            throw_if_error(status, "clCreateKernel(run_span_dedup)");
+			compact_kernel = clCreateKernel(program, "compact_survivors_ordered", &status); throw_if_error(status, "clCreateKernel(compact_survivors_ordered)");
+			resolve_kernel = clCreateKernel(program, "resolve_flags", &status);             throw_if_error(status, "clCreateKernel(resolve_flags)");
+		}
+		if (args.raceway_cap_mark)
+		{
+			raceway_cap_mark_kernel = clCreateKernel(program, "raceway_boundary_cap_mark_offset", &status);
+			throw_if_error(status, "clCreateKernel(raceway_boundary_cap_mark_offset)");
+		}
+		if (args.raceway_wave_cap_mark)
+		{
+			raceway_wave_first_kernel = clCreateKernel(program, "raceway_boundary_cap_state_offset", &status);
+			throw_if_error(status, "clCreateKernel(raceway_boundary_cap_state_offset)");
+			raceway_wave_span_kernel = clCreateKernel(program, "raceway_span_state_liveidx_cap_offset", &status);
+			throw_if_error(status, "clCreateKernel(raceway_span_state_liveidx_cap_offset)");
+		}
 
-		const bool need_offset_streams = args.use_ilp6 || args.parity_count > 0u;
+		const bool need_offset_streams = args.use_ilp6 || args.parity_count > 0u || args.compaction_count > 0u || args.calibrate || args.raceway_cap_mark || args.raceway_wave_cap_mark;
 		KernelAssets assets = build_kernel_assets(context, queue, args.key_id, need_offset_streams);
 
-		cl_mem result_buffer = clCreateBuffer(context, CL_MEM_READ_WRITE, args.batch_size, nullptr, &status);
+		// The ilp6 screen kernel rounds its work-group count up to cover (batch_size + 5)/6
+		// groups of 6 candidates, so it writes roundup6(batch_size) result bytes — up to 5
+		// past batch_size when batch_size isn't a multiple of 6. Size the device buffer to
+		// match; an under-sized buffer is an out-of-bounds device write that NVIDIA tolerates
+		// but AMD faults (zeroing the kernel's END profiling timestamp and the result data).
+		const uint32_t result_buffer_size = args.use_ilp6 ? ((args.batch_size + 5u) / 6u) * 6u : args.batch_size;
+		cl_mem result_buffer = clCreateBuffer(context, CL_MEM_READ_WRITE, result_buffer_size, nullptr, &status);
 		throw_if_error(status, "clCreateBuffer(result_buffer)");
 
 		throw_if_error(clSetKernelArg(screen_kernel, 0, sizeof(result_buffer), &result_buffer), "clSetKernelArg(screen.result)");
@@ -878,6 +1013,937 @@ int main(int argc, char** argv)
 			throw_if_error(clSetKernelArg(screen_ilp6_kernel,  8, sizeof(assets.carnival_data),  &assets.carnival_data),  "clSetKernelArg(ilp6.carnival)");
 			throw_if_error(clSetKernelArg(screen_ilp6_kernel,  9, sizeof(args.key_id), &args.key_id), "clSetKernelArg(ilp6.key)");
 		};
+
+		// TDR-safe launch of the ilp6 screen over [data_start, data_start+count). A single
+		// NDRange over a full 64M tile runs ~3 s, which can trip the Windows GPU watchdog
+		// (TDR, default ~2 s) on the display adapter -> driver reset / blackout / bugcheck.
+		// Splitting into sub-launches keeps every dispatch well under the limit. A global
+		// work-group offset makes each sub-launch write to its absolute result slot
+		// (result_data[get_global_id(1)*6 + j]) and derive the correct data index, so the
+		// output and total GPU work are byte-identical to one launch — per-launch overhead
+		// is microseconds and the screen rate is flat across launch sizes. Requires args 1-8
+		// to have been set first (via set_ilp6_static_args); this sets 0, 9, 10.
+		auto enqueue_ilp6_screen = [&](cl_mem result_buf, uint32_t key_id, uint32_t ds, uint32_t count) {
+			throw_if_error(clSetKernelArg(screen_ilp6_kernel, 0, sizeof(result_buf), &result_buf), "ilp6.chunk.res");
+			throw_if_error(clSetKernelArg(screen_ilp6_kernel, 9, sizeof(key_id), &key_id), "ilp6.chunk.key");
+			throw_if_error(clSetKernelArg(screen_ilp6_kernel, 10, sizeof(ds), &ds), "ilp6.chunk.ds");
+			const size_t total_wg = (count + 5u) / 6u;
+			const size_t CHUNK_WG = wd_chunk_cands / 6u;  // watchdog-safe cand/sub-launch (CU-scaled; 6 cand/wg)
+			size_t lsz[3] = { 32, 1, 1 };
+			for (size_t wg0 = 0; wg0 < total_wg; wg0 += CHUNK_WG)
+			{
+				size_t this_wg = (total_wg - wg0 < CHUNK_WG) ? (total_wg - wg0) : CHUNK_WG;
+				size_t off[3] = { 0, wg0, 0 };
+				size_t gsz[3] = { 32, this_wg, 1 };
+				throw_if_error(clEnqueueNDRangeKernel(queue, screen_ilp6_kernel, 3, off, gsz, lsz, 0, nullptr, nullptr), "ilp6.chunk.enq");
+			}
+		};
+
+		// ---- Calibration: find host-optimal engine/ILP, write a portable config. ----
+		// Single binary, no shell/script dependency (cross-platform). Rebuilds only the
+		// span kernel per ILP (compact/resolve/screen are ILP-independent), sweeps a
+		// representative random-key/window sample, picks engine by measured aggregate.
+		if (args.calibrate)
+		{
+			// Calibrate AT the production tile size, not a tiny fixed window. The compaction
+			// win comes from duplicate decrypted states collapsing within a tile; at 1M
+			// candidates too few collide, so span-dedup overhead dominates and compaction is
+			// mis-measured as a loss (the false "screen wins" verdict). The tile auto-sizes
+			// from VRAM using the same 144 B/candidate formula the --compaction path uses, so
+			// CAL_N = tile is guaranteed to fit. (Measured RX 7800 XT: 1M -> 0.95x but the real
+			// 64M tile is 1.15x aggregate across 2^32, up to 1.85x in dense data windows.)
+			const cl_ulong cal_reserve = 256ull * 1024 * 1024;
+			const cl_ulong cal_budget  = (dev_global_mem > cal_reserve) ? (cl_ulong)((dev_global_mem - cal_reserve) * 0.90) : 0;
+			cl_ulong cal_nmax = cal_budget / 144ull;
+			const cl_ulong cal_nmax_alloc = dev_max_alloc / 128ull;  // state buffer = N*128
+			if (cal_nmax_alloc < cal_nmax) cal_nmax = cal_nmax_alloc;
+			uint32_t tile = 4u * 1024u * 1024u;
+			while (((cl_ulong)tile << 1) <= cal_nmax && (tile << 1) <= 134217728u) tile <<= 1;
+			const uint32_t CAL_N = tile;              // sample at the real production tile size
+			const uint32_t cuts[9] = { 0u,1u,5u,9u,13u,17u,21u,25u,27u };
+			const uint32_t NSPANS = 8u;
+			const size_t span_ls = 32u, loc1 = 256u;
+			cl_int e = CL_SUCCESS;
+
+			cl_mem buf_ref  = clCreateBuffer(context, CL_MEM_READ_WRITE, ((CAL_N + 5u) / 6u) * 6u, nullptr, &e); throw_if_error(e, "cal.ref");
+			set_ilp6_static_args(buf_ref);  // sets screen offset-stream args 1-8 (+0,9); run_screen overrides 0/9/10
+			cl_mem state    = clCreateBuffer(context, CL_MEM_READ_WRITE, (size_t)CAL_N * 32 * sizeof(uint32_t), nullptr, &e); throw_if_error(e, "cal.state");
+			cl_mem rep_glob = clCreateBuffer(context, CL_MEM_READ_WRITE, (size_t)CAL_N * sizeof(uint32_t), nullptr, &e); throw_if_error(e, "cal.rep");
+			cl_mem alive    = clCreateBuffer(context, CL_MEM_READ_WRITE, CAL_N, nullptr, &e); throw_if_error(e, "cal.alive");
+			cl_mem live_a   = clCreateBuffer(context, CL_MEM_READ_WRITE, (size_t)CAL_N * sizeof(uint32_t), nullptr, &e); throw_if_error(e, "cal.la");
+			cl_mem live_b   = clCreateBuffer(context, CL_MEM_READ_WRITE, (size_t)CAL_N * sizeof(uint32_t), nullptr, &e); throw_if_error(e, "cal.lb");
+			cl_mem counter  = clCreateBuffer(context, CL_MEM_READ_WRITE, sizeof(uint32_t), nullptr, &e); throw_if_error(e, "cal.cnt");
+			cl_mem flag     = clCreateBuffer(context, CL_MEM_READ_WRITE, CAL_N, nullptr, &e); throw_if_error(e, "cal.flag");
+			cl_mem buf_comp = clCreateBuffer(context, CL_MEM_READ_WRITE, CAL_N, nullptr, &e); throw_if_error(e, "cal.comp");
+
+			throw_if_error(clSetKernelArg(compact_kernel, 4, sizeof(counter), &counter), "cal.cmp.cnt");
+			throw_if_error(clSetKernelArg(resolve_kernel, 0, sizeof(rep_glob), &rep_glob), "cal.res.rep");
+			throw_if_error(clSetKernelArg(resolve_kernel, 1, sizeof(flag), &flag), "cal.res.flag");
+			throw_if_error(clSetKernelArg(resolve_kernel, 2, sizeof(buf_comp), &buf_comp), "cal.res.res");
+			throw_if_error(clSetKernelArg(resolve_kernel, 3, sizeof(CAL_N), &CAL_N), "cal.res.N");
+
+			// Representative workload: pseudo-random keys (splitmix64) × spread windows.
+			auto splitmix = [](uint64_t x) -> uint32_t {
+				x += 0x9E3779B97F4A7C15ull; x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+				x = (x ^ (x >> 27)) * 0x94D049BB133111EBull; return (uint32_t)(x ^ (x >> 31));
+			};
+			std::vector<std::pair<uint32_t,uint32_t>> samples;
+			const uint32_t windows[3] = { 0u, 0x55555555u, 0xAAAAAAAAu };
+			// Each sample is now a full-tile pipeline (~100x the old per-sample work), so use
+			// 2 keys x 3 windows = 6 samples. That spans the compression range adequately: the
+			// data-window position dominates the dedup ratio, while the key axis barely moves it.
+			for (uint32_t ki = 0; ki < 2u; ki++)
+				for (uint32_t wi = 0; wi < 3u; wi++)
+					samples.push_back({ splitmix(0xC0FFEEu + ki), windows[wi] });
+
+			// Run the full compaction pipeline (8 spans, fused final, resolve) for the
+			// current span_kernel into buf_comp. screen_ilp6 -> buf_ref.
+			auto run_screen = [&](uint32_t key_id, uint32_t ds) {
+				enqueue_ilp6_screen(buf_ref, key_id, ds, CAL_N);  // TDR-safe chunked launch
+			};
+			auto run_pipeline = [&](cl_kernel span_k, uint32_t key_id, uint32_t ds, uint32_t W) {
+				const uint32_t fill = 0xFFFFFFFFu;
+				throw_if_error(clEnqueueFillBuffer(queue, rep_glob, &fill, sizeof(fill), 0, (size_t)CAL_N * sizeof(uint32_t), 0, nullptr, nullptr), "cal.fillrep");
+				uint32_t M = CAL_N; cl_mem in_live = live_a, out_live = live_b; int first = 1;
+				for (uint32_t sp = 0; sp < NSPANS; sp++) {
+					uint32_t m0 = cuts[sp], m1 = cuts[sp + 1]; int mode = (sp == NSPANS - 1u) ? 2 : 1;
+					clSetKernelArg(span_k, 0, sizeof(in_live), &in_live);
+					clSetKernelArg(span_k, 1, sizeof(M), &M);
+					clSetKernelArg(span_k, 5, sizeof(m0), &m0);
+					clSetKernelArg(span_k, 6, sizeof(m1), &m1);
+					clSetKernelArg(span_k, 7, sizeof(first), &first);
+					clSetKernelArg(span_k, 17, sizeof(key_id), &key_id);
+					clSetKernelArg(span_k, 18, sizeof(ds), &ds);
+					clSetKernelArg(span_k, 19, sizeof(mode), &mode);
+					// Chunk the span over dim1 work-groups (run_span_dedup keys off
+					// get_global_id(1), so a global offset shifts the candidate base just like
+					// the screen path). A single full-tile launch runs multiple seconds at the
+					// representative tile on a small iGPU and trips the GPU compute watchdog
+					// (hard recovery); ~1M candidates/sub-launch is proven watchdog-safe.
+					const size_t total_wg = (M + W - 1u) / W;
+					const size_t CHUNK_WG = (W > 0u) ? (wd_chunk_cands / W) : (size_t)1u;
+					size_t sl[3] = { span_ls, 1, 1 };
+					for (size_t wg0 = 0; wg0 < total_wg; wg0 += CHUNK_WG) {
+						size_t this_wg = (total_wg - wg0 < CHUNK_WG) ? (total_wg - wg0) : CHUNK_WG;
+						size_t off[3] = { 0, wg0, 0 };
+						size_t sg[3] = { span_ls, this_wg, 1 };
+						throw_if_error(clEnqueueNDRangeKernel(queue, span_k, 3, off, sg, sl, 0, nullptr, nullptr), "cal.span");
+					}
+					if (mode == 1) {
+						const uint32_t zero = 0u;
+						clEnqueueFillBuffer(queue, counter, &zero, sizeof(zero), 0, sizeof(zero), 0, nullptr, nullptr);
+						clSetKernelArg(compact_kernel, 0, sizeof(alive), &alive);
+						clSetKernelArg(compact_kernel, 1, sizeof(in_live), &in_live);
+						clSetKernelArg(compact_kernel, 2, sizeof(M), &M);
+						clSetKernelArg(compact_kernel, 3, sizeof(out_live), &out_live);
+						clSetKernelArg(compact_kernel, 5, sizeof(first), &first);
+						size_t cg = ((M + 255u) / 256u) * 256u;
+						throw_if_error(clEnqueueNDRangeKernel(queue, compact_kernel, 1, nullptr, &cg, &loc1, 0, nullptr, nullptr), "cal.cmp");
+						clFinish(queue);
+						clEnqueueReadBuffer(queue, counter, CL_TRUE, 0, sizeof(M), &M, 0, nullptr, nullptr);
+						cl_mem t = in_live; in_live = out_live; out_live = t; first = 0;
+					}
+				}
+				size_t rg = ((CAL_N + 255u) / 256u) * 256u;
+				throw_if_error(clEnqueueNDRangeKernel(queue, resolve_kernel, 1, nullptr, &rg, &loc1, 0, nullptr, nullptr), "cal.res");
+				clFinish(queue);
+			};
+
+			const uint32_t ilp_candidates[3] = { 4u, 8u, 16u };
+			uint32_t best_ilp = 8u; double best_agg = 0.0; std::size_t total_mism = 0;
+			std::cout << "Calibrating " << device_name << " — " << samples.size() << " samples x "
+			          << "ilp{4,8,16}...\n";
+			std::vector<uint8_t> hr(((CAL_N + 5u) / 6u) * 6u), hc(CAL_N);
+			for (uint32_t ic = 0; ic < 3u; ic++)
+			{
+				const uint32_t ilp = ilp_candidates[ic];
+				const std::string opts = "-cl-std=CL1.2 -DSPAN_ILP=" + std::to_string(ilp);
+				cl_program prog_i = clCreateProgramWithSource(context, 1, &source_ptr, &source_size, &e); throw_if_error(e, "cal.prog");
+				if (clBuildProgram(prog_i, 1, &device, opts.c_str(), nullptr, nullptr) != CL_SUCCESS)
+				{
+					size_t ls = 0; clGetProgramBuildInfo(prog_i, device, CL_PROGRAM_BUILD_LOG, 0, nullptr, &ls);
+					std::string log(ls, '\0'); clGetProgramBuildInfo(prog_i, device, CL_PROGRAM_BUILD_LOG, ls, &log[0], nullptr);
+					throw std::runtime_error("calibrate build failed (ilp=" + std::to_string(ilp) + "):\n" + log);
+				}
+				cl_kernel span_k = clCreateKernel(prog_i, "run_span_dedup", &e); throw_if_error(e, "cal.span.k");
+				clSetKernelArg(span_k, 2, sizeof(state), &state);
+				clSetKernelArg(span_k, 3, sizeof(alive), &alive);
+				clSetKernelArg(span_k, 4, sizeof(rep_glob), &rep_glob);
+				clSetKernelArg(span_k, 8, sizeof(assets.offset_regular), &assets.offset_regular);
+				clSetKernelArg(span_k, 9, sizeof(assets.offset_alg0), &assets.offset_alg0);
+				clSetKernelArg(span_k, 10, sizeof(assets.offset_alg6), &assets.offset_alg6);
+				clSetKernelArg(span_k, 11, sizeof(assets.offset_alg2), &assets.offset_alg2);
+				clSetKernelArg(span_k, 12, sizeof(assets.offset_alg5), &assets.offset_alg5);
+				clSetKernelArg(span_k, 13, sizeof(assets.expansion_values), &assets.expansion_values);
+				clSetKernelArg(span_k, 14, sizeof(assets.schedule_data), &assets.schedule_data);
+				clSetKernelArg(span_k, 15, sizeof(assets.carnival_data), &assets.carnival_data);
+				clSetKernelArg(span_k, 16, sizeof(flag), &flag);
+
+				double inv_sum = 0.0;
+				for (auto& smp : samples)
+				{
+					clFinish(queue);
+					auto a0 = std::chrono::steady_clock::now();
+					run_screen(smp.first, smp.second); clFinish(queue);
+					auto a1 = std::chrono::steady_clock::now();
+					run_pipeline(span_k, smp.first, smp.second, ilp);
+					auto a2 = std::chrono::steady_clock::now();
+					const double s_ms = std::chrono::duration<double, std::milli>(a1 - a0).count();
+					const double c_ms = std::chrono::duration<double, std::milli>(a2 - a1).count();
+					clEnqueueReadBuffer(queue, buf_ref, CL_TRUE, 0, hr.size(), hr.data(), 0, nullptr, nullptr);
+					clEnqueueReadBuffer(queue, buf_comp, CL_TRUE, 0, CAL_N, hc.data(), 0, nullptr, nullptr);
+					for (uint32_t i = 0; i < CAL_N; i++) if (hr[i] != hc[i]) total_mism++;
+					inv_sum += c_ms / s_ms;  // 1 / (s/c) = c/s
+				}
+				const double agg = (double)samples.size() / inv_sum;
+				std::cout << "  ilp=" << ilp << "  aggregate speedup vs screen: " << std::fixed << std::setprecision(3) << agg << "x\n";
+				if (agg > best_agg) { best_agg = agg; best_ilp = ilp; }
+				clReleaseKernel(span_k); clReleaseProgram(prog_i);
+			}
+
+			// Engine from measured aggregate; tile already computed above (production size,
+			// and equal to CAL_N — calibration measured at exactly this size).
+			const char* engine = (best_agg >= 1.0) ? "compaction" : "screen";
+
+			std::ostringstream fpkey;
+			fpkey << "opencl|" << device_name << "|" << (dev_global_mem >> 20) << "MB|" << dev_cus << "CU";
+			std::ostringstream line;
+			line << fpkey.str() << "\tengine=" << engine << " ilp=" << best_ilp
+			     << " tile=" << (tile >> 20) << "M aggregate=" << std::fixed << std::setprecision(3) << best_agg
+			     << " runtime=opencl";
+
+			// Read-modify-write the config (portable text; replace any line for this device).
+			std::vector<std::string> lines;
+			{
+				std::ifstream in(args.config_path);
+				std::string l;
+				while (std::getline(in, l)) {
+					if (l.empty() || l[0] == '#') { lines.push_back(l); continue; }
+					const std::string key = l.substr(0, l.find('\t'));
+					if (key != fpkey.str()) lines.push_back(l);
+				}
+			}
+			lines.push_back(line.str());
+			{
+				std::ofstream out(args.config_path, std::ios::trunc);
+				out << "# tm_compaction.conf  (device-fingerprint -> engine/ilp/tile)\n";
+				for (auto& l : lines) if (!(l.size() && l[0] == '#')) out << l << "\n";
+			}
+
+			std::cout << "Calibration result: engine=" << engine << "  ilp=" << best_ilp
+			          << "  tile=" << (tile >> 20) << "M  aggregate=" << std::fixed << std::setprecision(3) << best_agg << "x\n";
+			std::cout << (total_mism == 0 ? "  parity: PASS (all samples match the screen)\n"
+			             : ("  parity: FAIL (" + std::to_string(total_mism) + " mismatches)\n"));
+			std::cout << "  wrote " << args.config_path << "  [" << fpkey.str() << "]\n";
+			if (best_agg < 1.0)
+				std::cout << "  note: compaction is below break-even here (likely small-L2) -> flat screen chosen.\n";
+			// Per-device: remind to calibrate the host's other GPUs (config accumulates).
+			if (devices.size() > 1u)
+			{
+				std::cout << "  host has " << devices.size() << " GPUs; calibrate the others (config keyed per device):\n";
+				for (uint32_t d = 0; d < devices.size(); d++)
+				{
+					if (d == args.device_index) continue;
+					std::cout << "    --calibrate " << args.config_path << " --device " << d
+					          << "   (" << get_device_string(devices[d], CL_DEVICE_NAME) << ")\n";
+				}
+			}
+
+			clReleaseMemObject(buf_ref); clReleaseMemObject(state); clReleaseMemObject(rep_glob);
+			clReleaseMemObject(alive); clReleaseMemObject(live_a); clReleaseMemObject(live_b);
+			clReleaseMemObject(counter); clReleaseMemObject(flag); clReleaseMemObject(buf_comp);
+			release_assets(assets);
+			if (raceway_cap_mark_kernel) clReleaseKernel(raceway_cap_mark_kernel);
+			clReleaseKernel(span_kernel); clReleaseKernel(compact_kernel); clReleaseKernel(resolve_kernel);
+			clReleaseKernel(screen_ilp6_kernel); clReleaseKernel(materialize_kernel); clReleaseKernel(screen_kernel);
+			clReleaseProgram(program); clReleaseCommandQueue(queue); clReleaseContext(context);
+			return 0;
+		}
+
+		if (args.raceway_wave_cap_mark)
+		{
+			const uint32_t N = args.workunit_size;
+			const uint32_t data_start = args.range_start;
+			const std::vector<uint32_t> cap_maps_host = build_raceway_cap_maps(args);
+			if (cap_maps_host.empty())
+			{
+				throw std::runtime_error("--raceway-wave-cap-mark requires nonzero caps and at least one boundary");
+			}
+			const uint32_t effective_cap_count = static_cast<uint32_t>(cap_maps_host.size());
+			const uint64_t cap_buckets = (args.raceway_cap_bits == 0u) ? 1ull : (1ull << args.raceway_cap_bits);
+			const uint64_t cap_slots_per_table_u64 = cap_buckets * static_cast<uint64_t>(args.raceway_cap_ways);
+			const uint64_t cap_slots_u64 = cap_slots_per_table_u64 * static_cast<uint64_t>(effective_cap_count);
+			const std::size_t cap_slots = static_cast<std::size_t>(cap_slots_u64);
+			const std::size_t cap_slot_bytes = raceway_cap_fp64 ? sizeof(uint64_t) : sizeof(uint32_t);
+			const std::size_t cap_bytes = cap_slots * cap_slot_bytes;
+			const std::size_t cap_table_bytes = static_cast<std::size_t>(cap_slots_per_table_u64) * cap_slot_bytes;
+
+			cl_int s_r = CL_SUCCESS;
+			cl_mem alive = clCreateBuffer(context, CL_MEM_READ_WRITE, N, nullptr, &s_r);
+			throw_if_error(s_r, "clCreateBuffer(raceway.wave.alive)");
+			cl_mem drop_map = clCreateBuffer(context, CL_MEM_READ_WRITE, N, nullptr, &s_r);
+			throw_if_error(s_r, "clCreateBuffer(raceway.wave.drop)");
+			cl_mem state = clCreateBuffer(context, CL_MEM_READ_WRITE, (size_t)N * 32u * sizeof(uint32_t), nullptr, &s_r);
+			throw_if_error(s_r, "clCreateBuffer(raceway.wave.state)");
+			cl_mem live_a = clCreateBuffer(context, CL_MEM_READ_WRITE, (size_t)N * sizeof(uint32_t), nullptr, &s_r);
+			throw_if_error(s_r, "clCreateBuffer(raceway.wave.live_a)");
+			cl_mem live_b = clCreateBuffer(context, CL_MEM_READ_WRITE, (size_t)N * sizeof(uint32_t), nullptr, &s_r);
+			throw_if_error(s_r, "clCreateBuffer(raceway.wave.live_b)");
+			cl_mem compact_counter = clCreateBuffer(context, CL_MEM_READ_WRITE, sizeof(uint32_t), nullptr, &s_r);
+			throw_if_error(s_r, "clCreateBuffer(raceway.wave.counter)");
+			cl_mem cap_table = clCreateBuffer(context, CL_MEM_READ_WRITE, cap_bytes, nullptr, &s_r);
+			throw_if_error(s_r, "clCreateBuffer(raceway.wave.cap_table)");
+			cl_mem continue_flags = clCreateBuffer(context, CL_MEM_READ_WRITE, N, nullptr, &s_r);
+			throw_if_error(s_r, "clCreateBuffer(raceway.wave.continue_flags)");
+
+			const uint8_t zero_u8 = 0u;
+			const uint8_t ff_u8 = 0xFFu;
+			const uint32_t zero_u32 = 0u;
+			const uint64_t zero_u64 = 0u;
+			throw_if_error(clEnqueueFillBuffer(queue, alive, &zero_u8, sizeof(zero_u8), 0, N, 0, nullptr, nullptr), "raceway.wave.fill(alive)");
+			throw_if_error(clEnqueueFillBuffer(queue, drop_map, &ff_u8, sizeof(ff_u8), 0, N, 0, nullptr, nullptr), "raceway.wave.fill(drop)");
+			if (raceway_cap_fp64)
+				throw_if_error(clEnqueueFillBuffer(queue, cap_table, &zero_u64, sizeof(zero_u64), 0, cap_bytes, 0, nullptr, nullptr), "raceway.wave.fill(cap64)");
+			else
+				throw_if_error(clEnqueueFillBuffer(queue, cap_table, &zero_u32, sizeof(zero_u32), 0, cap_bytes, 0, nullptr, nullptr), "raceway.wave.fill(cap32)");
+
+			auto timed_finish = [&](const char* label) -> double {
+				(void)label;
+				const auto t0 = std::chrono::high_resolution_clock::now();
+				throw_if_error(clFinish(queue), "raceway.wave.finish");
+				const auto t1 = std::chrono::high_resolution_clock::now();
+				return std::chrono::duration<double, std::milli>(t1 - t0).count();
+			};
+			auto compact_alive = [&](cl_mem live_in, uint32_t count, cl_mem live_out, int first_span) -> std::pair<uint32_t, double> {
+				throw_if_error(clEnqueueFillBuffer(queue, compact_counter, &zero_u32, sizeof(zero_u32), 0, sizeof(zero_u32), 0, nullptr, nullptr), "raceway.wave.fill(counter)");
+				throw_if_error(clSetKernelArg(compact_kernel, 0, sizeof(alive), &alive), "raceway.wave.comp.alive");
+				throw_if_error(clSetKernelArg(compact_kernel, 1, sizeof(live_in), &live_in), "raceway.wave.comp.in");
+				throw_if_error(clSetKernelArg(compact_kernel, 2, sizeof(count), &count), "raceway.wave.comp.count");
+				throw_if_error(clSetKernelArg(compact_kernel, 3, sizeof(live_out), &live_out), "raceway.wave.comp.out");
+				throw_if_error(clSetKernelArg(compact_kernel, 4, sizeof(compact_counter), &compact_counter), "raceway.wave.comp.counter");
+				throw_if_error(clSetKernelArg(compact_kernel, 5, sizeof(first_span), &first_span), "raceway.wave.comp.first");
+				const size_t local = 256u;
+				const size_t global = ((static_cast<size_t>(count) + local - 1u) / local) * local;
+				const auto c0 = std::chrono::high_resolution_clock::now();
+				throw_if_error(clEnqueueNDRangeKernel(queue, compact_kernel, 1, nullptr, &global, &local, 0, nullptr, nullptr), "raceway.wave.comp.enqueue");
+				throw_if_error(clFinish(queue), "raceway.wave.comp.finish");
+				const auto c1 = std::chrono::high_resolution_clock::now();
+				uint32_t compacted = 0u;
+				throw_if_error(clEnqueueReadBuffer(queue, compact_counter, CL_TRUE, 0, sizeof(compacted), &compacted, 0, nullptr, nullptr), "raceway.wave.read(counter)");
+				return { compacted, std::chrono::duration<double, std::milli>(c1 - c0).count() };
+			};
+
+			const size_t local3[3] = { 32u, 1u, 1u };
+			double span_ms_total = 0.0;
+			double compact_ms_total = 0.0;
+			double continue_ms_total = 0.0;
+			uint64_t estimated_map_evals = 0;
+			std::vector<uint32_t> boundary_inputs(effective_cap_count, 0u);
+			std::vector<uint32_t> boundary_survivors(effective_cap_count, 0u);
+
+			throw_if_error(clSetKernelArg(raceway_wave_first_kernel, 0, sizeof(alive), &alive), "wave.first.alive");
+			throw_if_error(clSetKernelArg(raceway_wave_first_kernel, 1, sizeof(drop_map), &drop_map), "wave.first.drop");
+			throw_if_error(clSetKernelArg(raceway_wave_first_kernel, 2, sizeof(state), &state), "wave.first.state");
+			throw_if_error(clSetKernelArg(raceway_wave_first_kernel, 3, sizeof(cap_table), &cap_table), "wave.first.cap");
+			throw_if_error(clSetKernelArg(raceway_wave_first_kernel, 4, sizeof(args.raceway_cap_bits), &args.raceway_cap_bits), "wave.first.bits");
+			throw_if_error(clSetKernelArg(raceway_wave_first_kernel, 5, sizeof(args.raceway_cap_ways), &args.raceway_cap_ways), "wave.first.ways");
+			uint32_t cap_index = 0u;
+			throw_if_error(clSetKernelArg(raceway_wave_first_kernel, 6, sizeof(cap_index), &cap_index), "wave.first.cap_index");
+			throw_if_error(clSetKernelArg(raceway_wave_first_kernel, 7, sizeof(assets.offset_regular), &assets.offset_regular), "wave.first.reg");
+			throw_if_error(clSetKernelArg(raceway_wave_first_kernel, 8, sizeof(assets.offset_alg0), &assets.offset_alg0), "wave.first.a0");
+			throw_if_error(clSetKernelArg(raceway_wave_first_kernel, 9, sizeof(assets.offset_alg6), &assets.offset_alg6), "wave.first.a6");
+			throw_if_error(clSetKernelArg(raceway_wave_first_kernel, 10, sizeof(assets.offset_alg2), &assets.offset_alg2), "wave.first.a2");
+			throw_if_error(clSetKernelArg(raceway_wave_first_kernel, 11, sizeof(assets.offset_alg5), &assets.offset_alg5), "wave.first.a5");
+			throw_if_error(clSetKernelArg(raceway_wave_first_kernel, 12, sizeof(assets.expansion_values), &assets.expansion_values), "wave.first.exp");
+			throw_if_error(clSetKernelArg(raceway_wave_first_kernel, 13, sizeof(assets.schedule_data), &assets.schedule_data), "wave.first.sched");
+			throw_if_error(clSetKernelArg(raceway_wave_first_kernel, 14, sizeof(args.key_id), &args.key_id), "wave.first.key");
+			throw_if_error(clSetKernelArg(raceway_wave_first_kernel, 15, sizeof(data_start), &data_start), "wave.first.ds");
+			throw_if_error(clSetKernelArg(raceway_wave_first_kernel, 16, sizeof(N), &N), "wave.first.N");
+			uint32_t end_map = cap_maps_host[0];
+			throw_if_error(clSetKernelArg(raceway_wave_first_kernel, 17, sizeof(end_map), &end_map), "wave.first.end");
+			const size_t first_global[3] = { 32u, (static_cast<size_t>(N) + args.raceway_cap_ilp - 1u) / args.raceway_cap_ilp, 1u };
+			const auto f0 = std::chrono::high_resolution_clock::now();
+			throw_if_error(clEnqueueNDRangeKernel(queue, raceway_wave_first_kernel, 3, nullptr, first_global, local3, 0, nullptr, nullptr), "wave.first.enqueue");
+			throw_if_error(clFinish(queue), "wave.first.finish");
+			const auto f1 = std::chrono::high_resolution_clock::now();
+			span_ms_total += std::chrono::duration<double, std::milli>(f1 - f0).count();
+			estimated_map_evals += static_cast<uint64_t>(N) * static_cast<uint64_t>(end_map + 1u);
+			boundary_inputs[0] = N;
+			auto compact0 = compact_alive(nullptr, N, live_a, 1);
+			uint32_t cur_count = compact0.first;
+			compact_ms_total += compact0.second;
+			boundary_survivors[0] = cur_count;
+			cl_mem cur_live = live_a;
+			cl_mem next_live = live_b;
+			uint32_t prev_boundary = end_map;
+
+			for (uint32_t bi = 1u; bi < effective_cap_count && cur_count != 0u; bi++)
+			{
+				uint32_t start_map = prev_boundary + 1u;
+				end_map = cap_maps_host[bi];
+				boundary_inputs[bi] = cur_count;
+				estimated_map_evals += static_cast<uint64_t>(cur_count) * static_cast<uint64_t>(end_map - start_map + 1u);
+				throw_if_error(clSetKernelArg(raceway_wave_span_kernel, 0, sizeof(cur_live), &cur_live), "wave.span.live");
+				throw_if_error(clSetKernelArg(raceway_wave_span_kernel, 1, sizeof(cur_count), &cur_count), "wave.span.count");
+				throw_if_error(clSetKernelArg(raceway_wave_span_kernel, 2, sizeof(state), &state), "wave.span.state");
+				throw_if_error(clSetKernelArg(raceway_wave_span_kernel, 3, sizeof(alive), &alive), "wave.span.alive");
+				throw_if_error(clSetKernelArg(raceway_wave_span_kernel, 4, sizeof(drop_map), &drop_map), "wave.span.drop");
+				throw_if_error(clSetKernelArg(raceway_wave_span_kernel, 5, sizeof(cap_table), &cap_table), "wave.span.cap");
+				throw_if_error(clSetKernelArg(raceway_wave_span_kernel, 6, sizeof(args.raceway_cap_bits), &args.raceway_cap_bits), "wave.span.bits");
+				throw_if_error(clSetKernelArg(raceway_wave_span_kernel, 7, sizeof(args.raceway_cap_ways), &args.raceway_cap_ways), "wave.span.ways");
+				cap_index = bi;
+				throw_if_error(clSetKernelArg(raceway_wave_span_kernel, 8, sizeof(cap_index), &cap_index), "wave.span.cap_index");
+				throw_if_error(clSetKernelArg(raceway_wave_span_kernel, 9, sizeof(assets.offset_regular), &assets.offset_regular), "wave.span.reg");
+				throw_if_error(clSetKernelArg(raceway_wave_span_kernel, 10, sizeof(assets.offset_alg0), &assets.offset_alg0), "wave.span.a0");
+				throw_if_error(clSetKernelArg(raceway_wave_span_kernel, 11, sizeof(assets.offset_alg6), &assets.offset_alg6), "wave.span.a6");
+				throw_if_error(clSetKernelArg(raceway_wave_span_kernel, 12, sizeof(assets.offset_alg2), &assets.offset_alg2), "wave.span.a2");
+				throw_if_error(clSetKernelArg(raceway_wave_span_kernel, 13, sizeof(assets.offset_alg5), &assets.offset_alg5), "wave.span.a5");
+				throw_if_error(clSetKernelArg(raceway_wave_span_kernel, 14, sizeof(assets.schedule_data), &assets.schedule_data), "wave.span.sched");
+				throw_if_error(clSetKernelArg(raceway_wave_span_kernel, 15, sizeof(start_map), &start_map), "wave.span.start");
+				throw_if_error(clSetKernelArg(raceway_wave_span_kernel, 16, sizeof(end_map), &end_map), "wave.span.end");
+				const size_t span_global[3] = { 32u, (static_cast<size_t>(cur_count) + args.raceway_cap_ilp - 1u) / args.raceway_cap_ilp, 1u };
+				const auto s0 = std::chrono::high_resolution_clock::now();
+				throw_if_error(clEnqueueNDRangeKernel(queue, raceway_wave_span_kernel, 3, nullptr, span_global, local3, 0, nullptr, nullptr), "wave.span.enqueue");
+				throw_if_error(clFinish(queue), "wave.span.finish");
+				const auto s1 = std::chrono::high_resolution_clock::now();
+				span_ms_total += std::chrono::duration<double, std::milli>(s1 - s0).count();
+				auto compacted = compact_alive(cur_live, cur_count, next_live, 0);
+				cur_count = compacted.first;
+				compact_ms_total += compacted.second;
+				boundary_survivors[bi] = cur_count;
+				std::swap(cur_live, next_live);
+				prev_boundary = end_map;
+			}
+
+			const uint32_t continue_start_map = std::min<uint32_t>(27u, prev_boundary + 1u);
+			if (cur_count != 0u && continue_start_map < 27u)
+			{
+				throw_if_error(clEnqueueFillBuffer(queue, continue_flags, &zero_u8, sizeof(zero_u8), 0, N, 0, nullptr, nullptr), "raceway.wave.fill(continue_flags)");
+				uint32_t m0 = continue_start_map;
+				uint32_t m1 = 27u;
+				int first_span = 0;
+				int mode = 2;
+				throw_if_error(clSetKernelArg(span_kernel, 0, sizeof(cur_live), &cur_live), "wave.cont.live");
+				throw_if_error(clSetKernelArg(span_kernel, 1, sizeof(cur_count), &cur_count), "wave.cont.count");
+				throw_if_error(clSetKernelArg(span_kernel, 2, sizeof(state), &state), "wave.cont.state");
+				throw_if_error(clSetKernelArg(span_kernel, 3, sizeof(alive), &alive), "wave.cont.alive");
+				throw_if_error(clSetKernelArg(span_kernel, 4, sizeof(next_live), &next_live), "wave.cont.rep_dummy");
+				throw_if_error(clSetKernelArg(span_kernel, 5, sizeof(m0), &m0), "wave.cont.m0");
+				throw_if_error(clSetKernelArg(span_kernel, 6, sizeof(m1), &m1), "wave.cont.m1");
+				throw_if_error(clSetKernelArg(span_kernel, 7, sizeof(first_span), &first_span), "wave.cont.first");
+				throw_if_error(clSetKernelArg(span_kernel, 8, sizeof(assets.offset_regular), &assets.offset_regular), "wave.cont.reg");
+				throw_if_error(clSetKernelArg(span_kernel, 9, sizeof(assets.offset_alg0), &assets.offset_alg0), "wave.cont.a0");
+				throw_if_error(clSetKernelArg(span_kernel, 10, sizeof(assets.offset_alg6), &assets.offset_alg6), "wave.cont.a6");
+				throw_if_error(clSetKernelArg(span_kernel, 11, sizeof(assets.offset_alg2), &assets.offset_alg2), "wave.cont.a2");
+				throw_if_error(clSetKernelArg(span_kernel, 12, sizeof(assets.offset_alg5), &assets.offset_alg5), "wave.cont.a5");
+				throw_if_error(clSetKernelArg(span_kernel, 13, sizeof(assets.expansion_values), &assets.expansion_values), "wave.cont.exp");
+				throw_if_error(clSetKernelArg(span_kernel, 14, sizeof(assets.schedule_data), &assets.schedule_data), "wave.cont.sched");
+				throw_if_error(clSetKernelArg(span_kernel, 15, sizeof(assets.carnival_data), &assets.carnival_data), "wave.cont.carnival");
+				throw_if_error(clSetKernelArg(span_kernel, 16, sizeof(continue_flags), &continue_flags), "wave.cont.flags");
+				throw_if_error(clSetKernelArg(span_kernel, 17, sizeof(args.key_id), &args.key_id), "wave.cont.key");
+				throw_if_error(clSetKernelArg(span_kernel, 18, sizeof(data_start), &data_start), "wave.cont.ds");
+				throw_if_error(clSetKernelArg(span_kernel, 19, sizeof(mode), &mode), "wave.cont.mode");
+				const size_t cont_global[3] = { 32u, (static_cast<size_t>(cur_count) + args.compaction_ilp - 1u) / args.compaction_ilp, 1u };
+				const auto c0 = std::chrono::high_resolution_clock::now();
+				throw_if_error(clEnqueueNDRangeKernel(queue, span_kernel, 3, nullptr, cont_global, local3, 0, nullptr, nullptr), "wave.cont.enqueue");
+				throw_if_error(clFinish(queue), "wave.cont.finish");
+				const auto c1 = std::chrono::high_resolution_clock::now();
+				continue_ms_total += std::chrono::duration<double, std::milli>(c1 - c0).count();
+			}
+
+			const double pipeline_ms = span_ms_total + compact_ms_total + continue_ms_total;
+			std::ostringstream boundary_list;
+			for (std::size_t i = 0; i < cap_maps_host.size(); i++)
+			{
+				if (i) boundary_list << ",";
+				boundary_list << (cap_maps_host[i] + 1u);
+			}
+			std::cout << "OpenCL raceway wave-cap mark: " << N << " candidates, key=0x"
+			          << std::hex << std::setw(8) << std::setfill('0') << args.key_id
+			          << std::dec << std::setfill(' ') << "\n";
+			std::cout << "  boundaries    : " << boundary_list.str()
+			          << "  cap: 2^" << args.raceway_cap_bits << " x " << args.raceway_cap_ways
+			          << " x " << effective_cap_count
+			          << " (" << std::fixed << std::setprecision(1)
+			          << (static_cast<double>(cap_bytes) / (1024.0 * 1024.0)) << " MB total, "
+			          << (raceway_cap_fp64 ? "fp64" : "fp32 fallback") << ")\n";
+			std::cout << "  wave kernel   : span=" << std::fixed << std::setprecision(3) << span_ms_total
+			          << " ms compact=" << compact_ms_total
+			          << " ms continue=" << continue_ms_total
+			          << " ms pipeline=" << pipeline_ms << " ms  ("
+			          << std::setprecision(1) << (static_cast<double>(N) / 1.0e6 / (pipeline_ms / 1000.0))
+			          << " M input/s)\n";
+			std::cout << "  cap-span only : " << std::fixed << std::setprecision(3) << span_ms_total << " ms   "
+			          << std::fixed << std::setprecision(0) << (static_cast<double>(N) / (span_ms_total / 1000.0)) << " c/s\n";
+			std::cout << "  survivors     : " << cur_count
+			          << " dropped=" << (static_cast<uint64_t>(N) - cur_count)
+			          << " map_evals=" << estimated_map_evals << "\n";
+			std::cout << "  boundary      :";
+			for (std::size_t i = 0; i < cap_maps_host.size(); i++)
+			{
+				std::cout << " m" << (cap_maps_host[i] + 1u)
+				          << " input=" << boundary_inputs[i]
+				          << " survivors=" << boundary_survivors[i];
+			}
+			std::cout << "\n";
+
+			clReleaseMemObject(alive);
+			clReleaseMemObject(drop_map);
+			clReleaseMemObject(state);
+			clReleaseMemObject(live_a);
+			clReleaseMemObject(live_b);
+			clReleaseMemObject(compact_counter);
+			clReleaseMemObject(cap_table);
+			clReleaseMemObject(continue_flags);
+			clReleaseMemObject(result_buffer);
+			clReleaseMemObject(survivor_data_buffer);
+			clReleaseMemObject(survivor_flag_buffer);
+			clReleaseMemObject(materialized_state_buffer);
+			release_assets(assets);
+			if (span_kernel) clReleaseKernel(span_kernel);
+			if (compact_kernel) clReleaseKernel(compact_kernel);
+			if (resolve_kernel) clReleaseKernel(resolve_kernel);
+			if (raceway_wave_first_kernel) clReleaseKernel(raceway_wave_first_kernel);
+			if (raceway_wave_span_kernel) clReleaseKernel(raceway_wave_span_kernel);
+			clReleaseKernel(screen_ilp6_kernel);
+			clReleaseKernel(materialize_kernel);
+			clReleaseKernel(screen_kernel);
+			clReleaseProgram(program);
+			clReleaseCommandQueue(queue);
+			clReleaseContext(context);
+			return 0;
+		}
+
+		// OpenCL raceway foundation: direct offset-stream boundary-cap mark pass.
+		// This is intentionally a diagnostic exit path. It exercises the CUDA
+		// raceway cap/mark shape on non-CUDA devices without changing the normal
+		// screen+materialize workflow.
+		if (args.raceway_cap_mark)
+		{
+			const uint32_t N = args.workunit_size;
+			const uint32_t data_start = args.range_start;
+			const std::vector<uint32_t> cap_maps_host = build_raceway_cap_maps(args);
+			const uint32_t effective_cap_count = static_cast<uint32_t>(cap_maps_host.size());
+			const uint32_t cap_table_count = effective_cap_count == 0u ? 1u : effective_cap_count;
+			const uint64_t cap_buckets = (args.raceway_cap_bits == 0u) ? 1ull : (1ull << args.raceway_cap_bits);
+			const uint64_t cap_slots_per_table_u64 = cap_buckets * static_cast<uint64_t>(args.raceway_cap_ways);
+			if (cap_slots_per_table_u64 > std::numeric_limits<uint64_t>::max() / static_cast<uint64_t>(cap_table_count))
+			{
+				throw std::runtime_error("OpenCL raceway cap table slot count overflows uint64_t");
+			}
+			const uint64_t cap_slots_u64 = cap_slots_per_table_u64 * static_cast<uint64_t>(cap_table_count);
+			if (cap_slots_u64 > static_cast<uint64_t>(static_cast<std::size_t>(-1) / sizeof(uint32_t)))
+			{
+				throw std::runtime_error("OpenCL raceway cap table is too large for host size_t");
+			}
+			const std::size_t cap_slots = static_cast<std::size_t>(cap_slots_u64);
+			const std::size_t cap_slot_bytes = raceway_cap_fp64 ? sizeof(uint64_t) : sizeof(uint32_t);
+			if (cap_slots > static_cast<std::size_t>(-1) / cap_slot_bytes)
+			{
+				throw std::runtime_error("OpenCL raceway cap table byte size overflows size_t");
+			}
+			const std::size_t cap_bytes = cap_slots * cap_slot_bytes;
+
+			cl_int s_r = CL_SUCCESS;
+			cl_mem alive = clCreateBuffer(context, CL_MEM_READ_WRITE, N, nullptr, &s_r);
+			throw_if_error(s_r, "clCreateBuffer(raceway.alive)");
+			cl_mem drop_map = clCreateBuffer(context, CL_MEM_READ_WRITE, N, nullptr, &s_r);
+			throw_if_error(s_r, "clCreateBuffer(raceway.drop_map)");
+			cl_mem cap_table = clCreateBuffer(context, CL_MEM_READ_WRITE, cap_bytes, nullptr, &s_r);
+			throw_if_error(s_r, "clCreateBuffer(raceway.cap_table)");
+			cl_mem work_counter = clCreateBuffer(context, CL_MEM_READ_WRITE, sizeof(uint32_t), nullptr, &s_r);
+			throw_if_error(s_r, "clCreateBuffer(raceway.work_counter)");
+			const std::vector<uint32_t> cap_maps_upload = cap_maps_host.empty() ? std::vector<uint32_t>{0u} : cap_maps_host;
+			cl_mem cap_maps = create_read_only_buffer(context, queue, cap_maps_upload.data(), cap_maps_upload.size() * sizeof(uint32_t));
+
+			throw_if_error(clSetKernelArg(raceway_cap_mark_kernel, 0, sizeof(alive), &alive), "raceway.alive");
+			throw_if_error(clSetKernelArg(raceway_cap_mark_kernel, 1, sizeof(drop_map), &drop_map), "raceway.drop");
+			throw_if_error(clSetKernelArg(raceway_cap_mark_kernel, 2, sizeof(cap_table), &cap_table), "raceway.cap");
+			throw_if_error(clSetKernelArg(raceway_cap_mark_kernel, 3, sizeof(args.raceway_cap_bits), &args.raceway_cap_bits), "raceway.cap_bits");
+			throw_if_error(clSetKernelArg(raceway_cap_mark_kernel, 4, sizeof(args.raceway_cap_ways), &args.raceway_cap_ways), "raceway.cap_ways");
+			throw_if_error(clSetKernelArg(raceway_cap_mark_kernel, 5, sizeof(effective_cap_count), &effective_cap_count), "raceway.cap_count");
+			throw_if_error(clSetKernelArg(raceway_cap_mark_kernel, 6, sizeof(assets.offset_regular), &assets.offset_regular), "raceway.offset_regular");
+			throw_if_error(clSetKernelArg(raceway_cap_mark_kernel, 7, sizeof(assets.offset_alg0), &assets.offset_alg0), "raceway.offset_alg0");
+			throw_if_error(clSetKernelArg(raceway_cap_mark_kernel, 8, sizeof(assets.offset_alg6), &assets.offset_alg6), "raceway.offset_alg6");
+			throw_if_error(clSetKernelArg(raceway_cap_mark_kernel, 9, sizeof(assets.offset_alg2), &assets.offset_alg2), "raceway.offset_alg2");
+			throw_if_error(clSetKernelArg(raceway_cap_mark_kernel, 10, sizeof(assets.offset_alg5), &assets.offset_alg5), "raceway.offset_alg5");
+			throw_if_error(clSetKernelArg(raceway_cap_mark_kernel, 11, sizeof(assets.expansion_values), &assets.expansion_values), "raceway.expansion");
+			throw_if_error(clSetKernelArg(raceway_cap_mark_kernel, 12, sizeof(assets.schedule_data), &assets.schedule_data), "raceway.schedule");
+			throw_if_error(clSetKernelArg(raceway_cap_mark_kernel, 13, sizeof(args.key_id), &args.key_id), "raceway.key");
+			throw_if_error(clSetKernelArg(raceway_cap_mark_kernel, 14, sizeof(data_start), &data_start), "raceway.data_start");
+			throw_if_error(clSetKernelArg(raceway_cap_mark_kernel, 15, sizeof(N), &N), "raceway.N");
+			throw_if_error(clSetKernelArg(raceway_cap_mark_kernel, 16, sizeof(args.raceway_first_cap_map), &args.raceway_first_cap_map), "raceway.first_cap_map");
+			throw_if_error(clSetKernelArg(raceway_cap_mark_kernel, 17, sizeof(cap_maps), &cap_maps), "raceway.cap_maps");
+			throw_if_error(clSetKernelArg(raceway_cap_mark_kernel, 18, sizeof(work_counter), &work_counter), "raceway.work_counter");
+			const uint32_t persistent_flag = args.raceway_persistent ? 1u : 0u;
+			throw_if_error(clSetKernelArg(raceway_cap_mark_kernel, 19, sizeof(persistent_flag), &persistent_flag), "raceway.persistent");
+
+			const size_t span_count = (static_cast<size_t>(N) + args.raceway_cap_ilp - 1u) / args.raceway_cap_ilp;
+			size_t wg_count = span_count;
+			if (args.raceway_persistent)
+			{
+				const uint32_t requested_groups = args.raceway_persistent_groups == 0u ? kRacewayDefaultPersistentGroups : args.raceway_persistent_groups;
+				wg_count = std::min<std::size_t>(span_count, requested_groups);
+				if (wg_count == 0u) wg_count = 1u;
+			}
+			size_t global_item_size[3] = { 32, wg_count, 1 };
+			size_t local_item_size[3] = { 32, 1, 1 };
+
+			const uint8_t zero_u8 = 0u;
+			const uint8_t ff_u8 = 0xFFu;
+			const uint32_t zero_u32 = 0u;
+			const uint64_t zero_u64 = 0u;
+			auto reset_raceway_buffers = [&]() {
+				throw_if_error(clEnqueueFillBuffer(queue, alive, &zero_u8, sizeof(zero_u8), 0, N, 0, nullptr, nullptr), "raceway.fill(alive)");
+				throw_if_error(clEnqueueFillBuffer(queue, drop_map, &ff_u8, sizeof(ff_u8), 0, N, 0, nullptr, nullptr), "raceway.fill(drop_map)");
+				throw_if_error(clEnqueueFillBuffer(queue, work_counter, &zero_u32, sizeof(zero_u32), 0, sizeof(zero_u32), 0, nullptr, nullptr), "raceway.fill(work_counter)");
+				if (raceway_cap_fp64)
+				{
+					throw_if_error(clEnqueueFillBuffer(queue, cap_table, &zero_u64, sizeof(zero_u64), 0, cap_bytes, 0, nullptr, nullptr), "raceway.fill(cap_table64)");
+				}
+				else
+				{
+					throw_if_error(clEnqueueFillBuffer(queue, cap_table, &zero_u32, sizeof(zero_u32), 0, cap_bytes, 0, nullptr, nullptr), "raceway.fill(cap_table32)");
+				}
+			};
+			auto run_raceway_once = [&]() -> double {
+				reset_raceway_buffers();
+				cl_event raceway_event = nullptr;
+				throw_if_error(clEnqueueNDRangeKernel(queue, raceway_cap_mark_kernel, 3, nullptr, global_item_size, local_item_size, 0, nullptr, &raceway_event), "raceway.enqueue");
+				throw_if_error(clWaitForEvents(1, &raceway_event), "raceway.wait");
+				cl_ulong raceway_t0 = 0, raceway_t1 = 0;
+				throw_if_error(clGetEventProfilingInfo(raceway_event, CL_PROFILING_COMMAND_START, sizeof(raceway_t0), &raceway_t0, nullptr), "raceway.profile.start");
+				throw_if_error(clGetEventProfilingInfo(raceway_event, CL_PROFILING_COMMAND_END, sizeof(raceway_t1), &raceway_t1, nullptr), "raceway.profile.end");
+				clReleaseEvent(raceway_event);
+				return static_cast<double>(raceway_t1 - raceway_t0) / 1.0e6;
+			};
+
+			for (uint32_t i = 0; i < args.warmup_batches; i++)
+			{
+				(void)run_raceway_once();
+			}
+
+			std::vector<double> raceway_ms_runs(args.raceway_bench_repeats, 0.0);
+			for (uint32_t i = 0; i < args.raceway_bench_repeats; i++)
+			{
+				raceway_ms_runs[i] = run_raceway_once();
+			}
+
+			std::vector<uint8_t> host_alive(N);
+			std::vector<uint8_t> host_drop(N);
+			throw_if_error(clEnqueueReadBuffer(queue, alive, CL_TRUE, 0, N, host_alive.data(), 0, nullptr, nullptr), "raceway.read(alive)");
+			throw_if_error(clEnqueueReadBuffer(queue, drop_map, CL_TRUE, 0, N, host_drop.data(), 0, nullptr, nullptr), "raceway.read(drop)");
+
+			uint64_t alive_count = 0;
+			uint64_t dropped_count = 0;
+			uint64_t bad_drop_count = 0;
+			std::vector<uint64_t> drop_hist(27, 0);
+			for (uint32_t i = 0; i < N; i++)
+			{
+				if (host_alive[i] != 0u)
+				{
+					alive_count++;
+				}
+				else
+				{
+					dropped_count++;
+					if (host_drop[i] < drop_hist.size()) drop_hist[host_drop[i]]++;
+					else bad_drop_count++;
+				}
+			}
+
+			double raceway_min_ms = raceway_ms_runs[0];
+			double raceway_max_ms = raceway_ms_runs[0];
+			double raceway_sum_ms = 0.0;
+			for (std::size_t i = 0; i < raceway_ms_runs.size(); i++)
+			{
+				if (raceway_ms_runs[i] < raceway_min_ms) raceway_min_ms = raceway_ms_runs[i];
+				if (raceway_ms_runs[i] > raceway_max_ms) raceway_max_ms = raceway_ms_runs[i];
+				raceway_sum_ms += raceway_ms_runs[i];
+			}
+			const double raceway_mean_ms = raceway_sum_ms / static_cast<double>(raceway_ms_runs.size());
+			const double raceway_cps = static_cast<double>(N) / (raceway_min_ms / 1000.0);
+			const double cap_mb = static_cast<double>(cap_bytes) / (1024.0 * 1024.0);
+			const uint32_t last_map = cap_maps_host.empty() ? 0u : cap_maps_host.back() + 1u;
+			uint64_t estimated_map_evals = alive_count * static_cast<uint64_t>(last_map);
+			uint64_t estimated_cap_probes = alive_count * static_cast<uint64_t>(effective_cap_count);
+			for (std::size_t m = 0; m < drop_hist.size(); m++)
+			{
+				const uint64_t n_drop = drop_hist[m];
+				if (n_drop == 0u) continue;
+				estimated_map_evals += n_drop * static_cast<uint64_t>(m + 1u);
+				estimated_cap_probes += n_drop * static_cast<uint64_t>(
+					std::upper_bound(cap_maps_host.begin(), cap_maps_host.end(), static_cast<uint32_t>(m)) - cap_maps_host.begin());
+			}
+			std::ostringstream boundary_list;
+			for (std::size_t i = 0; i < cap_maps_host.size(); i++)
+			{
+				if (i != 0u) boundary_list << ",";
+				boundary_list << (cap_maps_host[i] + 1u);
+			}
+			const double map_rate = raceway_min_ms == 0.0 ? 0.0 : static_cast<double>(estimated_map_evals) / (raceway_min_ms / 1000.0);
+			const double probe_rate = raceway_min_ms == 0.0 ? 0.0 : static_cast<double>(estimated_cap_probes) / (raceway_min_ms / 1000.0);
+			std::cout << "OpenCL raceway boundary-cap mark: " << N << " candidates, key=0x"
+			          << std::hex << std::setw(8) << std::setfill('0') << args.key_id
+			          << std::dec << std::setfill(' ') << "\n";
+			std::cout << "  cuda_equiv    : ./test_cuda --device <n> --key_id 0x"
+			          << std::hex << std::setw(8) << std::setfill('0') << args.key_id
+			          << std::dec << std::setfill(' ')
+			          << " --workunit_size " << N
+			          << " --raceway-direct-cap-mark --raceway-direct-offset"
+			          << " --raceway-direct-wave-span-ilp " << args.raceway_cap_ilp
+			          << " --raceway-cap-bits " << args.raceway_cap_bits
+			          << " --raceway-cap-ways " << args.raceway_cap_ways
+			          << " --raceway-first-cap-map " << args.raceway_first_cap_map
+			          << " --raceway-cap-count " << effective_cap_count << "\n";
+			std::cout << "  first_cap_map : " << args.raceway_first_cap_map
+			          << "  cap_count: " << effective_cap_count
+			          << "  boundaries: " << (cap_maps_host.empty() ? "none" : boundary_list.str())
+			          << "  cap: 2^" << args.raceway_cap_bits << " x " << args.raceway_cap_ways
+			          << " x " << cap_table_count
+			          << " (" << std::fixed << std::setprecision(1) << cap_mb << " MB total, "
+			          << (raceway_cap_fp64 ? "fp64" : "fp32 fallback") << ")\n";
+			std::cout << "  repeats       : warmup=" << args.warmup_batches
+			          << " timed=" << args.raceway_bench_repeats
+			          << " ilp=" << args.raceway_cap_ilp
+			          << " groups=" << wg_count
+			          << (args.raceway_persistent ? " persistent" : " static")
+			          << " min/mean/max=" << std::fixed << std::setprecision(3)
+			          << raceway_min_ms << "/" << raceway_mean_ms << "/" << raceway_max_ms << " ms\n";
+			std::cout << "  mark kernel   : " << std::fixed << std::setprecision(3) << raceway_min_ms << " ms   "
+			          << std::fixed << std::setprecision(0) << raceway_cps << " c/s\n";
+			std::cout << "  alive/dropped : " << alive_count << " / " << dropped_count << "\n";
+			std::cout << "  est work      : map_evals=" << estimated_map_evals
+			          << " (" << std::fixed << std::setprecision(1) << (map_rate / 1.0e6) << " M/s)"
+			          << " cap_probes=" << estimated_cap_probes
+			          << " (" << std::fixed << std::setprecision(1) << (probe_rate / 1.0e6) << " M/s)\n";
+			if (bad_drop_count != 0u)
+			{
+				std::cout << "  invalid drop-map bytes: " << bad_drop_count << "\n";
+			}
+			std::cout << "  drop_hist     :";
+			bool any_drop = false;
+			for (std::size_t m = 0; m < drop_hist.size(); m++)
+			{
+				if (drop_hist[m] == 0u) continue;
+				any_drop = true;
+				std::cout << " m" << m << "=" << drop_hist[m];
+			}
+			if (!any_drop) std::cout << " none";
+			std::cout << "\n";
+			if (args.raceway_cap_bits == 0u && dropped_count == 0u)
+			{
+				std::cout << "  no-cap smoke  : PASS (all candidates alive)\n";
+			}
+			else if (args.raceway_cap_bits == 0u)
+			{
+				std::cout << "  no-cap smoke  : FAIL (" << dropped_count << " candidates dropped)\n";
+			}
+
+			if (!args.raceway_profile_csv_path.empty())
+			{
+				const bool new_file = !static_cast<bool>(std::ifstream(args.raceway_profile_csv_path.c_str()));
+				std::ofstream csv(args.raceway_profile_csv_path.c_str(), std::ios::out | std::ios::app);
+				if (!csv)
+				{
+					throw std::runtime_error("Could not open raceway profile CSV path: " + args.raceway_profile_csv_path);
+				}
+				if (new_file)
+				{
+					csv << "platform,device,key,range_start,workunit_size,cap_bits,cap_ways,cap_count,first_cap_map,cap_mode,cap_mb,warmup,repeats,ilp,groups,persistent,min_ms,mean_ms,max_ms,candidates_per_s,alive,dropped,map_evals,map_evals_per_s,cap_probes,cap_probes_per_s\n";
+				}
+				csv << platform_name << ","
+				    << device_name << ","
+				    << "0x" << std::hex << std::setw(8) << std::setfill('0') << args.key_id << std::dec << std::setfill(' ') << ","
+				    << data_start << ","
+				    << N << ","
+				    << args.raceway_cap_bits << ","
+				    << args.raceway_cap_ways << ","
+				    << effective_cap_count << ","
+				    << args.raceway_first_cap_map << ","
+				    << (raceway_cap_fp64 ? "fp64" : "fp32") << ","
+				    << std::fixed << std::setprecision(3) << cap_mb << ","
+				    << args.warmup_batches << ","
+				    << args.raceway_bench_repeats << ","
+				    << args.raceway_cap_ilp << ","
+				    << wg_count << ","
+				    << (args.raceway_persistent ? 1 : 0) << ","
+				    << std::fixed << std::setprecision(6) << raceway_min_ms << ","
+				    << raceway_mean_ms << ","
+				    << raceway_max_ms << ","
+				    << std::fixed << std::setprecision(3) << raceway_cps << ","
+				    << alive_count << ","
+				    << dropped_count << ","
+				    << estimated_map_evals << ","
+				    << std::fixed << std::setprecision(3) << map_rate << ","
+				    << estimated_cap_probes << ","
+				    << std::fixed << std::setprecision(3) << probe_rate << "\n";
+				std::cout << "  profile_csv   : " << args.raceway_profile_csv_path << "\n";
+			}
+
+			clReleaseMemObject(alive);
+			clReleaseMemObject(drop_map);
+			clReleaseMemObject(cap_table);
+			clReleaseMemObject(cap_maps);
+			clReleaseMemObject(work_counter);
+			clReleaseMemObject(result_buffer);
+			clReleaseMemObject(survivor_data_buffer);
+			clReleaseMemObject(survivor_flag_buffer);
+			clReleaseMemObject(materialized_state_buffer);
+			release_assets(assets);
+			if (span_kernel) clReleaseKernel(span_kernel);
+			if (compact_kernel) clReleaseKernel(compact_kernel);
+			if (resolve_kernel) clReleaseKernel(resolve_kernel);
+			clReleaseKernel(raceway_cap_mark_kernel);
+			clReleaseKernel(screen_ilp6_kernel);
+			clReleaseKernel(materialize_kernel);
+			clReleaseKernel(screen_kernel);
+			clReleaseProgram(program);
+			clReleaseCommandQueue(queue);
+			clReleaseContext(context);
+			return 0;
+		}
+
+		// On-GPU survivor-compaction pipeline vs the ilp6 screen (parity + speedup).
+		if (args.compaction_count > 0u)
+		{
+			uint32_t N = args.compaction_count;
+			if (args.compaction_auto_tile)
+			{
+				// Per-candidate device bytes: state(128)+rep(4)+alive(1)+live_a(4)+live_b(4)
+				// +flag(1)+comp(1)+ref(~1) = 144. Bound by VRAM budget AND single-buffer
+				// max-alloc (state = N*128). Cap 128M (plateau + index safety + divides 2^32).
+				const cl_ulong reserve = 256ull * 1024 * 1024;
+				const cl_ulong budget = (dev_global_mem > reserve) ? (cl_ulong)((dev_global_mem - reserve) * 0.90) : 0;
+				cl_ulong nmax = budget / 144ull;
+				const cl_ulong nmax_alloc = dev_max_alloc / 128ull;  // state buffer limit
+				if (nmax_alloc < nmax) nmax = nmax_alloc;
+				uint32_t tile = 4u * 1024u * 1024u;
+				while (((cl_ulong)tile << 1) <= nmax && (tile << 1) <= 134217728u) tile <<= 1;
+				N = tile;
+				std::cout << "  auto-tile: VRAM " << (dev_global_mem >> 20) << " MB, maxAlloc "
+				          << (dev_max_alloc >> 20) << " MB -> tile " << (N >> 20) << "M candidates ("
+				          << (((cl_ulong)N * 128) >> 20) << " MB state)\n";
+			}
+			const uint32_t data_start = args.range_start;
+			const uint32_t SPAN_W = args.compaction_ilp;  // single-warp dedup window
+			const size_t span_ls = 32u;                    // work-group size (single warp)
+			cl_int e = CL_SUCCESS;
+
+			// Reference: ilp6 screen into buf_ref (TDR-safe chunked launch over the tile).
+			cl_mem buf_ref = clCreateBuffer(context, CL_MEM_READ_WRITE, ((N + 5u) / 6u) * 6u, nullptr, &e); throw_if_error(e, "alloc(ref)");
+			set_ilp6_static_args(buf_ref);
+			clFinish(queue);
+			auto r0 = std::chrono::steady_clock::now();
+			enqueue_ilp6_screen(buf_ref, args.key_id, data_start, N);
+			clFinish(queue);
+			const double ref_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - r0).count();
+
+			// Compaction buffers.
+			cl_mem state      = clCreateBuffer(context, CL_MEM_READ_WRITE, (size_t)N * 32 * sizeof(uint32_t), nullptr, &e); throw_if_error(e, "alloc(state)");
+			cl_mem rep_global = clCreateBuffer(context, CL_MEM_READ_WRITE, (size_t)N * sizeof(uint32_t), nullptr, &e); throw_if_error(e, "alloc(rep)");
+			cl_mem alive      = clCreateBuffer(context, CL_MEM_READ_WRITE, N, nullptr, &e); throw_if_error(e, "alloc(alive)");
+			cl_mem live_a     = clCreateBuffer(context, CL_MEM_READ_WRITE, (size_t)N * sizeof(uint32_t), nullptr, &e); throw_if_error(e, "alloc(live_a)");
+			cl_mem live_b     = clCreateBuffer(context, CL_MEM_READ_WRITE, (size_t)N * sizeof(uint32_t), nullptr, &e); throw_if_error(e, "alloc(live_b)");
+			cl_mem counter    = clCreateBuffer(context, CL_MEM_READ_WRITE, sizeof(uint32_t), nullptr, &e); throw_if_error(e, "alloc(counter)");
+			cl_mem flag       = clCreateBuffer(context, CL_MEM_READ_WRITE, N, nullptr, &e); throw_if_error(e, "alloc(flag)");
+			cl_mem buf_comp   = clCreateBuffer(context, CL_MEM_READ_WRITE, N, nullptr, &e); throw_if_error(e, "alloc(comp)");
+
+			const uint32_t cuts[9] = { 0u,1u,5u,9u,13u,17u,21u,25u,27u };
+			const uint32_t NSPANS = 8u;
+
+			// Static span args.
+			throw_if_error(clSetKernelArg(span_kernel, 2, sizeof(state), &state), "span.state");
+			throw_if_error(clSetKernelArg(span_kernel, 3, sizeof(alive), &alive), "span.alive");
+			throw_if_error(clSetKernelArg(span_kernel, 4, sizeof(rep_global), &rep_global), "span.rep");
+			throw_if_error(clSetKernelArg(span_kernel, 8, sizeof(assets.offset_regular), &assets.offset_regular), "span.or");
+			throw_if_error(clSetKernelArg(span_kernel, 9, sizeof(assets.offset_alg0), &assets.offset_alg0), "span.a0");
+			throw_if_error(clSetKernelArg(span_kernel, 10, sizeof(assets.offset_alg6), &assets.offset_alg6), "span.a6");
+			throw_if_error(clSetKernelArg(span_kernel, 11, sizeof(assets.offset_alg2), &assets.offset_alg2), "span.a2");
+			throw_if_error(clSetKernelArg(span_kernel, 12, sizeof(assets.offset_alg5), &assets.offset_alg5), "span.a5");
+			throw_if_error(clSetKernelArg(span_kernel, 13, sizeof(assets.expansion_values), &assets.expansion_values), "span.exp");
+			throw_if_error(clSetKernelArg(span_kernel, 14, sizeof(assets.schedule_data), &assets.schedule_data), "span.sched");
+			throw_if_error(clSetKernelArg(span_kernel, 15, sizeof(assets.carnival_data), &assets.carnival_data), "span.carn");
+			throw_if_error(clSetKernelArg(span_kernel, 16, sizeof(flag), &flag), "span.flag");
+			throw_if_error(clSetKernelArg(span_kernel, 17, sizeof(args.key_id), &args.key_id), "span.key");
+			throw_if_error(clSetKernelArg(span_kernel, 18, sizeof(data_start), &data_start), "span.ds");
+			throw_if_error(clSetKernelArg(compact_kernel, 4, sizeof(counter), &counter), "comp.counter");
+			throw_if_error(clSetKernelArg(resolve_kernel, 0, sizeof(rep_global), &rep_global), "res.rep");
+			throw_if_error(clSetKernelArg(resolve_kernel, 1, sizeof(flag), &flag), "res.flag");
+			throw_if_error(clSetKernelArg(resolve_kernel, 2, sizeof(buf_comp), &buf_comp), "res.res");
+			throw_if_error(clSetKernelArg(resolve_kernel, 3, sizeof(N), &N), "res.N");
+
+			auto run_pipeline = [&]() {
+				const uint32_t fill = 0xFFFFFFFFu;
+				throw_if_error(clEnqueueFillBuffer(queue, rep_global, &fill, sizeof(fill), 0, (size_t)N * sizeof(uint32_t), 0, nullptr, nullptr), "fill(rep)");
+				uint32_t M = N;
+				cl_mem in_live = live_a, out_live = live_b;
+				int first = 1;
+				for (uint32_t sp = 0; sp < NSPANS; sp++)
+				{
+					uint32_t m0 = cuts[sp], m1 = cuts[sp + 1];
+					int mode = (sp == NSPANS - 1u) ? 2 : 1;  // fused screen on last span
+					throw_if_error(clSetKernelArg(span_kernel, 0, sizeof(in_live), &in_live), "span.live");
+					throw_if_error(clSetKernelArg(span_kernel, 1, sizeof(M), &M), "span.M");
+					throw_if_error(clSetKernelArg(span_kernel, 5, sizeof(m0), &m0), "span.m0");
+					throw_if_error(clSetKernelArg(span_kernel, 6, sizeof(m1), &m1), "span.m1");
+					throw_if_error(clSetKernelArg(span_kernel, 7, sizeof(first), &first), "span.first");
+					throw_if_error(clSetKernelArg(span_kernel, 19, sizeof(mode), &mode), "span.mode");
+					size_t wg = (M + SPAN_W - 1u) / SPAN_W;
+					size_t sg[3] = { span_ls, wg, 1 };
+					size_t sl[3] = { span_ls, 1, 1 };
+					throw_if_error(clEnqueueNDRangeKernel(queue, span_kernel, 3, nullptr, sg, sl, 0, nullptr, nullptr), "enq(span)");
+					if (mode == 1)
+					{
+						const uint32_t zero = 0u;
+						throw_if_error(clEnqueueFillBuffer(queue, counter, &zero, sizeof(zero), 0, sizeof(zero), 0, nullptr, nullptr), "fill(counter)");
+						throw_if_error(clSetKernelArg(compact_kernel, 0, sizeof(alive), &alive), "comp.alive");
+						throw_if_error(clSetKernelArg(compact_kernel, 1, sizeof(in_live), &in_live), "comp.in");
+						throw_if_error(clSetKernelArg(compact_kernel, 2, sizeof(M), &M), "comp.M");
+						throw_if_error(clSetKernelArg(compact_kernel, 3, sizeof(out_live), &out_live), "comp.out");
+						throw_if_error(clSetKernelArg(compact_kernel, 5, sizeof(first), &first), "comp.first");
+						size_t cg = ((M + 255u) / 256u) * 256u, clsz = 256;
+						throw_if_error(clEnqueueNDRangeKernel(queue, compact_kernel, 1, nullptr, &cg, &clsz, 0, nullptr, nullptr), "enq(compact)");
+						clFinish(queue);
+						throw_if_error(clEnqueueReadBuffer(queue, counter, CL_TRUE, 0, sizeof(M), &M, 0, nullptr, nullptr), "read(counter)");
+						cl_mem tmp = in_live; in_live = out_live; out_live = tmp;
+						first = 0;
+					}
+				}
+				size_t rg = ((N + 255u) / 256u) * 256u, rl = 256;
+				throw_if_error(clEnqueueNDRangeKernel(queue, resolve_kernel, 1, nullptr, &rg, &rl, 0, nullptr, nullptr), "enq(resolve)");
+				clFinish(queue);
+			};
+
+			run_pipeline();  // warm-up
+			auto c0 = std::chrono::steady_clock::now();
+			run_pipeline();
+			const double comp_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c0).count();
+
+			std::vector<uint8_t> hr(((N + 5u) / 6u) * 6u), hc(N);
+			throw_if_error(clEnqueueReadBuffer(queue, buf_ref, CL_TRUE, 0, hr.size(), hr.data(), 0, nullptr, nullptr), "read(ref)");
+			throw_if_error(clEnqueueReadBuffer(queue, buf_comp, CL_TRUE, 0, N, hc.data(), 0, nullptr, nullptr), "read(comp)");
+			std::size_t mism = 0, fm = 0;
+			for (std::size_t i = 0; i < N; i++) if (hr[i] != hc[i]) { if (!mism) fm = i; mism++; }
+
+			std::cout << "OpenCL compaction vs ilp6 screen: " << N << " candidates, key=0x"
+			          << std::hex << std::setw(8) << std::setfill('0') << args.key_id << std::dec << std::setfill(' ') << "\n";
+			std::cout << "  ilp6 screen : " << std::fixed << std::setprecision(3) << ref_ms << " ms   " << std::setprecision(0) << (double)N / (ref_ms / 1000.0) << " c/s\n";
+			std::cout << "  compaction  : " << std::fixed << std::setprecision(3) << comp_ms << " ms   " << std::setprecision(0) << (double)N / (comp_ms / 1000.0) << " c/s\n";
+			std::cout << "  speedup     : " << std::fixed << std::setprecision(3) << (ref_ms / comp_ms) << "x\n";
+			if (mism == 0) std::cout << "  PASS - all " << N << " flags match the ilp6 screen\n";
+			else std::cout << "  FAIL - " << mism << " mismatches; first at " << fm << " ref=0x" << std::hex << (unsigned)hr[fm] << " comp=0x" << (unsigned)hc[fm] << std::dec << "\n";
+
+			clReleaseMemObject(buf_ref); clReleaseMemObject(state); clReleaseMemObject(rep_global);
+			clReleaseMemObject(alive); clReleaseMemObject(live_a); clReleaseMemObject(live_b);
+			clReleaseMemObject(counter); clReleaseMemObject(flag); clReleaseMemObject(buf_comp);
+			release_assets(assets);
+			if (raceway_cap_mark_kernel) clReleaseKernel(raceway_cap_mark_kernel);
+			clReleaseKernel(span_kernel); clReleaseKernel(compact_kernel); clReleaseKernel(resolve_kernel);
+			clReleaseKernel(screen_ilp6_kernel); clReleaseKernel(materialize_kernel); clReleaseKernel(screen_kernel);
+			clReleaseProgram(program); clReleaseCommandQueue(queue); clReleaseContext(context);
+			return 0;
+		}
 
 		// Parity + speedup check: run both screen kernels over N candidates and compare flag bytes.
 		// Then exit (no full workunit processing).
@@ -960,6 +2026,7 @@ int main(int argc, char** argv)
 			clReleaseMemObject(buf_ilp6);
 
 			release_assets(assets);
+			if (raceway_cap_mark_kernel) clReleaseKernel(raceway_cap_mark_kernel);
 			clReleaseKernel(screen_ilp6_kernel);
 			clReleaseKernel(materialize_kernel);
 			clReleaseKernel(screen_kernel);
@@ -1176,6 +2243,7 @@ int main(int argc, char** argv)
 		clReleaseMemObject(survivor_flag_buffer);
 		clReleaseMemObject(materialized_state_buffer);
 		release_assets(assets);
+		if (raceway_cap_mark_kernel) clReleaseKernel(raceway_cap_mark_kernel);
 		clReleaseKernel(screen_kernel);
 		clReleaseKernel(materialize_kernel);
 		clReleaseKernel(screen_ilp6_kernel);
@@ -1191,4 +2259,3 @@ int main(int argc, char** argv)
 		return 1;
 	}
 }
-

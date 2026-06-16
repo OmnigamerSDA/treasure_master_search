@@ -37,6 +37,7 @@ public:
 	void generate_expansion_values_8();
 	void generate_expansion_values_128_8_shuffled();
 	void generate_expansion_values_256_8_shuffled();
+	void generate_expansion_values_512_8_shuffled();
 
 	void _generate_alg0_values(uint8** rng_values, bool shuffle, int bits, bool packing_16);
 	void generate_alg0_values_8();
@@ -113,6 +114,7 @@ public:
 	static uint8* expansion_values_8;
 	static uint8* expansion_values_128_8_shuffled;
 	static uint8* expansion_values_256_8_shuffled;
+	static uint8* expansion_values_512_8_shuffled;
 
 	static uint8* alg0_values_8;
 	static uint8* alg0_bits_8;          // bit-packed alg0: 65536*16 bytes

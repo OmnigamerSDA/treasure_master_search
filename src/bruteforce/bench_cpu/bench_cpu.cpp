@@ -39,6 +39,8 @@
 #include "../cpu/tm_avx2_r256s_8.h"
 #include "../cpu/tm_avx2_r256_map_8.h"
 #include "../cpu/tm_avx512_r512s_8.h"
+#include "../cpu/tm_avx512_r512_map_8.h"
+#include "../cpu/tm_avx512_r512s_map_8.h"
 
 namespace
 {
@@ -56,6 +58,8 @@ namespace
         Avx2R256s,
         Avx2R256Map,
         Avx512R512s,
+        Avx512R512Map,
+        Avx512R512sMap,
     };
 
     const char* impl_name(Impl i)
@@ -68,6 +72,8 @@ namespace
             case Impl::Avx2R256s:   return "tm_avx2_r256s_8";
             case Impl::Avx2R256Map: return "tm_avx2_r256_map_8";
             case Impl::Avx512R512s: return "tm_avx512_r512s_8";
+            case Impl::Avx512R512Map:  return "tm_avx512_r512_map_8";
+            case Impl::Avx512R512sMap: return "tm_avx512_r512s_map_8";
         }
         return "?";
     }
@@ -81,6 +87,8 @@ namespace
         if (s == "avx2_r256s_8")    return Impl::Avx2R256s;
         if (s == "avx2_r256_map_8") return Impl::Avx2R256Map;
         if (s == "avx512_r512s_8")  return Impl::Avx512R512s;
+        if (s == "avx512_r512_map_8")  return Impl::Avx512R512Map;
+        if (s == "avx512_r512s_map_8") return Impl::Avx512R512sMap;
         throw std::runtime_error("Unknown --impl value: " + s);
     }
 
@@ -92,6 +100,7 @@ namespace
         uint32 warmup_count  = 1u << 18;
         uint32 threads       = 1u;
         Impl   impl          = Impl::Scalar;
+        bool   interleave    = false;
     };
 
     template <typename T>
@@ -130,6 +139,8 @@ namespace
                 args.impl = Impl::Avx2R256s;
             else if (a == "--nway")        // legacy alias
                 args.impl = Impl::ScalarNway;
+            else if (a == "--interleave")
+                args.interleave = true;
             else if (a == "--help" || a == "-h")
             {
                 std::cout
@@ -147,8 +158,13 @@ namespace
                     << "                          avx2_r256s_8\n"
                     << "                          avx2_r256_map_8 (port of micro500 map-mode kernel)\n"
                     << "                          avx512_r512s_8\n"
+                    << "                          avx512_r512_map_8  (AVX-512 NATURAL map kernel)\n"
+                    << "                          avx512_r512s_map_8 (AVX-512 SHUFFLED map kernel)\n"
                     << "  --avx2                legacy alias for --impl avx2_r256s_8\n"
-                    << "  --nway                legacy alias for --impl nway\n";
+                    << "  --nway                legacy alias for --impl nway\n"
+                    << "  --interleave          use the interleaved bulk screen (run_bruteforce_data_il)\n"
+                    << "                          where available: 4-way for the 512 maps, 2-way for\n"
+                    << "                          avx2_r256_map_8; no-op for impls without an _il path\n";
                 std::exit(0);
             }
             else
@@ -221,21 +237,34 @@ namespace
     template <typename TM>
     void native_screen_worker(TM& tm, uint32 key_id, uint32 warmup_start, uint32 warmup_count,
                               uint32 timed_start, uint32 timed_count,
-                              const key_schedule& schedule, std::barrier<>* bar, ThreadResult* out)
+                              const key_schedule& schedule, std::barrier<>* bar, ThreadResult* out,
+                              bool interleave)
     {
         const uint32 buf_size = std::max(timed_count / 16u, 4096u) * 5u;
         std::vector<uint8> buf(buf_size, 0);
         auto noop = [](double) {};
+        // Dispatch to the interleaved bulk screen when requested AND the impl
+        // exposes run_bruteforce_data_il; otherwise fall back to 1-way (so
+        // --interleave is a no-op for impls without an interleaved path).
+        auto run = [&](uint32 start, uint32 cnt, uint32& sz) {
+            if (interleave) {
+                if constexpr (requires { &TM::run_bruteforce_data_il; }) {
+                    tm.run_bruteforce_data_il(key_id, start, schedule, cnt,
+                                              noop, buf.data(), buf_size, &sz);
+                    return;
+                }
+            }
+            tm.run_bruteforce_data(key_id, start, schedule, cnt,
+                                   noop, buf.data(), buf_size, &sz);
+        };
         if (warmup_count > 0) {
             uint32 sz = 0;
-            tm.run_bruteforce_data(key_id, warmup_start, schedule, warmup_count,
-                                   noop, buf.data(), buf_size, &sz);
+            run(warmup_start, warmup_count, sz);
         }
         bar->arrive_and_wait();
         const auto t0 = std::chrono::high_resolution_clock::now();
         uint32 sz = 0;
-        tm.run_bruteforce_data(key_id, timed_start, schedule, timed_count,
-                               noop, buf.data(), buf_size, &sz);
+        run(timed_start, timed_count, sz);
         out->hits = sz / 5;
         out->wall_s = std::chrono::duration<double>(
             std::chrono::high_resolution_clock::now() - t0).count();
@@ -251,7 +280,8 @@ namespace
         RNG* rng,
         Impl impl,
         std::barrier<>* bar,
-        ThreadResult* out)
+        ThreadResult* out,
+        bool interleave)
     {
         switch (impl) {
             case Impl::Scalar: {
@@ -297,27 +327,37 @@ namespace
             }
             case Impl::AvxR128s: {
                 tm_avx_r128s_8 tm(rng);
-                native_screen_worker(tm, key_id, warmup_start, warmup_count, timed_start, timed_count, schedule, bar, out);
+                native_screen_worker(tm, key_id, warmup_start, warmup_count, timed_start, timed_count, schedule, bar, out, interleave);
                 break;
             }
             case Impl::AvxR256s: {
                 tm_avx_r256s_8 tm(rng);
-                native_screen_worker(tm, key_id, warmup_start, warmup_count, timed_start, timed_count, schedule, bar, out);
+                native_screen_worker(tm, key_id, warmup_start, warmup_count, timed_start, timed_count, schedule, bar, out, interleave);
                 break;
             }
             case Impl::Avx2R256s: {
                 tm_avx2_r256s_8 tm(rng);
-                native_screen_worker(tm, key_id, warmup_start, warmup_count, timed_start, timed_count, schedule, bar, out);
+                native_screen_worker(tm, key_id, warmup_start, warmup_count, timed_start, timed_count, schedule, bar, out, interleave);
                 break;
             }
             case Impl::Avx2R256Map: {
                 tm_avx2_r256_map_8 tm(rng);
-                native_screen_worker(tm, key_id, warmup_start, warmup_count, timed_start, timed_count, schedule, bar, out);
+                native_screen_worker(tm, key_id, warmup_start, warmup_count, timed_start, timed_count, schedule, bar, out, interleave);
                 break;
             }
             case Impl::Avx512R512s: {
                 tm_avx512_r512s_8 tm(rng);
                 simd_worker(tm, key_id, warmup_start, warmup_count, timed_start, timed_count, schedule, bar, out);
+                break;
+            }
+            case Impl::Avx512R512Map: {
+                tm_avx512_r512_map_8 tm(rng);
+                native_screen_worker(tm, key_id, warmup_start, warmup_count, timed_start, timed_count, schedule, bar, out, interleave);
+                break;
+            }
+            case Impl::Avx512R512sMap: {
+                tm_avx512_r512s_map_8 tm(rng);
+                native_screen_worker(tm, key_id, warmup_start, warmup_count, timed_start, timed_count, schedule, bar, out, interleave);
                 break;
             }
         }
@@ -376,7 +416,8 @@ int main(int argc, char** argv)
                 &rng,
                 args.impl,
                 &bar,
-                &results[t]);
+                &results[t],
+                args.interleave);
         }
 
         for (auto& th : threads)
@@ -401,6 +442,7 @@ int main(int argc, char** argv)
         std::cout << "  range_start:   " << args.range_start << "\n";
         std::cout << "  workunit_size: " << args.workunit_size << "\n";
         std::cout << "  threads:       " << T << "\n";
+        std::cout << "  interleave:    " << (args.interleave ? "yes" : "no") << "\n";
         std::cout << "  wall_s:        " << std::fixed << std::setprecision(3) << wall_s << "\n";
         std::cout << "  screen_rate:   " << std::fixed << std::setprecision(0)
                   << rate << " candidates/s\n";

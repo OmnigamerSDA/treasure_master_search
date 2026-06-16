@@ -2,7 +2,9 @@
 #include "key_schedule.h"
 #include "key_file.h"
 #include "state_dedup.h"
+#include "state_dedup_il.h"
 #include "../cpu/tm_avx2_r256s_8.h"
+#include "../cpu/tm_avx512_r512s_8.h"
 
 #include <algorithm>
 #include <atomic>
@@ -91,11 +93,25 @@ struct Args
     uint32 first_dedup_maps = 1;
     std::vector<uint32> checkpoint_entries;
     bool dedup_expanded_states = false;
+    bool interleave2 = false;  // PROTOTYPE: 2-way interleaved frontier replay
+    bool batch_hash = false;   // PROTOTYPE: 1-way map + software-pipelined batched inserts (slim driver)
+    bool batch_inserts = true; // PRODUCTION default: batched/prefetched inserts in forward_block_with_dedup
+    bool map1_source_prefilter = false;
+    bool map1_source_global_nibble_gate = true;
+    uint32 map1_source_max_classes = 1;
+    uint16 map1_source_sample_nibbles = 0xFFFFu;
+    bool map1_window_sample_gate = false;
+    uint32 map1_window_sample_pages = 4;
+    double map1_window_sample_threshold = 4.0;
     std::string boundary_stats_path;
     uint8 strict_invalid_mask = USES_UNOFFICIAL_NOPS | USES_ILLEGAL_OPCODES | USES_JAM;
     int threads = 1;
     std::size_t limit = 0;
     key_schedule::map_list_type map_kind = key_schedule::ALL_MAPS;
+    // Forward kernel: "avx2" (tm_avx2_r256s_8, 1-way) or "avx512"
+    // (tm_avx512_r512s_8, auto-4-way in the dedup driver — the normalized
+    // production forward).
+    std::string impl = "avx2";
 };
 
 template <typename T>
@@ -141,9 +157,30 @@ Args parse_args(int argc, char** argv)
         else if (s == "--dedup-checkpoints") a.checkpoint_entries = parse_checkpoints(nxt(i, "--dedup-checkpoints"));
         else if (s == "--skip-expand-dedup") a.dedup_expanded_states = false;  // legacy / no-op (now default)
         else if (s == "--dedup-expand-states") a.dedup_expanded_states = true;  // opt back into legacy behaviour
+        else if (s == "--interleave2")     a.interleave2 = true;  // PROTOTYPE 2-way interleaved frontier replay
+        else if (s == "--batch-hash")      a.batch_hash = true;   // PROTOTYPE 1-way map + batched inserts (slim driver)
+        else if (s == "--serial-hash")     a.batch_inserts = false; // disable production batched inserts (A/B the promotion)
+        else if (s == "--map1-source-prefilter") a.map1_source_prefilter = true;
+        else if (s == "--map1-source-max-classes")
+        {
+            a.map1_source_prefilter = true;
+            a.map1_source_max_classes = parse_u<uint32>(nxt(i, "--map1-source-max-classes"));
+        }
+        else if (s == "--map1-window-sample-gate") a.map1_window_sample_gate = true;
+        else if (s == "--map1-window-sample-pages")
+        {
+            a.map1_window_sample_gate = true;
+            a.map1_window_sample_pages = parse_u<uint32>(nxt(i, "--map1-window-sample-pages"));
+        }
+        else if (s == "--map1-window-sample-threshold")
+        {
+            a.map1_window_sample_gate = true;
+            a.map1_window_sample_threshold = std::stod(nxt(i, "--map1-window-sample-threshold"));
+        }
         else if (s == "--boundary-stats")  a.boundary_stats_path = nxt(i, "--boundary-stats");
         else if (s == "--strict-invalid-mask") a.strict_invalid_mask = parse_u<uint8>(nxt(i, "--strict-invalid-mask"));
         else if (s == "--threads")         a.threads = std::stoi(nxt(i, "--threads"));
+        else if (s == "--impl")            a.impl = nxt(i, "--impl");
         else if (s == "--limit")           a.limit = static_cast<std::size_t>(std::stoull(nxt(i, "--limit")));
         else if (s == "--schedule")
         {
@@ -169,6 +206,16 @@ Args parse_args(int argc, char** argv)
                 << "  --dedup-checkpoints LIST comma-separated map-entry cut points; overrides every/first\n"
                 << "  --skip-expand-dedup      (default) run first map group before the first dedup merge\n"
                 << "  --dedup-expand-states    opt back into the legacy expand-then-dedup behaviour\n"
+                << "  --impl <avx2|avx512>     forward kernel: avx2 (tm_avx2_r256s_8, 1-way; default) or\n"
+                << "                           avx512 (tm_avx512_r512s_8, auto-4-way dedup; production)\n"
+                << "  --interleave2            PROTOTYPE: 2-way interleaved frontier replay (f1k4 default shape only; AVX2 only)\n"
+                << "  --batch-hash             PROTOTYPE: slim 1-way map + batched-insert driver (f1k4 default shape only)\n"
+                << "  --serial-hash            disable production batched inserts (default on) to A/B the promotion\n"
+                << "  --map1-source-prefilter  static D=1 source-bit page compressor before MAP1 hash\n"
+                << "  --map1-source-max-classes N  accept static page only if representative count <= N\n"
+                << "  --map1-window-sample-gate sample MAP1 pages before enabling source prefilter\n"
+                << "  --map1-window-sample-pages N  pages sampled per 64K window (default 4)\n"
+                << "  --map1-window-sample-threshold R  enable source prefilter when sampled R >= R (default 4)\n"
                 << "  --boundary-stats FILE    append per-boundary frontier sizes + map/hash wall to CSV\n"
                 << "  --strict-invalid-mask N   flags rejected for strict all-entry count\n"
                 << "  --threads N\n"
@@ -182,7 +229,25 @@ Args parse_args(int argc, char** argv)
     if (a.window == 0) throw std::runtime_error("--window must be > 0");
     if (a.windows_per_key == 0) throw std::runtime_error("--windows-per-key must be > 0");
     if (a.dedup_every_maps == 0) throw std::runtime_error("--dedup-every-maps must be > 0");
+    if (a.map1_window_sample_gate && a.window != 65536)
+        throw std::runtime_error("--map1-window-sample-gate currently requires --window 65536");
+    if (a.map1_window_sample_gate && (a.map1_window_sample_pages == 0 || (256u % a.map1_window_sample_pages) != 0))
+        throw std::runtime_error("--map1-window-sample-pages must be > 0 and divide 256");
+    if (a.map1_window_sample_gate && a.map1_window_sample_threshold <= 0.0)
+        throw std::runtime_error("--map1-window-sample-threshold must be > 0");
     if (a.threads < 1) throw std::runtime_error("--threads must be >= 1");
+    if (a.interleave2 && a.batch_hash)
+        throw std::runtime_error("--interleave2 and --batch-hash are mutually exclusive");
+    if (a.interleave2 || a.batch_hash)
+    {
+        const char* w = a.interleave2 ? "--interleave2" : "--batch-hash";
+        if (a.map1_source_prefilter || a.map1_window_sample_gate)
+            throw std::runtime_error(std::string(w) + " prototype does not support MAP1 prefilter/sampler");
+        if (a.dedup_expanded_states)
+            throw std::runtime_error(std::string(w) + " prototype does not support --dedup-expand-states");
+        if (!a.checkpoint_entries.empty())
+            throw std::runtime_error(std::string(w) + " prototype does not support --dedup-checkpoints");
+    }
     return a;
 }
 
@@ -209,6 +274,12 @@ struct Counts
     std::uint64_t checksum_windows = 0;
     std::uint64_t all_entries_windows = 0;
     std::uint64_t strict_all_entries_windows = 0;
+    std::uint64_t map1_sampled_windows = 0;
+    std::uint64_t map1_sample_pass_windows = 0;
+    std::uint64_t map1_sample_pages = 0;
+    std::uint64_t map1_sample_ns = 0;
+    std::uint64_t forward_ns = 0;   // time in forward_block_with_dedup
+    std::uint64_t screen_ns = 0;    // time in screen_table (final decrypt+checksum+machine-code)
 
     void add(const Counts& o)
     {
@@ -233,6 +304,12 @@ struct Counts
         checksum_windows += o.checksum_windows;
         all_entries_windows += o.all_entries_windows;
         strict_all_entries_windows += o.strict_all_entries_windows;
+        map1_sampled_windows += o.map1_sampled_windows;
+        map1_sample_pass_windows += o.map1_sample_pass_windows;
+        map1_sample_pages += o.map1_sample_pages;
+        map1_sample_ns += o.map1_sample_ns;
+        forward_ns += o.forward_ns;
+        screen_ns += o.screen_ns;
     }
 };
 
@@ -243,6 +320,11 @@ struct WindowRow
     uint32 data_start = 0;
     Counts counts;
     double elapsed_s = 0.0;
+    bool map1_sampled = false;
+    bool map1_sample_pass = false;
+    double map1_sample_R = 0.0;
+    std::uint64_t map1_sample_ns = 0;
+    bool map1_source_prefilter_used = false;
 };
 
 struct ScreenResult
@@ -252,8 +334,9 @@ struct ScreenResult
     uint8 flags = 0;
 };
 
+template <typename TM>
 ScreenResult screen_entry(
-    tm_avx2_r256s_8& tm,
+    TM& tm,
     const state_dedup::FlatTable::Entry& entry)
 {
     ScreenResult result;
@@ -281,7 +364,8 @@ ScreenResult screen_entry(
     return result;
 }
 
-Counts screen_table(tm_avx2_r256s_8& tm, const state_dedup::FlatTable& table, uint8 strict_invalid_mask)
+template <typename TM>
+Counts screen_table(TM& tm, const state_dedup::FlatTable& table, uint8 strict_invalid_mask)
 {
     Counts c;
     c.unique = table.pool.size();
@@ -331,6 +415,35 @@ Counts screen_table(tm_avx2_r256s_8& tm, const state_dedup::FlatTable& table, ui
     return c;
 }
 
+template <typename TM>
+double sample_map1_window_R(
+    TM& tm,
+    uint32 key,
+    uint32 data_start,
+    const key_schedule& schedule,
+    uint32 sample_pages,
+    state_dedup::FlatTable& table)
+{
+    state_dedup::prepare_map_group(tm, schedule, 0, 1);
+    const uint32 step = 256u / sample_pages;
+    std::uint64_t class_sum = 0;
+    for (uint32 page = 0; page < 256u; page += step)
+    {
+        table.reset(256);
+        const uint32 page_start = data_start + page * 256u;
+        for (uint32 i = 0; i < 256u; i++)
+        {
+            tm.expand(key, page_start + i);
+            state_dedup::run_map_group(tm, schedule, 0, 1);
+            table.insert(tm.state_raw(), 1u);
+        }
+        class_sum += table.pool.size();
+    }
+    return class_sum > 0
+        ? 256.0 / (static_cast<double>(class_sum) / static_cast<double>(sample_pages))
+        : 0.0;
+}
+
 std::string hex_key(uint32 key)
 {
     std::ostringstream ss;
@@ -348,7 +461,9 @@ void write_rows(const std::string& path, const std::vector<WindowRow>& rows)
         << "checksum_unique,checksum_origins,carnival_unique,other_unique,dual_unique,"
         << "first_entry_unique,first_entry_origins,all_entries_unique,all_entries_origins,"
         << "strict_all_entries_unique,strict_all_entries_origins,"
-        << "nop_unique,nop2_unique,illegal_unique,jam_unique,elapsed_s,rate_cps\n";
+        << "nop_unique,nop2_unique,illegal_unique,jam_unique,"
+        << "map1_sampled,map1_sample_pass,map1_sample_R,map1_sample_ns,"
+        << "map1_source_prefilter_used,elapsed_s,rate_cps\n";
     for (const WindowRow& r : rows)
     {
         const Counts& c = r.counts;
@@ -376,15 +491,23 @@ void write_rows(const std::string& path, const std::vector<WindowRow>& rows)
             << c.nop2_unique << ','
             << c.illegal_unique << ','
             << c.jam_unique << ','
+            << (r.map1_sampled ? 1 : 0) << ','
+            << (r.map1_sample_pass ? 1 : 0) << ','
+            << std::fixed << std::setprecision(6) << r.map1_sample_R << ','
+            << r.map1_sample_ns << ','
+            << (r.map1_source_prefilter_used ? 1 : 0) << ','
             << std::fixed << std::setprecision(6) << r.elapsed_s << ','
             << std::fixed << std::setprecision(0) << rate << '\n';
     }
 }
 
+template <typename TM>
 Counts run_sweep(const Args& a, const std::vector<uint32>& keys, std::vector<WindowRow>& rows, double& elapsed_s)
 {
     RNG warm_rng;
-    tm_avx2_r256s_8 warm_tm(&warm_rng);
+    TM warm_tm(&warm_rng);
+    if (a.map1_source_prefilter)
+        state_dedup::ensure_map1_source_tables();
 
     const std::uint64_t total_tasks =
         static_cast<std::uint64_t>(keys.size()) * static_cast<std::uint64_t>(a.windows_per_key);
@@ -403,8 +526,14 @@ Counts run_sweep(const Args& a, const std::vector<uint32>& keys, std::vector<Win
         workers.emplace_back([&, tid]()
         {
             RNG rng;
-            tm_avx2_r256s_8 tm(&rng);
+            TM tm(&rng);
             state_dedup::FlatTable out, scratch;
+            state_dedup::FlatTable sample_table;
+            state_dedup::Map1SourcePrefilterConfig map1_prefilter;
+            map1_prefilter.enabled = a.map1_source_prefilter;
+            map1_prefilter.global_nibble_gate = a.map1_source_global_nibble_gate;
+            map1_prefilter.sample_nibble_mask = a.map1_source_sample_nibbles;
+            map1_prefilter.sample_max_classes = a.map1_source_max_classes;
             Counts local_total;
             std::vector<WindowRow> mine;
             BoundaryAggregate boundary_local;
@@ -422,17 +551,76 @@ Counts run_sweep(const Args& a, const std::vector<uint32>& keys, std::vector<Win
                 key_schedule schedule(key, a.map_kind);
 
                 const auto w0 = std::chrono::high_resolution_clock::now();
+                bool sample_pass = true;
+                double sample_R = 0.0;
+                std::uint64_t sample_ns = 0;
+                if (a.map1_window_sample_gate)
+                {
+                    const auto sample_t0 = std::chrono::steady_clock::now();
+                    sample_R = sample_map1_window_R(
+                        tm, key, start, schedule, a.map1_window_sample_pages, sample_table);
+                    sample_ns = static_cast<std::uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - sample_t0).count());
+                    sample_pass = sample_R >= a.map1_window_sample_threshold;
+                }
+                const bool use_map1_source_prefilter =
+                    a.map1_source_prefilter &&
+                    (!a.map1_window_sample_gate || sample_pass);
                 if (collect_boundary_stats) boundary_buf.clear();
-                state_dedup::forward_block_with_dedup(
-                    tm, key, start, a.window, schedule, out, scratch,
-                    a.dedup_every_maps, a.first_dedup_maps,
-                    a.checkpoint_entries.empty() ? nullptr : &a.checkpoint_entries,
-                    a.dedup_expanded_states,
-                    collect_boundary_stats ? &boundary_buf : nullptr);
+                const auto fwd_t0 = std::chrono::steady_clock::now();
+                if (a.interleave2 && [&]{ if constexpr (requires { &TM::run_maps_range_x2; }) return true; else return false; }())
+                {
+                    // PROTOTYPE path: slim 2-way interleaved driver (AVX2 only —
+                    // needs run_maps_range_x2). Supports only the production-default
+                    // f1k4 shape (no prefilter, no expand-dedup, no checkpoints,
+                    // no skip-final-hash).
+                    if constexpr (requires { &TM::run_maps_range_x2; })
+                        state_dedup::forward_block_with_dedup_il2(
+                            tm, key, start, a.window, schedule, out, scratch,
+                            a.dedup_every_maps, a.first_dedup_maps,
+                            collect_boundary_stats ? &boundary_buf : nullptr);
+                }
+                else if (a.batch_hash)
+                {
+                    // PROTOTYPE path: 1-way map + software-pipelined batched inserts.
+                    state_dedup::forward_block_with_dedup_bh(
+                        tm, key, start, a.window, schedule, out, scratch,
+                        a.dedup_every_maps, a.first_dedup_maps,
+                        collect_boundary_stats ? &boundary_buf : nullptr);
+                }
+                else
+                {
+                    state_dedup::forward_block_with_dedup(
+                        tm, key, start, a.window, schedule, out, scratch,
+                        a.dedup_every_maps, a.first_dedup_maps,
+                        a.checkpoint_entries.empty() ? nullptr : &a.checkpoint_entries,
+                        a.dedup_expanded_states,
+                        collect_boundary_stats ? &boundary_buf : nullptr,
+                        false,
+                        use_map1_source_prefilter ? &map1_prefilter : nullptr,
+                        a.batch_inserts);
+                }
+                const std::uint64_t fwd_ns = static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - fwd_t0).count());
                 if (collect_boundary_stats) fold_boundary_stats(boundary_local, boundary_buf);
+                const auto scr_t0 = std::chrono::steady_clock::now();
                 Counts wc = screen_table(tm, out, a.strict_invalid_mask);
+                const std::uint64_t scr_ns = static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - scr_t0).count());
+                wc.forward_ns = fwd_ns;
+                wc.screen_ns = scr_ns;
                 wc.windows = 1;
                 wc.candidates = a.window;
+                if (a.map1_window_sample_gate)
+                {
+                    wc.map1_sampled_windows = 1;
+                    wc.map1_sample_pass_windows = sample_pass ? 1 : 0;
+                    wc.map1_sample_pages = a.map1_window_sample_pages;
+                    wc.map1_sample_ns = sample_ns;
+                }
                 const double ws = std::chrono::duration<double>(
                     std::chrono::high_resolution_clock::now() - w0).count();
 
@@ -445,6 +633,11 @@ Counts run_sweep(const Args& a, const std::vector<uint32>& keys, std::vector<Win
                     row.data_start = start;
                     row.counts = wc;
                     row.elapsed_s = ws;
+                    row.map1_sampled = a.map1_window_sample_gate;
+                    row.map1_sample_pass = a.map1_window_sample_gate && sample_pass;
+                    row.map1_sample_R = sample_R;
+                    row.map1_sample_ns = sample_ns;
+                    row.map1_source_prefilter_used = use_map1_source_prefilter;
                     mine.push_back(row);
                 }
             }
@@ -513,13 +706,25 @@ void print_summary(const Args& a, const std::vector<uint32>& keys, const Counts&
     const double origin_replay_rate = c.windows > 0 ? static_cast<double>(c.all_entries_windows) / static_cast<double>(c.windows) : 0.0;
     const double strict_replay_rate = c.windows > 0 ? static_cast<double>(c.strict_all_entries_windows) / static_cast<double>(c.windows) : 0.0;
 
-    std::cout << "Flat dedup screen bench: tm_avx2_r256s_8\n";
+    std::cout << "Flat dedup screen bench: "
+              << ((a.impl == "avx512" || a.impl == "tm_avx512_r512s_8") ? "tm_avx512_r512s_8 (auto-4-way)" : "tm_avx2_r256s_8")
+              << "\n";
     std::cout << "  keys:                 " << keys.size() << "\n";
     std::cout << "  window:               " << a.window << "\n";
     std::cout << "  windows/key:          " << a.windows_per_key << "\n";
     std::cout << "  dedup every maps:     " << a.dedup_every_maps << "\n";
     std::cout << "  first dedup maps:     " << a.first_dedup_maps << "\n";
     std::cout << "  dedup expanded states:" << (a.dedup_expanded_states ? " yes" : " no") << "\n";
+    std::cout << "  MAP1 source prefilter:" << (a.map1_source_prefilter ? " on" : " off") << "\n";
+    if (a.map1_source_prefilter)
+        std::cout << "  MAP1 source max cls:  " << a.map1_source_max_classes << "\n";
+    std::cout << "  MAP1 window sampler: " << (a.map1_window_sample_gate ? " on" : " off") << "\n";
+    if (a.map1_window_sample_gate)
+    {
+        std::cout << "  MAP1 sample pages:   " << a.map1_window_sample_pages << "\n";
+        std::cout << "  MAP1 sample thresh:  " << std::fixed << std::setprecision(3)
+                  << a.map1_window_sample_threshold << "\n";
+    }
     if (!a.checkpoint_entries.empty())
     {
         std::cout << "  dedup checkpoints:    ";
@@ -529,11 +734,28 @@ void print_summary(const Args& a, const std::vector<uint32>& keys, const Counts&
     }
     std::cout << "  threads:              " << a.threads << "\n";
     std::cout << "  windows:              " << c.windows << "\n";
+    if (a.map1_window_sample_gate)
+    {
+        std::cout << "  sampled windows:      " << c.map1_sampled_windows << "\n";
+        std::cout << "  sample-pass windows:  " << c.map1_sample_pass_windows << "\n";
+        std::cout << "  sampled MAP1 pages:   " << c.map1_sample_pages << "\n";
+        std::cout << "  sample time:          " << std::fixed << std::setprecision(3)
+                  << c.map1_sample_ns / 1.0e6 << " ms\n";
+    }
     std::cout << "  candidates:           " << c.candidates << "\n";
     std::cout << "  unique states:        " << c.unique << "\n";
     std::cout << "  elapsed_s:            " << std::fixed << std::setprecision(3) << elapsed_s << "\n";
     std::cout << "  total_rate:           " << std::fixed << std::setprecision(3) << total_rate << " M/s\n";
     std::cout << "  rate/thread:          " << std::fixed << std::setprecision(3) << per_thread << " M/s/thread\n";
+    {
+        const double fwd_ms = c.forward_ns / 1.0e6;
+        const double scr_ms = c.screen_ns / 1.0e6;
+        const double sum = static_cast<double>(c.forward_ns + c.screen_ns);
+        const double scr_share = sum > 0.0 ? static_cast<double>(c.screen_ns) / sum : 0.0;
+        std::cout << "  forward time (sum):   " << std::fixed << std::setprecision(1) << fwd_ms << " ms\n";
+        std::cout << "  screen time (sum):    " << std::fixed << std::setprecision(1) << scr_ms << " ms ("
+                  << std::setprecision(2) << (scr_share * 100.0) << "% of fwd+screen)\n";
+    }
     std::cout << "  checksum unique:      " << c.checksum_unique << " (" << std::setprecision(8) << unique_rate << "/unique)\n";
     std::cout << "  checksum origins:     " << c.checksum_origins << "\n";
     std::cout << "  checksum windows:     " << c.checksum_windows << "\n";
@@ -572,7 +794,13 @@ int main(int argc, char** argv)
 
         std::vector<WindowRow> rows;
         double elapsed_s = 0.0;
-        const Counts total = run_sweep(a, keys, rows, elapsed_s);
+        Counts total;
+        if (a.impl == "avx512" || a.impl == "tm_avx512_r512s_8")
+            total = run_sweep<tm_avx512_r512s_8>(a, keys, rows, elapsed_s);
+        else if (a.impl == "avx2" || a.impl == "tm_avx2_r256s_8")
+            total = run_sweep<tm_avx2_r256s_8>(a, keys, rows, elapsed_s);
+        else
+            throw std::runtime_error("unknown --impl: " + a.impl + " (use avx2 or avx512)");
         write_rows(a.out_path, rows);
         print_summary(a, keys, total, elapsed_s);
         return 0;

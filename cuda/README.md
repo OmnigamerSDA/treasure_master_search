@@ -11,6 +11,29 @@ Master forward-search release. It is self-contained enough to publish as a
 standalone CUDA package, but the preferred public layout also includes the
 CPU and OpenCL implementations beside it.
 
+## Production engine: the bounded-wave raceway
+
+The **production forward engine (2026-06-16) is the bounded-wave raceway**
+(`src/tm_cuda_raceway.cuh`) — best across **both throughput and memory**, the
+default for any system. It originates the MAP1 frontier into an LLC-/VRAM-sized
+wave and drains it through persistent per-boundary fingerprint caps; it is
+**FN-safe** (finds every hit). Run it:
+
+```sh
+./tm_cuda --device D --key_id 0x... --workunit_size 4294967296 \
+  --raceway-direct-wave-continue-batch auto
+```
+
+Tune it per device once (sweeps span-ILP × cap-bits, auto-applied on later runs):
+
+```sh
+./tm_cuda --device D --calibrate-raceway
+```
+
+The flat **checksum screen** and **on-GPU compaction** paths below are retained
+as **research / A-B** comparisons (the screen is also the bit-exact parity
+reference and the exact per-value hit tally).
+
 ## What the code does
 
 For each candidate `(key, data)`:
@@ -29,14 +52,21 @@ The 2^32 key space is searched by fixing a key and sweeping the data axis
 (or vice versa). The kernel is the data-sweep variant: one fixed key per
 launch, batched data values across threads.
 
-## Performance
+## Performance (research / A-B paths)
 
-Two screen-kernel paths are available:
+Besides the production raceway above, three screen/compaction paths are available
+for comparison and as the bit-exact parity reference:
 
-* **Baseline** (default): universal RNG tables, ILP4. Stable, broadly portable.
+* **Baseline** (default fallback): universal RNG tables, ILP4. Stable, broadly portable.
 * **Offset-stream + ILP** (`--screen-offsets [--ilp 4|6|8]`): per-key
   precomputed offset streams, configurable ILP. **~1.4× faster on
-  sm_120 Blackwell.** Costs ~22 MB of extra device memory per key.
+  sm_120 Blackwell** than baseline. Costs ~22 MB of extra device memory per key.
+* **On-GPU VRAM compaction** (`--compaction`, or auto-selected after `--calibrate`):
+  `run_span_dedup` + `compact_survivors_ordered` + `resolve_flags`. Keeps survivors
+  in VRAM and shrinks subsequent grid launches, recovering idle occupancy lost to
+  within-block dedup. **~1.4–1.8× over baseline on high-R keys** (R = survivors/span).
+  Break-even at R ≈ 1.3; compaction is on-par or slightly below baseline at very low R.
+  Use `--calibrate` to measure the optimal span geometry for your GPU and key mix.
 
 Measured on a clean GPU (no contention). 2^24-candidate workunit, fixed
 key `0x2CA5B42D`:
@@ -49,11 +79,10 @@ key `0x2CA5B42D`:
 | NVIDIA RTX 5090                            | `--screen-offsets --ilp 8`    | 136.6 M cand/s | 107.1 M cand/s |
 | NVIDIA RTX PRO 6000 Blackwell Max-Q WS Ed. | baseline                      | 74.8 M cand/s  | 72.8 M cand/s  |
 
-Survivor counts are byte-identical across all four configurations
-(deterministic kernel). ILP6 is the empirical sweet spot on Blackwell;
-ILP4 and ILP8 are exposed for tuning on other GPU families where the
-optimum may shift (smaller register file → prefer ILP4; larger →
-ILP8 may win).
+Survivor counts are byte-identical across all configurations (deterministic
+kernel). ILP6 is the empirical sweet spot on Blackwell; ILP4 and ILP8 are
+exposed for tuning on other GPU families where the optimum may shift (smaller
+register file → prefer ILP4; larger → ILP8 may win).
 
 At the measured screen-kernel rates, a full `2^32` single-key sweep on
 RTX 5090 is about **30-33 s** with `--screen-offsets --ilp 6`, or about
@@ -115,7 +144,7 @@ What didn't help (verified with Nsight Compute):
 - Small loop-unroll tweaks beyond the above.
 
 The remaining bottleneck is the dependent table-load chain in
-`run_alg_offset()` — see the inline notes in `src/tm_cuda.cu`.
+`run_alg_offset()` — see the inline notes in `src/tm_cuda_primitives.cuh`.
 
 ## Build
 
@@ -245,7 +274,19 @@ Fast kernel (offset-stream + ILP6, ~1.4× faster):
             --screen-offsets --ilp 6
 ```
 
-### 4. Full 2^32 sweep for one fixed key (~30-33 s screen time on RTX 5090)
+### 4. Calibrate compaction geometry for your GPU (recommended once per machine)
+
+```sh
+./tm_cuda --device 0 --calibrate
+```
+
+This sweeps the six pre-compiled span geometries (`w8i5`, `w8i6`, `w8i8`,
+`w8i10`, `w4i8`, `w8i4`) against screen throughput and writes the winner to
+`tm_compaction.conf` in the current directory, keyed by device fingerprint.
+Subsequent runs automatically load this config and use `--compaction` if the
+measured speedup exceeds the screen baseline.
+
+### 5. Full 2^32 sweep for one fixed key (~30-33 s screen time on RTX 5090)
 
 ```sh
 ./tm_cuda --device 0 --key_id 0x2CA5B42D --range_start 0 \
@@ -256,6 +297,13 @@ Fast kernel (offset-stream + ILP6, ~1.4× faster):
 The `--screen-offsets` path uses ~22 MB of extra GPU memory per key (the
 precomputed offset streams). It must be re-uploaded if the key changes;
 for single-key workunits this is amortized once at startup.
+
+To use the on-GPU compaction path explicitly (after calibration, or to force it):
+```sh
+./tm_cuda --device 0 --key_id 0x2CA5B42D --range_start 0 \
+            --workunit_size 4294967296 --batch_size 1048576 --warmup_batches 1 \
+            --screen-offsets --ilp 6 --compaction
+```
 
 ### Note on device numbering
 
@@ -272,14 +320,22 @@ values on the host side, but the kernel is 32-bit candidate-indexed.
 
 ```
 src/
-  main.cpp           CUDA host: argument parsing, kernel launch, validation
-  tm_cuda.cu         CUDA kernel: schedule + alg loop + checksum screen
-  key_schedule.{cpp,h}  Forward key-schedule generator
-  rng_obj.{cpp,h}    PRNG class — produces all RNG tables fed to the kernel
-  alignment2.{cpp,h} Memory-alignment helpers
-  data_sizes.h       Compile-time size constants
-Makefile             Build driver (configurable CUDA_PATH and GENCODE)
-README.md            This file
+  main.cpp                CUDA host: argument parsing, kernel launch, calibration,
+                          compaction pipeline, validation
+  tm_cuda.cu              CUDA kernel compilation unit (thin stub — includes below)
+  tm_cuda_primitives.cuh  Device helpers: __constant__ tables, run_alg, schedule
+                          runners, HLL support, screen_candidate
+  tm_cuda_screen.cuh      Screen/HLL/dump/materialize kernels — baseline ILP4,
+                          offset-stream ILP4/6/8, maprng and experimental variants
+  tm_cuda_dedup.cuh       On-GPU VRAM compaction kernels: run_span_dedup,
+                          compact_survivors_ordered, resolve_flags, span-geometry
+                          variants used by --calibrate (w8i5/w8i6/w8i8/w8i10/w8i4/w4i8)
+  key_schedule.{cpp,h}    Forward key-schedule generator
+  rng_obj.{cpp,h}         PRNG class — produces all RNG tables fed to the kernel
+  alignment2.{cpp,h}      Memory-alignment helpers
+  data_sizes.h            Compile-time size constants
+Makefile                  Build driver (configurable CUDA_PATH and GENCODE)
+README.md                 This file
 ```
 
 The host computes all RNG tables once on the CPU (via `rng_obj`) and
@@ -314,7 +370,7 @@ A 6502 disassembly of the unlock path and a step-by-step walkthrough of
 the algorithm are published in the consolidated repository's `wiki/` and
 `docs/` directories. This directory focuses on the CUDA implementation;
 the algorithm itself is also documented in the host `key_schedule.cpp`
-and `tm_cuda.cu` sources.
+and `tm_cuda_primitives.cuh` / `tm_cuda_screen.cuh` sources.
 
 ## License
 

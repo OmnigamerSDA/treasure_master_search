@@ -1,12 +1,26 @@
 #include "alignment2.h"
 #include <stdint.h>
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
 
 void * aligned_malloc(int byte_count, int align_size)
 {
+	const int huge_size = 2 * 1024 * 1024;
+	if (byte_count >= huge_size && align_size < huge_size)
+	{
+		align_size = huge_size;
+	}
 	uint8 * raw = new uint8[byte_count + align_size + sizeof(void*)];
 	uintptr_t ptr = (uintptr_t)raw + sizeof(void*);
 	uintptr_t aligned = (ptr + align_size - 1) & ~((uintptr_t)(align_size - 1));
 	((void**)aligned)[-1] = raw;
+#if defined(__linux__)
+	if (byte_count >= huge_size)
+	{
+		(void)madvise((void*)aligned, byte_count, MADV_HUGEPAGE);
+	}
+#endif
 	return (void*)aligned;
 }
 
@@ -49,4 +63,3 @@ uint8 packing_load(uint8* src, int offset, bool packing_16)
 		return ((uint8*)src)[offset];
 	}
 }
-

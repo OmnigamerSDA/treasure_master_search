@@ -17,7 +17,9 @@ SRCS := bench_cpu.cpp \
         ../cpu/tm_avx_r256s_8.cpp \
         ../cpu/tm_avx2_r256s_8.cpp \
         ../cpu/tm_avx2_r256_map_8.cpp \
-        ../cpu/tm_avx512_r512s_8.cpp
+        ../cpu/tm_avx512_r512s_8.cpp \
+        ../cpu/tm_avx512_r512_map_8.cpp \
+        ../cpu/tm_avx512_r512s_map_8.cpp
 
 TARGET := bench_cpu
 PROFILE_DIR ?= .pgo

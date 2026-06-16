@@ -323,22 +323,26 @@ origin-replay path included for strict-passing windows.
 
 The CUDA production screen path is now the offset-stream implementation:
 
-- kernel: `tm_checksum_screen_offset_store_ilp8_preids_cuda`
-- host flag: `--screen-offsets`
+- kernel: `tm_checksum_screen_offset_store_ilp6_preids_cuda`
+- host flag: `--screen-offsets` (ILP defaults to 6; public binary also accepts `--ilp 4|6|8`)
 - key/schedule preprocessing buffer: 21,676,032 bytes
 - source: `src/bruteforce/test_cuda/main.cpp`,
-  `src/bruteforce/test_cuda/tm_cuda.cu`
+  `src/bruteforce/test_cuda/tm_cuda_screen.cuh` (split from `tm_cuda.cu` 2026-05-30)
 
-Representative rates from the 2026-05-25 CUDA pass:
+Representative rates (2026-06-01, ILP6, production fatbin = CUDA 13.3 + compaction ACF):
 
-| GPU | Offset-stream screen rate |
-|---|---:|
-| RTX 5090 | 132.4 M/s |
-| RTX PRO 6000 Blackwell Max-Q | 105.1 M/s |
+| GPU | Screen rate | Compaction (high-R key) |
+|---|---:|---:|
+| RTX 5090 | ~139–144 M/s | ~256–503 M/s (R-dependent) |
+| RTX PRO 6000 Blackwell Max-Q | ~104–106 M/s | ~115–175 M/s (R-dependent) |
 
-Dedup on GPU is now a specialty/research path. The stronger offset-stream
-screen changes the old dedup routing threshold; do not ship GPU dedup as a
-default until it is re-thresholded against the offset-stream baseline.
+The production fatbin is compiled with `--apply-controls tools/ciq_results/compaction_best_acf.bin`
+(CUDA 13.3).  The Makefile still defaults to CUDA 13.2 (safe fallback); re-apply the ACF after
+any `make` rebuild.  See `docs/compileiq_acf_tuning_20260601.md` for the full ACF analysis.
+
+The on-GPU survivor-compaction path (`--compaction-sweep`) is the recommended production sweep
+mode for keys with R ≥ 1.3 (auto-selected by `tm_compaction.conf` calibration).  The flat ilp6
+screen remains the fallback for low-R keys and hardware without calibration data.
 
 ## Release Candidate Boundary
 

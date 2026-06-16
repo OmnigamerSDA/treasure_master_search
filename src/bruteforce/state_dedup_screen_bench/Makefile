@@ -8,7 +8,8 @@ SRCS := state_dedup_screen_bench.cpp \
         $(SRC_COMMON)/key_schedule.cpp \
         $(SRC_COMMON)/tm_base.cpp \
         $(SRC_COMMON)/carnival_targets.cpp \
-        ../cpu/tm_avx2_r256s_8.cpp
+        ../cpu/tm_avx2_r256s_8.cpp \
+        ../cpu/tm_avx512_r512s_8.cpp
 
 TARGET := state_dedup_screen_bench
 

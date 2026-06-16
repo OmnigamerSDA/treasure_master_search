@@ -2,6 +2,11 @@
 
 This note tracks the current forward-path GPU benchmark shape and the latest measured CUDA results.
 
+> **Production engine (2026-06-16): the bounded-wave raceway** (best across throughput AND memory; see
+> `docs/forward_engines_operating_guide_20260614.md`, tuned per device by `test_cuda --calibrate-raceway`).
+> The flat **checksum screen** measured below is the throughput-methodology baseline and the bit-exact
+> parity reference — not the production engine.
+
 ## Scope
 
 Chosen scope for the GPU benchmark:
@@ -32,8 +37,8 @@ OpenCL benchmark path:
 CUDA benchmark path:
 
 - host benchmark: `src/bruteforce/test_cuda/main.cpp`
-- checksum-screen kernel: `src/bruteforce/test_cuda/tm_cuda.cu`
-- survivor materialization kernel: `src/bruteforce/test_cuda/tm_cuda.cu`
+- checksum-screen kernel: `src/bruteforce/test_cuda/tm_cuda_screen.cuh`
+- survivor materialization kernel: `src/bruteforce/test_cuda/tm_cuda_screen.cuh`
 
 Current CUDA benchmark output focuses on:
 
@@ -91,13 +96,15 @@ Nsight Systems and Nsight Compute now agree on the remaining bottleneck:
 - survivor materialization is negligible in the benchmark configuration
 - the dominant remaining issue is the dependent table-load/use chain inside `run_alg()`
 
-Hot sites repeatedly identified by source-correlated `ncu` runs:
+Hot sites repeatedly identified by source-correlated `ncu` runs (line numbers
+from the original monolithic `tm_cuda.cu`; the relevant code now lives in
+`src/bruteforce/test_cuda/tm_cuda_primitives.cuh` after the 2026-05-30 split):
 
-- `src/bruteforce/test_cuda/tm_cuda.cu:92`
-- `src/bruteforce/test_cuda/tm_cuda.cu:96`
-- `src/bruteforce/test_cuda/tm_cuda.cu:100`
-- `src/bruteforce/test_cuda/tm_cuda.cu:104`
-- `src/bruteforce/test_cuda/tm_cuda.cu:108`
+- `tm_cuda.cu:92` → `run_alg()` alg-2 LDR path
+- `tm_cuda.cu:96` → `run_alg()` alg-5 LDR path
+- `tm_cuda.cu:100` → `run_alg()` alg-0 bit-extract
+- `tm_cuda.cu:104` → `run_alg()` alg-6 bit-extract
+- `tm_cuda.cu:108` → `run_alg()` alg-1/3/4 table load
 
 What did not show a compelling standalone gain:
 
@@ -169,16 +176,22 @@ Quick parity check:
 ./test_cuda --device 1 --parity 256 --batch_size 256 --workunit_size 256 --warmup_batches 0
 ```
 
-Short throughput benchmark:
+Short throughput benchmark (baseline kernel, historical reference):
 
 ```bash
 ./test_cuda --device 1 --key_id 0x2CA5B42D --range_start 0 --workunit_size 16777216 --batch_size 1048576 --warmup_batches 1
 ```
 
-Full `2^32` sweep:
+Short throughput benchmark (production offset-stream + ILP6 kernel, current):
 
 ```bash
-./test_cuda --device 1 --key_id 0x2CA5B42D --range_start 0 --workunit_size 4294967296 --batch_size 1048576 --warmup_batches 1
+./test_cuda --device 1 --key_id 0x2CA5B42D --range_start 0 --workunit_size 16777216 --batch_size 1048576 --warmup_batches 1 --screen-offsets
+```
+
+Full `2^32` sweep (production):
+
+```bash
+./test_cuda --device 1 --key_id 0x2CA5B42D --range_start 0 --workunit_size 4294967296 --batch_size 1048576 --warmup_batches 1 --screen-offsets
 ```
 
 Nsight Systems:

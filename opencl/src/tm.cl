@@ -1,13 +1,32 @@
 // Treasure Master — OpenCL kernels for the forward search.
 //
-// Kernels:
+// Working state: 128 bytes per candidate, held as 32 × uint32 across a
+// 32-item work-group (one lane per uint32 word).  Algorithms operate on
+// all 128 bytes in parallel; work-group barriers serialise cross-lane
+// operations (alg2/alg5 carry propagation, checksum reduction).
+//
+// Kernels (development / test harness):
 //   tm_process              — single-step algorithm dispatch (alg 0..7)
 //   test_expand             — IV expansion (8B → 128B via RNG accumulation)
 //   test_alg                — standalone algorithm test harness
 //   full_process            — end-to-end (expand + schedule + alg loop)
+//
+// Kernels (RESEARCH / A-B + parity-reference screening path):
 //   tm_stats                — kernel-side machine-flag stats accumulator
 //   tm_checksum_screen      — fast checksum-only screen (forward fair filter)
-//   tm_materialize_survivors — emit survivor records to host buffer
+//   tm_checksum_screen_offset_ilp6 — ILP6 offset-stream screen (bit-exact parity reference)
+//   tm_materialize_survivors — replay survivors: expand + decrypt + validate
+//
+// Kernels (RESEARCH / A-B: on-GPU compaction architecture, 2026-05-29):
+//   run_span_dedup          — map a candidate span, dedup, flag alive
+//   compact_survivors_ordered — block-stable ordered compaction
+//   resolve_flags           — union-find chain resolution for compaction
+//
+// Kernels (PRODUCTION engine: bounded-wave raceway — best across throughput AND memory,
+// the 2026-06-16 default; this OpenCL port runs ~70% of the CUDA raceway):
+//   raceway_boundary_cap_mark_offset   — direct offset-stream cap mark pass
+//   raceway_boundary_cap_state_offset  — cap-span originate (carries boundary state)
+//   raceway_span_state_liveidx_cap_offset — per-boundary cap-drain span
 //
 // Each algorithm case (0..7) corresponds to one byte op in the schedule.
 // Cases 2 and 5 require cross-lane carries; carry-ins for the last lane
@@ -15,6 +34,22 @@
 
 #define reverse_offset(x) (127 - (x))
 
+// AMD LDS-relief prototype: the raceway inner loop can keep per-lane state in
+// registers and move cross-lane data with subgroup collectives instead of the
+// LDS round-trip + double work-group barrier on every algorithm step. The
+// alg-id source word is uniform across the wave (read from one source_lane), so
+// sub_group_broadcast fits exactly; only alg2/alg5 need the +1 neighbour byte,
+// which falls back to a minimal LDS exchange (this ICD lacks cl_khr_subgroup_shuffle).
+// Requires the work-group to be exactly one subgroup (local size {32,1,1}).
+#ifdef RACEWAY_SUBGROUP
+#pragma OPENCL EXTENSION cl_khr_subgroups : enable
+#endif
+
+// -------------------------------------------------------------------
+// Development / test harness kernels
+// These operate on pre-staged code_space buffers and are used only
+// for unit-testing and parity checks, not for production sweeps.
+// -------------------------------------------------------------------
 __kernel void tm_process(__global unsigned char* code_space, __global unsigned char * regular_rng_values, __global unsigned char * alg0_values, __global unsigned char * alg6_values, __global unsigned char * rng_forward_1, __global unsigned char * rng_forward_128, __global unsigned char * alg2_values, __global unsigned char * alg5_values)
 {
 	__local unsigned int working_code[32];
@@ -156,6 +191,10 @@ void expand(__local unsigned int * working_code, int int_index, unsigned short r
 	working_code[int_index] = temp;
 }
 
+// -------------------------------------------------------------------
+// test_expand — IV expansion: interleave key/data halves, accumulate
+// RNG values byte-by-byte to produce the 128-byte initial working state.
+// -------------------------------------------------------------------
 __kernel void test_expand(__global unsigned char* code_space, __global unsigned char* input_ivs, __global unsigned char* expansion_values)
 {
 	__local unsigned int working_code[32];
@@ -254,6 +293,9 @@ void run_alg(__local unsigned int * working_code, int int_index, int alg_id, uns
 	barrier(CLK_LOCAL_MEM_FENCE);
 }
 
+// -------------------------------------------------------------------
+// test_alg — run a single algorithm step on pre-staged working state.
+// -------------------------------------------------------------------
 __kernel void test_alg(__global unsigned char* code_space, __global unsigned char * test_data, __global unsigned char * regular_rng_values, __global unsigned char * alg0_values, __global unsigned char * alg6_values, __global unsigned short * rng_forward_1, __global unsigned short * rng_forward_128, __global unsigned char * alg2_values, __global unsigned char * alg5_values)
 {
 	__local unsigned int working_code[32];
@@ -306,6 +348,10 @@ void run_one_map(__local unsigned int* working_code, unsigned int int_index, __g
 }
 
 
+// -------------------------------------------------------------------
+// full_process — end-to-end: expand IV → run 27-schedule → decrypt.
+// For comparison against the screen-only path; not used in production.
+// -------------------------------------------------------------------
 __kernel void full_process(__global unsigned char* code_space, __global unsigned char * test_data, __global unsigned char * regular_rng_values, __global unsigned char * alg0_values, __global unsigned char * alg6_values, __global unsigned short * rng_forward_1, __global unsigned short * rng_forward_128, __global unsigned char * alg2_values, __global unsigned char * alg5_values, __global unsigned char * expansion_values, __global unsigned char * schedule_data, unsigned int key, unsigned int data_start)
 {
 	__local unsigned int working_code[32];
@@ -367,6 +413,13 @@ __constant unsigned char other_world_data_k[128] = {
 	0x5E,0xB1,0xC1,0xBD,0x44,0xFB,0xF1,0x50
 };
 
+// -------------------------------------------------------------------
+// 6502 opcode tables used by check_machine_code (in tm_stats).
+// opcode_bytes_used_k: instruction width (0 = JAM/ILLEGAL/not fetched).
+// opcode_type_k: OP_* category flags (OP_JAM=1, OP_ILLEGAL=2, OP_NOP2=4,
+//   OP_NOP=8, OP_JUMP=16).
+// Identical data is in main.cpp (kOpcodeBytesUsed / kOpcodeType).
+// -------------------------------------------------------------------
 __constant unsigned char opcode_bytes_used_k[256] = {
 	1,2,0,0,2,2,2,0,1,2,1,0,3,3,3,0,
 	2,2,0,0,2,2,2,0,1,3,1,0,2,3,3,0,
@@ -438,6 +491,9 @@ __constant unsigned char other_world_checksum_mask_k[128] = {
 	0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF
 };
 
+// -------------------------------------------------------------------
+// Checksum helpers (called by tm_stats; run from lane 0 only)
+// -------------------------------------------------------------------
 unsigned short masked_checksum(__local unsigned int* data_i, __constant unsigned char* mask)
 {
 	__local unsigned char* data = (__local unsigned char*)data_i;
@@ -1030,9 +1086,1182 @@ __kernel void tm_materialize_survivors(
 	((__global unsigned int*)output_data)[survivor_index * 32 + int_index] = decrypted_word;
 }
 
+// ===================================================================
+// On-GPU VRAM survivor-compaction architecture (OpenCL port).
+//
+// Geometry: single work-group of 32 lanes handles SPAN_ILP candidates (the
+// dedup window W = SPAN_ILP). State lives in __local (mirrors the ilp6 screen).
+// Because only lane 0 does the per-span dedup inserts (sequentially over the
+// SPAN_ILP candidates), NO atomics are needed inside the span kernel — the
+// int64-local-atomic concern is sidestepped entirely. Cross-span re-blocking
+// (ordered compaction) widens the effective dedup window over the run.
+// ===================================================================
+#ifndef SPAN_ILP
+#define SPAN_ILP   8       // dedup window W = SPAN_ILP; single-warp is optimal on OpenCL
+#endif
+#define SPAN_NSLOT (SPAN_ILP * 4)   // power-of-two when SPAN_ILP is; load factor 4
+#ifndef RACEWAY_CAP_ILP
+#define RACEWAY_CAP_ILP 4
+#endif
+
+// -------------------------------------------------------------------
+// LDS-resident RNG staging (rng_lds_staging_architectural_exploration_20260615.md).
+// Moves the per-map RNG-row reads off the saturated VMEM unit onto the idle LDS
+// unit. The ×3 offset tables (regular/alg0/alg6) collapse to regular only —
+// proven bit-exact over all 65536 seeds (lds_staging_probe.cpp):
+//   alg0_word[L] = (regular_word[L]    >> 7) & 0x01010101   (same lane)
+//   alg6_word[L] = bswap(regular_word[31-L]) & 0x80808080   (position-reversed)
+// Every touched rng_offset = 128*f + c with f+c <= 16 (f = #full-RNG steps so
+// far [+128 each], c = #rotate steps [+1 each]), so the touched set is a complete
+// bounded triangular superset (<=153 rows) and the LDS slot index is pure
+// arithmetic — no scatter table, no cold tail (slot < STAGE_ROWS is a dead-but-
+// safe guard). STAGE_ROWS is passed by the host (>=153).
+#ifdef RACEWAY_LDS_RNG
+#ifndef STAGE_ROWS
+#define STAGE_ROWS 160
+#endif
+// kLdsSlotBase[f] = sum_{g<f}(17-g) = #slots reserved for full-counts below f
+// (each full-count f' carries c in [0, 16-f'], i.e. 17-f' slots).
+__constant unsigned int kLdsSlotBase[17] = {
+	0u, 17u, 33u, 48u, 62u, 75u, 87u, 98u, 108u, 117u, 125u, 132u, 138u, 143u, 147u, 150u, 152u
+};
+
+inline unsigned int lds_slot_index(unsigned int rng_offset)
+{
+	return kLdsSlotBase[rng_offset >> 7] + (rng_offset & 0x7Fu);
+}
+
+inline unsigned int lds_bswap32(unsigned int v)
+{
+	return (v << 24) | ((v & 0x0000FF00u) << 8) | ((v & 0x00FF0000u) >> 8) | (v >> 24);
+}
+
+// Cooperatively stage this map's regular RNG rows into LDS (lane int_index loads
+// its own word for every structural slot). ~153 VMEM loads/lane/map, amortized
+// over RACEWAY_CAP_ILP * 16 LDS-served reads.
+void stage_map_rng(__local unsigned int* staged_regular, unsigned int int_index,
+                   unsigned int sched, __global unsigned char* offset_regular)
+{
+	for (unsigned int f = 0u; f <= 16u; f++)
+	{
+		const unsigned int cmax = 16u - f;
+		const unsigned int slot_base = kLdsSlotBase[f];
+		for (unsigned int c = 0u; c <= cmax; c++)
+		{
+			const unsigned int rng_offset = (f << 7) + c;
+			staged_regular[(slot_base + c) * 32u + int_index] =
+				*(__global unsigned int*)(offset_regular + ((sched * 2048u + rng_offset) * 128u + int_index * 4u));
+		}
+	}
+}
+#endif
+#ifdef RACEWAY_CAP_FP64
+#pragma OPENCL EXTENSION cl_khr_int64_base_atomics : enable
+typedef unsigned long raceway_cap_word_t;
+#else
+typedef unsigned int raceway_cap_word_t;
+#endif
+
+// Fingerprint the full 32-word state (lane 0 only): per-word murmur3, XOR-merged.
+// Collision-safe within an SPAN_ILP=8 window at 32 bits.
+unsigned int span_fingerprint(__local unsigned int* st)
+{
+	unsigned int h = 0u;
+	for (int i = 0; i < 32; i++)
+	{
+		unsigned int v = st[i] + (unsigned int)i * 0x9e3779b9u;
+		v ^= v >> 16; v *= 0x85ebca6bu; v ^= v >> 13; v *= 0xc2b2ae35u; v ^= v >> 16;
+		h ^= v;
+	}
+	return h ? h : 1u;
+}
+
+#ifdef RACEWAY_CAP_FP64
+unsigned long raceway_rotl64(unsigned long x, int r)
+{
+	return (x << r) | (x >> (64 - r));
+}
+
+unsigned long raceway_hstrong_step(unsigned long h, unsigned long w)
+{
+	h ^= w;
+	h = raceway_rotl64(h, 31);
+	h *= 0x9e3779b97f4a7c15UL;
+	h ^= h >> 29;
+	h *= 0xbf58476d1ce4e5b9UL;
+	return h;
+}
+
+raceway_cap_word_t raceway_state_fingerprint(__local unsigned int* st)
+{
+	unsigned long h = 0xcbf29ce484222325UL;
+	for (int i = 0; i < 16; i++)
+	{
+		const unsigned long lo = (unsigned long)st[i * 2];
+		const unsigned long hi = (unsigned long)st[i * 2 + 1];
+		h = raceway_hstrong_step(h, lo | (hi << 32));
+	}
+	h ^= h >> 32;
+	return h ? h : 1UL;
+}
+
+unsigned int raceway_cap_bucket(raceway_cap_word_t fp, unsigned int cap_bits)
+{
+	return (unsigned int)((fp * 0x9e3779b97f4a7c15UL) >> (64u - cap_bits));
+}
+
+raceway_cap_word_t raceway_atomic_cmpxchg(
+	volatile __global raceway_cap_word_t* slot,
+	raceway_cap_word_t cmp,
+	raceway_cap_word_t value)
+{
+	return atom_cmpxchg(slot, cmp, value);
+}
+
+raceway_cap_word_t raceway_atomic_xchg(
+	volatile __global raceway_cap_word_t* slot,
+	raceway_cap_word_t value)
+{
+	return atom_xchg(slot, value);
+}
+#else
+raceway_cap_word_t raceway_state_fingerprint(__local unsigned int* st)
+{
+	return span_fingerprint(st);
+}
+
+unsigned int raceway_cap_bucket(raceway_cap_word_t fp, unsigned int cap_bits)
+{
+	return (fp * 0x9e3779b9u) >> (32u - cap_bits);
+}
+
+raceway_cap_word_t raceway_atomic_cmpxchg(
+	volatile __global raceway_cap_word_t* slot,
+	raceway_cap_word_t cmp,
+	raceway_cap_word_t value)
+{
+	return atomic_cmpxchg(slot, cmp, value);
+}
+
+raceway_cap_word_t raceway_atomic_xchg(
+	volatile __global raceway_cap_word_t* slot,
+	raceway_cap_word_t value)
+{
+	return atomic_xchg(slot, value);
+}
+#endif
+
+// Portable OpenCL 1.2 fixed-cap probe. This intentionally uses 32-bit
+// fingerprints unless cl_khr_int64_base_atomics is available at build time.
+int raceway_cap_probe_or_keep(
+	raceway_cap_word_t fp,
+	volatile __global raceway_cap_word_t* table,
+	unsigned int cap_bits,
+	unsigned int cap_ways)
+{
+	if (table == 0 || cap_bits == 0u || cap_ways == 0u) return 0;
+	if (fp == (raceway_cap_word_t)0) fp = (raceway_cap_word_t)1;
+
+	const unsigned int bucket = raceway_cap_bucket(fp, cap_bits);
+	const unsigned int base = bucket * cap_ways;
+
+	for (unsigned int w = 0u; w < cap_ways; w++)
+	{
+		const raceway_cap_word_t cur = table[base + w];
+		if (cur == fp) return 1;
+	}
+
+#ifdef RACEWAY_CAP_FP64
+	const unsigned int victim = base + (unsigned int)(((fp >> 32) ^ (fp >> 17) ^ fp) % (raceway_cap_word_t)cap_ways);
+#else
+	const unsigned int victim = base + (unsigned int)(((fp >> 16) ^ (fp >> 7) ^ fp) % (raceway_cap_word_t)cap_ways);
+#endif
+#ifdef RACEWAY_CAP_NONATOMIC
+	// Benign-race plain store (lever #2): the cap is FN-safe over-keep, so a lost
+	// concurrent write just re-keeps a candidate later — it never drops a true hit.
+	// Drops the global-atomic-swap to a plain global store (CUDA does the same).
+	table[victim] = fp;
+#else
+	(void)raceway_atomic_xchg(table + victim, fp);
+#endif
+	return 0;
+}
+
+__kernel void raceway_boundary_cap_mark_offset(
+	__global unsigned char*  alive_out,
+	__global unsigned char*  drop_map_out,
+	volatile __global raceway_cap_word_t* cap_table,
+	unsigned int cap_bits,
+	unsigned int cap_ways,
+	unsigned int cap_count,
+	__global unsigned char*  offset_regular,
+	__global unsigned char*  offset_alg0,
+	__global unsigned char*  offset_alg6,
+	__global unsigned int*   offset_alg2,
+	__global unsigned int*   offset_alg5,
+	__global unsigned char*  expansion_values,
+	__global unsigned char*  schedule_data,
+	unsigned int key,
+	unsigned int data_start,
+	unsigned int candidate_count,
+	unsigned int first_cap_map,
+	__global unsigned int* cap_maps,
+	__global unsigned int* work_counter,
+	unsigned int persistent_queue)
+{
+	__local unsigned int working_code[32 * RACEWAY_CAP_ILP];
+	__local unsigned char alive_local[RACEWAY_CAP_ILP];
+	__local unsigned char drop_local[RACEWAY_CAP_ILP];
+	__local unsigned int task_base_local;
+	__local unsigned int any_alive_local;
+
+	const unsigned int int_index = get_local_id(0);
+	const unsigned int static_base = get_global_id(1) * RACEWAY_CAP_ILP;
+	const unsigned int last_map = (cap_count == 0u) ? 0u : (cap_maps[cap_count - 1u] + 1u);
+
+	while (1)
+	{
+		if (int_index == 0u)
+		{
+			task_base_local = (persistent_queue != 0u && work_counter != 0)
+				? atomic_add(work_counter, (unsigned int)RACEWAY_CAP_ILP)
+				: static_base;
+		}
+		barrier(CLK_LOCAL_MEM_FENCE);
+		const unsigned int base = task_base_local;
+		if (base >= candidate_count) break;
+
+		if (int_index == 0u)
+		{
+			for (int j = 0; j < RACEWAY_CAP_ILP; j++)
+			{
+				const unsigned int c = base + (unsigned int)j;
+				alive_local[j] = (c < candidate_count) ? 1u : 0u;
+				drop_local[j] = 0xFFu;
+			}
+		}
+		barrier(CLK_LOCAL_MEM_FENCE);
+
+		for (int j = 0; j < RACEWAY_CAP_ILP; j++)
+		{
+			const unsigned int cur_data = data_start + base + (unsigned int)j;
+			working_code[j * 32 + int_index] = ((int_index & 1u) == 0u) ? pack_be_u32(key) : pack_be_u32(cur_data);
+		}
+		barrier(CLK_LOCAL_MEM_FENCE);
+
+		for (int j = 0; j < RACEWAY_CAP_ILP; j++)
+		{
+			expand(working_code + j * 32, (int)int_index, (unsigned short)(key >> 16), expansion_values);
+		}
+		barrier(CLK_LOCAL_MEM_FENCE);
+
+		for (unsigned int sched = 0u; sched < last_map; sched++)
+		{
+			unsigned int rng_offset[RACEWAY_CAP_ILP];
+			for (int j = 0; j < RACEWAY_CAP_ILP; j++) rng_offset[j] = 0u;
+
+			const unsigned int packed_sched_b2 = (unsigned int)schedule_data[sched * 4 + 2];
+			const unsigned int packed_sched_b3 = (unsigned int)schedule_data[sched * 4 + 3];
+			unsigned short nibble_selector = (unsigned short)((packed_sched_b2 << 8) | packed_sched_b3);
+
+			for (int i = 0; i < 16; i++)
+			{
+				const unsigned int source_lane = (unsigned int)(i >> 2);
+				const unsigned int algorithm_shift = (unsigned int)((i & 3) * 8) + 1u + (((unsigned int)nibble_selector >> 13u) & 4u);
+
+				unsigned char algorithm_id[RACEWAY_CAP_ILP];
+				for (int j = 0; j < RACEWAY_CAP_ILP; j++)
+				{
+					const unsigned int source_word = working_code[j * 32 + source_lane];
+					algorithm_id[j] = (unsigned char)((source_word >> algorithm_shift) & 0x07u);
+				}
+
+				unsigned int new_values[RACEWAY_CAP_ILP];
+				for (int j = 0; j < RACEWAY_CAP_ILP; j++)
+				{
+					const unsigned int val = working_code[j * 32 + int_index];
+					const unsigned char aid = algorithm_id[j];
+					unsigned int temp = val;
+					if (alive_local[j] == 0u)
+					{
+						new_values[j] = temp;
+						continue;
+					}
+					if (aid == 0u)
+					{
+						temp = ((val << 1) & 0xFEFEFEFEu) | *(__global unsigned int*)(offset_alg0 + ((sched * 2048u + rng_offset[j]) * 128u + int_index * 4u));
+						rng_offset[j] += 128u;
+					}
+					else if (aid == 1u)
+					{
+						const unsigned int r = *(__global unsigned int*)(offset_regular + ((sched * 2048u + rng_offset[j]) * 128u + int_index * 4u));
+						temp = ((val & 0x00FF00FFu) + (r & 0x00FF00FFu)) & 0x00FF00FFu;
+						temp |= ((val & 0xFF00FF00u) + (r & 0xFF00FF00u)) & 0xFF00FF00u;
+						rng_offset[j] += 128u;
+					}
+					else if (aid == 3u)
+					{
+						temp = val ^ *(__global unsigned int*)(offset_regular + ((sched * 2048u + rng_offset[j]) * 128u + int_index * 4u));
+						rng_offset[j] += 128u;
+					}
+					else if (aid == 4u)
+					{
+						const unsigned int r = *(__global unsigned int*)(offset_regular + ((sched * 2048u + rng_offset[j]) * 128u + int_index * 4u));
+						temp = ((val & 0x00FF00FFu) + ((r & 0x00FF00FFu) ^ 0x00FF00FFu) + 0x00010001u) & 0x00FF00FFu;
+						temp |= ((val & 0xFF00FF00u) + ((r & 0xFF00FF00u) ^ 0xFF00FF00u) + 0x01000100u) & 0xFF00FF00u;
+						rng_offset[j] += 128u;
+					}
+					else if (aid == 6u)
+					{
+						temp = ((val >> 1) & 0x7F7F7F7Fu) | *(__global unsigned int*)(offset_alg6 + ((sched * 2048u + rng_offset[j]) * 128u + int_index * 4u));
+						rng_offset[j] += 128u;
+					}
+					else if (aid == 7u)
+					{
+						temp = val ^ 0xFFFFFFFFu;
+					}
+					else if (aid == 2u)
+					{
+						unsigned int t = (val & 0x00010000u) >> 8;
+						if (int_index == 31u) t |= offset_alg2[sched * 2048u + rng_offset[j]];
+						else { const unsigned int nlv = working_code[j * 32 + int_index + 1u]; t |= ((nlv & 0x00000001u) << 24); }
+						t |= (val >> 1) & 0x007F007Fu; t |= (val << 1) & 0xFE00FE00u; t |= (val >> 8) & 0x00800080u;
+						temp = t; rng_offset[j] += 1u;
+					}
+					else
+					{
+						unsigned int t = (val & 0x00800000u) >> 8;
+						if (int_index == 31u) t |= offset_alg5[sched * 2048u + rng_offset[j]];
+						else { const unsigned int nlv = working_code[j * 32 + int_index + 1u]; t |= ((nlv & 0x00000080u) << 24); }
+						t |= (val >> 1) & 0x7F007F00u; t |= (val << 1) & 0x00FE00FEu; t |= (val >> 8) & 0x00010001u;
+						temp = t; rng_offset[j] += 1u;
+					}
+					new_values[j] = temp;
+				}
+				barrier(CLK_LOCAL_MEM_FENCE);
+				for (int j = 0; j < RACEWAY_CAP_ILP; j++) working_code[j * 32 + int_index] = new_values[j];
+				barrier(CLK_LOCAL_MEM_FENCE);
+				nibble_selector = (unsigned short)(nibble_selector << 1);
+			}
+
+			unsigned int cap_idx = 0xFFFFFFFFu;
+			for (unsigned int ci = 0u; ci < cap_count; ci++)
+			{
+				if (cap_maps[ci] == sched)
+				{
+					cap_idx = ci;
+					break;
+				}
+			}
+			if (cap_idx != 0xFFFFFFFFu)
+			{
+				if (int_index == 0u)
+				{
+					const ulong cap_slots_per_table = ((cap_bits == 0u) ? 1UL : (1UL << cap_bits)) * (ulong)cap_ways;
+					volatile __global raceway_cap_word_t* cap_table_for_map = cap_table + (ulong)cap_idx * cap_slots_per_table;
+					for (int j = 0; j < RACEWAY_CAP_ILP; j++)
+					{
+						if (alive_local[j] == 0u) continue;
+						const raceway_cap_word_t fp = raceway_state_fingerprint(working_code + j * 32);
+						if (raceway_cap_probe_or_keep(fp, cap_table_for_map, cap_bits, cap_ways))
+						{
+							alive_local[j] = 0u;
+							drop_local[j] = (unsigned char)sched;
+						}
+					}
+				}
+				barrier(CLK_LOCAL_MEM_FENCE);
+				if (int_index == 0u)
+				{
+					unsigned int any_alive = 0u;
+					for (int j = 0; j < RACEWAY_CAP_ILP; j++)
+					{
+						any_alive |= (unsigned int)(alive_local[j] != 0u);
+					}
+					any_alive_local = any_alive;
+				}
+				barrier(CLK_LOCAL_MEM_FENCE);
+				if (any_alive_local == 0u) break;
+			}
+		}
+
+		if (int_index == 0u)
+		{
+			for (int j = 0; j < RACEWAY_CAP_ILP; j++)
+			{
+				const unsigned int c = base + (unsigned int)j;
+				if (c >= candidate_count) continue;
+				alive_out[c] = alive_local[j];
+				if (drop_map_out != 0) drop_map_out[c] = drop_local[j];
+			}
+		}
+		if (persistent_queue == 0u) break;
+		barrier(CLK_LOCAL_MEM_FENCE);
+	}
+}
+
+void raceway_run_map_range_local(
+	__local unsigned int* working_code,
+	__local unsigned char* alive_local,
+	unsigned int int_index,
+	unsigned int start_map,
+	unsigned int end_map,
+	__global unsigned char* offset_regular,
+	__global unsigned char* offset_alg0,
+	__global unsigned char* offset_alg6,
+	__global unsigned int* offset_alg2,
+	__global unsigned int* offset_alg5,
+	__global unsigned char* schedule_data
+#ifdef RACEWAY_LDS_RNG
+	, __local unsigned int* staged_regular
+#endif
+	)
+{
+#ifdef RACEWAY_LDS_RNG
+	// --- LDS-resident RNG variant -----------------------------------------------
+	// Stage this map's regular rows into LDS once, then serve all RNG reads from
+	// LDS and derive alg0/alg6 on the fly (idle VALU). alg2/5 carries stay global
+	// (tiny, lane-31 only). This is the production path under -DRACEWAY_LDS_RNG.
+	for (unsigned int sched = start_map; sched <= end_map && sched < 27u; sched++)
+	{
+		stage_map_rng(staged_regular, int_index, sched, offset_regular);
+		barrier(CLK_LOCAL_MEM_FENCE);
+
+		unsigned int rng_offset[RACEWAY_CAP_ILP];
+		for (int j = 0; j < RACEWAY_CAP_ILP; j++) rng_offset[j] = 0u;
+
+		const unsigned int packed_sched_b2 = (unsigned int)schedule_data[sched * 4 + 2];
+		const unsigned int packed_sched_b3 = (unsigned int)schedule_data[sched * 4 + 3];
+		unsigned short nibble_selector = (unsigned short)((packed_sched_b2 << 8) | packed_sched_b3);
+
+		for (int i = 0; i < 16; i++)
+		{
+			const unsigned int source_lane = (unsigned int)(i >> 2);
+			const unsigned int algorithm_shift = (unsigned int)((i & 3) * 8) + 1u + (((unsigned int)nibble_selector >> 13u) & 4u);
+
+			unsigned char algorithm_id[RACEWAY_CAP_ILP];
+			for (int j = 0; j < RACEWAY_CAP_ILP; j++)
+			{
+				const unsigned int source_word = working_code[j * 32 + source_lane];
+				algorithm_id[j] = (unsigned char)((source_word >> algorithm_shift) & 0x07u);
+			}
+
+			unsigned int new_values[RACEWAY_CAP_ILP];
+			for (int j = 0; j < RACEWAY_CAP_ILP; j++)
+			{
+				const unsigned int val = working_code[j * 32 + int_index];
+				const unsigned char aid = algorithm_id[j];
+				unsigned int temp = val;
+				if (alive_local[j] == 0u) { new_values[j] = temp; continue; }
+
+				// Pure-LDS serving: the staged set is a complete structural superset
+				// (slot < STAGE_ROWS always), so there is no global fallback in the hot
+				// loop — every RNG read is an LDS read; alg0/alg6 derived on the fly.
+				const unsigned int slot = lds_slot_index(rng_offset[j]);
+				if (aid == 0u)
+				{
+					const unsigned int reg = staged_regular[slot * 32u + int_index];
+					temp = ((val << 1) & 0xFEFEFEFEu) | ((reg >> 7) & 0x01010101u);
+					rng_offset[j] += 128u;
+				}
+				else if (aid == 1u)
+				{
+					const unsigned int r = staged_regular[slot * 32u + int_index];
+					temp = ((val & 0x00FF00FFu) + (r & 0x00FF00FFu)) & 0x00FF00FFu;
+					temp |= ((val & 0xFF00FF00u) + (r & 0xFF00FF00u)) & 0xFF00FF00u;
+					rng_offset[j] += 128u;
+				}
+				else if (aid == 3u)
+				{
+					const unsigned int r = staged_regular[slot * 32u + int_index];
+					temp = val ^ r;
+					rng_offset[j] += 128u;
+				}
+				else if (aid == 4u)
+				{
+					const unsigned int r = staged_regular[slot * 32u + int_index];
+					temp = ((val & 0x00FF00FFu) + ((r & 0x00FF00FFu) ^ 0x00FF00FFu) + 0x00010001u) & 0x00FF00FFu;
+					temp |= ((val & 0xFF00FF00u) + ((r & 0xFF00FF00u) ^ 0xFF00FF00u) + 0x01000100u) & 0xFF00FF00u;
+					rng_offset[j] += 128u;
+				}
+				else if (aid == 6u)
+				{
+					// alg6 row is position-reversed: derive from the mirror lane's word.
+					const unsigned int regm = staged_regular[slot * 32u + (31u - int_index)];
+					temp = ((val >> 1) & 0x7F7F7F7Fu) | (lds_bswap32(regm) & 0x80808080u);
+					rng_offset[j] += 128u;
+				}
+				else if (aid == 7u)
+				{
+					temp = val ^ 0xFFFFFFFFu;
+				}
+				else if (aid == 2u)
+				{
+					unsigned int t = (val & 0x00010000u) >> 8;
+					if (int_index == 31u) t |= offset_alg2[sched * 2048u + rng_offset[j]];
+					else { const unsigned int nlv = working_code[j * 32 + int_index + 1u]; t |= ((nlv & 0x00000001u) << 24); }
+					t |= (val >> 1) & 0x007F007Fu; t |= (val << 1) & 0xFE00FE00u; t |= (val >> 8) & 0x00800080u;
+					temp = t; rng_offset[j] += 1u;
+				}
+				else
+				{
+					unsigned int t = (val & 0x00800000u) >> 8;
+					if (int_index == 31u) t |= offset_alg5[sched * 2048u + rng_offset[j]];
+					else { const unsigned int nlv = working_code[j * 32 + int_index + 1u]; t |= ((nlv & 0x00000080u) << 24); }
+					t |= (val >> 1) & 0x7F007F00u; t |= (val << 1) & 0x00FE00FEu; t |= (val >> 8) & 0x00010001u;
+					temp = t; rng_offset[j] += 1u;
+				}
+				new_values[j] = temp;
+			}
+			barrier(CLK_LOCAL_MEM_FENCE);
+			for (int j = 0; j < RACEWAY_CAP_ILP; j++) working_code[j * 32 + int_index] = new_values[j];
+			barrier(CLK_LOCAL_MEM_FENCE);
+			nibble_selector = (unsigned short)(nibble_selector << 1);
+		}
+	}
+#elif defined(RACEWAY_SUBGROUP)
+	// --- AMD LDS-relief variant -------------------------------------------------
+	// Per-lane state lives in registers (st[]); cross-lane data moves via
+	// sub_group_broadcast (uniform alg-id source_lane). Only alg2/alg5 need the
+	// +1 neighbour byte, handled by a minimal LDS exchange. Lane-local algorithm
+	// steps touch neither LDS nor a barrier — that is the whole win. Requires the
+	// work-group to be exactly one subgroup (local size {32,1,1}); int_index is
+	// the subgroup local id.
+	unsigned int st[RACEWAY_CAP_ILP];
+	for (int j = 0; j < RACEWAY_CAP_ILP; j++) st[j] = working_code[j * 32 + int_index];
+
+	for (unsigned int sched = start_map; sched <= end_map && sched < 27u; sched++)
+	{
+		unsigned int rng_offset[RACEWAY_CAP_ILP];
+		for (int j = 0; j < RACEWAY_CAP_ILP; j++) rng_offset[j] = 0u;
+
+		const unsigned int packed_sched_b2 = (unsigned int)schedule_data[sched * 4 + 2];
+		const unsigned int packed_sched_b3 = (unsigned int)schedule_data[sched * 4 + 3];
+		unsigned short nibble_selector = (unsigned short)((packed_sched_b2 << 8) | packed_sched_b3);
+
+		for (int i = 0; i < 16; i++)
+		{
+			const unsigned int source_lane = (unsigned int)(i >> 2);
+			const unsigned int algorithm_shift = (unsigned int)((i & 3) * 8) + 1u + (((unsigned int)nibble_selector >> 13u) & 4u);
+
+			// Alg id is read from one (uniform) source_lane for every lane -> broadcast.
+			unsigned char algorithm_id[RACEWAY_CAP_ILP];
+			int need_lds = 0;
+			for (int j = 0; j < RACEWAY_CAP_ILP; j++)
+			{
+				const unsigned int source_word = sub_group_broadcast(st[j], source_lane);
+				const unsigned char aid = (unsigned char)((source_word >> algorithm_shift) & 0x07u);
+				algorithm_id[j] = aid;
+				if (alive_local[j] != 0u && (aid == 2u || aid == 5u)) need_lds = 1;
+			}
+
+			// need_lds is uniform across the wave, so these barriers stay convergent.
+			if (need_lds)
+			{
+				barrier(CLK_LOCAL_MEM_FENCE);
+				for (int j = 0; j < RACEWAY_CAP_ILP; j++) working_code[j * 32 + int_index] = st[j];
+				barrier(CLK_LOCAL_MEM_FENCE);
+			}
+
+			for (int j = 0; j < RACEWAY_CAP_ILP; j++)
+			{
+				if (alive_local[j] == 0u) continue;
+				const unsigned int val = st[j];
+				const unsigned char aid = algorithm_id[j];
+				unsigned int temp = val;
+				if (aid == 0u)
+				{
+					temp = ((val << 1) & 0xFEFEFEFEu) | *(__global unsigned int*)(offset_alg0 + ((sched * 2048u + rng_offset[j]) * 128u + int_index * 4u));
+					rng_offset[j] += 128u;
+				}
+				else if (aid == 1u)
+				{
+					const unsigned int r = *(__global unsigned int*)(offset_regular + ((sched * 2048u + rng_offset[j]) * 128u + int_index * 4u));
+					temp = ((val & 0x00FF00FFu) + (r & 0x00FF00FFu)) & 0x00FF00FFu;
+					temp |= ((val & 0xFF00FF00u) + (r & 0xFF00FF00u)) & 0xFF00FF00u;
+					rng_offset[j] += 128u;
+				}
+				else if (aid == 3u)
+				{
+					temp = val ^ *(__global unsigned int*)(offset_regular + ((sched * 2048u + rng_offset[j]) * 128u + int_index * 4u));
+					rng_offset[j] += 128u;
+				}
+				else if (aid == 4u)
+				{
+					const unsigned int r = *(__global unsigned int*)(offset_regular + ((sched * 2048u + rng_offset[j]) * 128u + int_index * 4u));
+					temp = ((val & 0x00FF00FFu) + ((r & 0x00FF00FFu) ^ 0x00FF00FFu) + 0x00010001u) & 0x00FF00FFu;
+					temp |= ((val & 0xFF00FF00u) + ((r & 0xFF00FF00u) ^ 0xFF00FF00u) + 0x01000100u) & 0xFF00FF00u;
+					rng_offset[j] += 128u;
+				}
+				else if (aid == 6u)
+				{
+					temp = ((val >> 1) & 0x7F7F7F7Fu) | *(__global unsigned int*)(offset_alg6 + ((sched * 2048u + rng_offset[j]) * 128u + int_index * 4u));
+					rng_offset[j] += 128u;
+				}
+				else if (aid == 7u)
+				{
+					temp = val ^ 0xFFFFFFFFu;
+				}
+				else if (aid == 2u)
+				{
+					unsigned int t = (val & 0x00010000u) >> 8;
+					if (int_index == 31u) t |= offset_alg2[sched * 2048u + rng_offset[j]];
+					else { const unsigned int nlv = working_code[j * 32 + int_index + 1u]; t |= ((nlv & 0x00000001u) << 24); }
+					t |= (val >> 1) & 0x007F007Fu; t |= (val << 1) & 0xFE00FE00u; t |= (val >> 8) & 0x00800080u;
+					temp = t; rng_offset[j] += 1u;
+				}
+				else
+				{
+					unsigned int t = (val & 0x00800000u) >> 8;
+					if (int_index == 31u) t |= offset_alg5[sched * 2048u + rng_offset[j]];
+					else { const unsigned int nlv = working_code[j * 32 + int_index + 1u]; t |= ((nlv & 0x00000080u) << 24); }
+					t |= (val >> 1) & 0x7F007F00u; t |= (val << 1) & 0x00FE00FEu; t |= (val >> 8) & 0x00010001u;
+					temp = t; rng_offset[j] += 1u;
+				}
+				st[j] = temp;
+			}
+			nibble_selector = (unsigned short)(nibble_selector << 1);
+		}
+	}
+
+	// Publish final register state so the caller's fingerprint / state-save reads it.
+	barrier(CLK_LOCAL_MEM_FENCE);
+	for (int j = 0; j < RACEWAY_CAP_ILP; j++) working_code[j * 32 + int_index] = st[j];
+	barrier(CLK_LOCAL_MEM_FENCE);
+#else
+	for (unsigned int sched = start_map; sched <= end_map && sched < 27u; sched++)
+	{
+		unsigned int rng_offset[RACEWAY_CAP_ILP];
+		for (int j = 0; j < RACEWAY_CAP_ILP; j++) rng_offset[j] = 0u;
+
+		const unsigned int packed_sched_b2 = (unsigned int)schedule_data[sched * 4 + 2];
+		const unsigned int packed_sched_b3 = (unsigned int)schedule_data[sched * 4 + 3];
+		unsigned short nibble_selector = (unsigned short)((packed_sched_b2 << 8) | packed_sched_b3);
+
+		for (int i = 0; i < 16; i++)
+		{
+			const unsigned int source_lane = (unsigned int)(i >> 2);
+			const unsigned int algorithm_shift = (unsigned int)((i & 3) * 8) + 1u + (((unsigned int)nibble_selector >> 13u) & 4u);
+
+			unsigned char algorithm_id[RACEWAY_CAP_ILP];
+			for (int j = 0; j < RACEWAY_CAP_ILP; j++)
+			{
+				const unsigned int source_word = working_code[j * 32 + source_lane];
+				algorithm_id[j] = (unsigned char)((source_word >> algorithm_shift) & 0x07u);
+			}
+
+			unsigned int new_values[RACEWAY_CAP_ILP];
+			for (int j = 0; j < RACEWAY_CAP_ILP; j++)
+			{
+				const unsigned int val = working_code[j * 32 + int_index];
+				const unsigned char aid = algorithm_id[j];
+				unsigned int temp = val;
+				if (alive_local[j] == 0u)
+				{
+					new_values[j] = temp;
+					continue;
+				}
+				if (aid == 0u)
+				{
+					temp = ((val << 1) & 0xFEFEFEFEu) | *(__global unsigned int*)(offset_alg0 + ((sched * 2048u + rng_offset[j]) * 128u + int_index * 4u));
+					rng_offset[j] += 128u;
+				}
+				else if (aid == 1u)
+				{
+					const unsigned int r = *(__global unsigned int*)(offset_regular + ((sched * 2048u + rng_offset[j]) * 128u + int_index * 4u));
+					temp = ((val & 0x00FF00FFu) + (r & 0x00FF00FFu)) & 0x00FF00FFu;
+					temp |= ((val & 0xFF00FF00u) + (r & 0xFF00FF00u)) & 0xFF00FF00u;
+					rng_offset[j] += 128u;
+				}
+				else if (aid == 3u)
+				{
+					temp = val ^ *(__global unsigned int*)(offset_regular + ((sched * 2048u + rng_offset[j]) * 128u + int_index * 4u));
+					rng_offset[j] += 128u;
+				}
+				else if (aid == 4u)
+				{
+					const unsigned int r = *(__global unsigned int*)(offset_regular + ((sched * 2048u + rng_offset[j]) * 128u + int_index * 4u));
+					temp = ((val & 0x00FF00FFu) + ((r & 0x00FF00FFu) ^ 0x00FF00FFu) + 0x00010001u) & 0x00FF00FFu;
+					temp |= ((val & 0xFF00FF00u) + ((r & 0xFF00FF00u) ^ 0xFF00FF00u) + 0x01000100u) & 0xFF00FF00u;
+					rng_offset[j] += 128u;
+				}
+				else if (aid == 6u)
+				{
+					temp = ((val >> 1) & 0x7F7F7F7Fu) | *(__global unsigned int*)(offset_alg6 + ((sched * 2048u + rng_offset[j]) * 128u + int_index * 4u));
+					rng_offset[j] += 128u;
+				}
+				else if (aid == 7u)
+				{
+					temp = val ^ 0xFFFFFFFFu;
+				}
+				else if (aid == 2u)
+				{
+					unsigned int t = (val & 0x00010000u) >> 8;
+					if (int_index == 31u) t |= offset_alg2[sched * 2048u + rng_offset[j]];
+					else { const unsigned int nlv = working_code[j * 32 + int_index + 1u]; t |= ((nlv & 0x00000001u) << 24); }
+					t |= (val >> 1) & 0x007F007Fu; t |= (val << 1) & 0xFE00FE00u; t |= (val >> 8) & 0x00800080u;
+					temp = t; rng_offset[j] += 1u;
+				}
+				else
+				{
+					unsigned int t = (val & 0x00800000u) >> 8;
+					if (int_index == 31u) t |= offset_alg5[sched * 2048u + rng_offset[j]];
+					else { const unsigned int nlv = working_code[j * 32 + int_index + 1u]; t |= ((nlv & 0x00000080u) << 24); }
+					t |= (val >> 1) & 0x7F007F00u; t |= (val << 1) & 0x00FE00FEu; t |= (val >> 8) & 0x00010001u;
+					temp = t; rng_offset[j] += 1u;
+				}
+				new_values[j] = temp;
+			}
+			barrier(CLK_LOCAL_MEM_FENCE);
+			for (int j = 0; j < RACEWAY_CAP_ILP; j++) working_code[j * 32 + int_index] = new_values[j];
+			barrier(CLK_LOCAL_MEM_FENCE);
+			nibble_selector = (unsigned short)(nibble_selector << 1);
+		}
+	}
+#endif
+}
+
+__kernel void raceway_boundary_cap_state_offset(
+	__global unsigned char* alive_out,
+	__global unsigned char* drop_map_out,
+	__global unsigned int* state,
+	volatile __global raceway_cap_word_t* cap_table,
+	unsigned int cap_bits,
+	unsigned int cap_ways,
+	unsigned int cap_index,
+	__global unsigned char* offset_regular,
+	__global unsigned char* offset_alg0,
+	__global unsigned char* offset_alg6,
+	__global unsigned int* offset_alg2,
+	__global unsigned int* offset_alg5,
+	__global unsigned char* expansion_values,
+	__global unsigned char* schedule_data,
+	unsigned int key,
+	unsigned int data_start,
+	unsigned int candidate_count,
+	unsigned int end_map)
+{
+	__local unsigned int working_code[32 * RACEWAY_CAP_ILP];
+	__local unsigned char alive_local[RACEWAY_CAP_ILP];
+#ifdef RACEWAY_LDS_RNG
+	__local unsigned int staged_regular[STAGE_ROWS * 32];
+#endif
+	const unsigned int int_index = get_local_id(0);
+	const unsigned int base = get_global_id(1) * RACEWAY_CAP_ILP;
+
+	if (int_index == 0u)
+	{
+		for (int j = 0; j < RACEWAY_CAP_ILP; j++)
+		{
+			const unsigned int c = base + (unsigned int)j;
+			alive_local[j] = (c < candidate_count) ? 1u : 0u;
+		}
+	}
+	barrier(CLK_LOCAL_MEM_FENCE);
+
+	for (int j = 0; j < RACEWAY_CAP_ILP; j++)
+	{
+		const unsigned int cur_data = data_start + base + (unsigned int)j;
+		working_code[j * 32 + int_index] = ((int_index & 1u) == 0u) ? pack_be_u32(key) : pack_be_u32(cur_data);
+	}
+	barrier(CLK_LOCAL_MEM_FENCE);
+
+	for (int j = 0; j < RACEWAY_CAP_ILP; j++)
+		expand(working_code + j * 32, (int)int_index, (unsigned short)(key >> 16), expansion_values);
+	barrier(CLK_LOCAL_MEM_FENCE);
+
+	raceway_run_map_range_local(working_code, alive_local, int_index, 0u, end_map,
+		offset_regular, offset_alg0, offset_alg6, offset_alg2, offset_alg5, schedule_data
+#ifdef RACEWAY_LDS_RNG
+		, staged_regular
+#endif
+		);
+
+	if (int_index == 0u)
+	{
+		const ulong cap_slots_per_table = ((cap_bits == 0u) ? 1UL : (1UL << cap_bits)) * (ulong)cap_ways;
+		volatile __global raceway_cap_word_t* cap_table_for_map = cap_table + (ulong)cap_index * cap_slots_per_table;
+		for (int j = 0; j < RACEWAY_CAP_ILP; j++)
+		{
+			const unsigned int c = base + (unsigned int)j;
+			if (c >= candidate_count) continue;
+			const raceway_cap_word_t fp = raceway_state_fingerprint(working_code + j * 32);
+			if (raceway_cap_probe_or_keep(fp, cap_table_for_map, cap_bits, cap_ways))
+			{
+				alive_local[j] = 0u;
+				if (drop_map_out != 0) drop_map_out[c] = (unsigned char)end_map;
+			}
+			alive_out[c] = alive_local[j];
+		}
+	}
+	barrier(CLK_LOCAL_MEM_FENCE);
+
+	for (int j = 0; j < RACEWAY_CAP_ILP; j++)
+	{
+		const unsigned int c = base + (unsigned int)j;
+		if (c < candidate_count && alive_local[j] != 0u)
+		{
+			state[(size_t)c * 32u + int_index] = working_code[j * 32 + int_index];
+		}
+	}
+}
+
+__kernel void raceway_span_state_liveidx_cap_offset(
+	__global unsigned int* live_idx,
+	unsigned int live_count,
+	__global unsigned int* state,
+	__global unsigned char* alive_out,
+	__global unsigned char* drop_map_out,
+	volatile __global raceway_cap_word_t* cap_table,
+	unsigned int cap_bits,
+	unsigned int cap_ways,
+	unsigned int cap_index,
+	__global unsigned char* offset_regular,
+	__global unsigned char* offset_alg0,
+	__global unsigned char* offset_alg6,
+	__global unsigned int* offset_alg2,
+	__global unsigned int* offset_alg5,
+	__global unsigned char* schedule_data,
+	unsigned int start_map,
+	unsigned int end_map)
+{
+	__local unsigned int working_code[32 * RACEWAY_CAP_ILP];
+	__local unsigned char alive_local[RACEWAY_CAP_ILP];
+	__local unsigned int orig_local[RACEWAY_CAP_ILP];
+#ifdef RACEWAY_LDS_RNG
+	__local unsigned int staged_regular[STAGE_ROWS * 32];
+#endif
+	const unsigned int int_index = get_local_id(0);
+	const unsigned int base = get_global_id(1) * RACEWAY_CAP_ILP;
+
+	if (int_index == 0u)
+	{
+		for (int j = 0; j < RACEWAY_CAP_ILP; j++)
+		{
+			const unsigned int s = base + (unsigned int)j;
+			alive_local[j] = (s < live_count) ? 1u : 0u;
+			orig_local[j] = (s < live_count) ? live_idx[s] : 0u;
+		}
+	}
+	barrier(CLK_LOCAL_MEM_FENCE);
+
+	for (int j = 0; j < RACEWAY_CAP_ILP; j++)
+		working_code[j * 32 + int_index] = state[(size_t)orig_local[j] * 32u + int_index];
+	barrier(CLK_LOCAL_MEM_FENCE);
+
+	raceway_run_map_range_local(working_code, alive_local, int_index, start_map, end_map,
+		offset_regular, offset_alg0, offset_alg6, offset_alg2, offset_alg5, schedule_data
+#ifdef RACEWAY_LDS_RNG
+		, staged_regular
+#endif
+		);
+
+	if (int_index == 0u)
+	{
+		const ulong cap_slots_per_table = ((cap_bits == 0u) ? 1UL : (1UL << cap_bits)) * (ulong)cap_ways;
+		volatile __global raceway_cap_word_t* cap_table_for_map = cap_table + (ulong)cap_index * cap_slots_per_table;
+		for (int j = 0; j < RACEWAY_CAP_ILP; j++)
+		{
+			const unsigned int s = base + (unsigned int)j;
+			if (s >= live_count) continue;
+			const raceway_cap_word_t fp = raceway_state_fingerprint(working_code + j * 32);
+			if (raceway_cap_probe_or_keep(fp, cap_table_for_map, cap_bits, cap_ways))
+			{
+				alive_local[j] = 0u;
+				if (drop_map_out != 0) drop_map_out[orig_local[j]] = (unsigned char)end_map;
+			}
+			alive_out[s] = alive_local[j];
+		}
+	}
+	barrier(CLK_LOCAL_MEM_FENCE);
+
+	for (int j = 0; j < RACEWAY_CAP_ILP; j++)
+	{
+		const unsigned int s = base + (unsigned int)j;
+		if (s < live_count && alive_local[j] != 0u)
+		{
+			state[(size_t)orig_local[j] * 32u + int_index] = working_code[j * 32 + int_index];
+		}
+	}
+}
+
+__kernel void run_span_dedup(
+	__global unsigned int*   live_idx,        // ignored when first_span != 0
+	unsigned int             M,
+	__global unsigned int*   state,           // [N*32]
+	__global unsigned char*  alive_out,       // [M]
+	__global unsigned int*   rep_global,      // [N] union-find parent (0xFFFFFFFF = root)
+	unsigned int m0, unsigned int m1, int first_span,
+	__global unsigned char*  offset_regular,
+	__global unsigned char*  offset_alg0,
+	__global unsigned char*  offset_alg6,
+	__global unsigned int*   offset_alg2,
+	__global unsigned int*   offset_alg5,
+	__global unsigned char*  expansion_values,
+	__global unsigned char*  schedule_data,
+	__global unsigned char*  carnival_data,
+	__global unsigned char*  flag_out,        // mode 2 only
+	unsigned int key, unsigned int data_start,
+	int mode)                                  // 0=writeback, 1=dedup, 2=screen+flag
+{
+	// Single-warp geometry (work-group = 32 lanes, SPAN_ILP candidates, W = SPAN_ILP).
+	// Only lane 0 does the per-span dedup inserts sequentially -> no atomics. The
+	// multi-warp (W>SPAN_ILP) variant was tested and is SLOWER on OpenCL: its
+	// work-group-wide barriers cost more than the larger dedup window saves
+	// (unlike CUDA, whose barrier-free warp shuffles made W=64 the optimum).
+	__local unsigned int  working_code[32 * SPAN_ILP];
+	__local unsigned int  decrypted_carnival[32];
+	__local unsigned int  decrypted_other[32];
+	__local unsigned int  orig_local[SPAN_ILP];
+	__local unsigned char alive_local[SPAN_ILP];
+	__local unsigned char rep_local[SPAN_ILP];
+	__local unsigned int  slot_fp[SPAN_NSLOT];
+	__local unsigned char slot_rep[SPAN_NSLOT];
+
+	const unsigned int int_index = get_local_id(0);
+	const unsigned int wg_index  = get_global_id(1);
+	const unsigned int base      = wg_index * SPAN_ILP;
+
+	if (int_index == 0u)
+	{
+		for (int j = 0; j < SPAN_ILP; j++)
+		{
+			const unsigned int s = base + (unsigned int)j;
+			const int active = (s < M);
+			orig_local[j]  = active ? (first_span ? s : live_idx[s]) : 0xFFFFFFFFu;
+			alive_local[j] = active ? 1u : 0u;
+			rep_local[j]   = (unsigned char)j;
+		}
+	}
+	barrier(CLK_LOCAL_MEM_FENCE);
+
+	for (int j = 0; j < SPAN_ILP; j++)
+	{
+		if (alive_local[j])
+		{
+			if (first_span)
+			{
+				const unsigned int cur_data = data_start + orig_local[j];
+				working_code[j * 32 + int_index] = ((int_index & 1u) == 0u) ? pack_be_u32(key) : pack_be_u32(cur_data);
+			}
+			else
+			{
+				working_code[j * 32 + int_index] = state[(size_t)orig_local[j] * 32u + int_index];
+			}
+		}
+		else
+		{
+			working_code[j * 32 + int_index] = 0u;
+		}
+	}
+	barrier(CLK_LOCAL_MEM_FENCE);
+	if (first_span)
+	{
+		for (int j = 0; j < SPAN_ILP; j++)
+			expand(working_code + j * 32, (int)int_index, (unsigned short)(key >> 16), expansion_values);
+		barrier(CLK_LOCAL_MEM_FENCE);
+	}
+
+	for (unsigned int sched = m0; sched < m1; sched++)
+	{
+		unsigned int rng_offset[SPAN_ILP];
+		for (int j = 0; j < SPAN_ILP; j++) rng_offset[j] = 0u;
+
+		const unsigned int packed_sched_b2 = (unsigned int)schedule_data[sched * 4 + 2];
+		const unsigned int packed_sched_b3 = (unsigned int)schedule_data[sched * 4 + 3];
+		unsigned short nibble_selector = (unsigned short)((packed_sched_b2 << 8) | packed_sched_b3);
+
+		for (int i = 0; i < 16; i++)
+		{
+			const unsigned int source_lane  = (unsigned int)(i >> 2);
+			const unsigned int algorithm_shift = (unsigned int)((i & 3) * 8) + 1u + (((unsigned int)nibble_selector >> 13u) & 4u);
+
+			unsigned char algorithm_id[SPAN_ILP];
+			for (int j = 0; j < SPAN_ILP; j++)
+			{
+				const unsigned int source_word = working_code[j * 32 + source_lane];
+				algorithm_id[j] = (unsigned char)((source_word >> algorithm_shift) & 0x07u);
+			}
+
+			unsigned int new_values[SPAN_ILP];
+			for (int j = 0; j < SPAN_ILP; j++)
+			{
+				const unsigned int val = working_code[j * 32 + int_index];
+				const unsigned char aid = algorithm_id[j];
+				unsigned int temp = val;
+				if (aid == 0u)
+				{
+					temp = ((val << 1) & 0xFEFEFEFEu) | *(__global unsigned int*)(offset_alg0 + ((sched * 2048u + rng_offset[j]) * 128u + int_index * 4u));
+					rng_offset[j] += 128u;
+				}
+				else if (aid == 1u)
+				{
+					const unsigned int r = *(__global unsigned int*)(offset_regular + ((sched * 2048u + rng_offset[j]) * 128u + int_index * 4u));
+					temp = ((val & 0x00FF00FFu) + (r & 0x00FF00FFu)) & 0x00FF00FFu;
+					temp |= ((val & 0xFF00FF00u) + (r & 0xFF00FF00u)) & 0xFF00FF00u;
+					rng_offset[j] += 128u;
+				}
+				else if (aid == 3u)
+				{
+					temp = val ^ *(__global unsigned int*)(offset_regular + ((sched * 2048u + rng_offset[j]) * 128u + int_index * 4u));
+					rng_offset[j] += 128u;
+				}
+				else if (aid == 4u)
+				{
+					const unsigned int r = *(__global unsigned int*)(offset_regular + ((sched * 2048u + rng_offset[j]) * 128u + int_index * 4u));
+					temp = ((val & 0x00FF00FFu) + ((r & 0x00FF00FFu) ^ 0x00FF00FFu) + 0x00010001u) & 0x00FF00FFu;
+					temp |= ((val & 0xFF00FF00u) + ((r & 0xFF00FF00u) ^ 0xFF00FF00u) + 0x01000100u) & 0xFF00FF00u;
+					rng_offset[j] += 128u;
+				}
+				else if (aid == 6u)
+				{
+					temp = ((val >> 1) & 0x7F7F7F7Fu) | *(__global unsigned int*)(offset_alg6 + ((sched * 2048u + rng_offset[j]) * 128u + int_index * 4u));
+					rng_offset[j] += 128u;
+				}
+				else if (aid == 7u)
+				{
+					temp = val ^ 0xFFFFFFFFu;
+				}
+				else if (aid == 2u)
+				{
+					unsigned int t = (val & 0x00010000u) >> 8;
+					if (int_index == 31u) t |= offset_alg2[sched * 2048u + rng_offset[j]];
+					else { const unsigned int nlv = working_code[j * 32 + int_index + 1u]; t |= ((nlv & 0x00000001u) << 24); }
+					t |= (val >> 1) & 0x007F007Fu; t |= (val << 1) & 0xFE00FE00u; t |= (val >> 8) & 0x00800080u;
+					temp = t; rng_offset[j] += 1u;
+				}
+				else /* aid == 5 */
+				{
+					unsigned int t = (val & 0x00800000u) >> 8;
+					if (int_index == 31u) t |= offset_alg5[sched * 2048u + rng_offset[j]];
+					else { const unsigned int nlv = working_code[j * 32 + int_index + 1u]; t |= ((nlv & 0x00000080u) << 24); }
+					t |= (val >> 1) & 0x7F007F00u; t |= (val << 1) & 0x00FE00FEu; t |= (val >> 8) & 0x00010001u;
+					temp = t; rng_offset[j] += 1u;
+				}
+				new_values[j] = temp;
+			}
+			barrier(CLK_LOCAL_MEM_FENCE);
+			for (int j = 0; j < SPAN_ILP; j++) working_code[j * 32 + int_index] = new_values[j];
+			barrier(CLK_LOCAL_MEM_FENCE);
+			nibble_selector = (unsigned short)(nibble_selector << 1);
+		}
+	}
+
+	if (mode == 1)
+	{
+		if (int_index == 0u)
+		{
+			for (int sIdx = 0; sIdx < SPAN_NSLOT; sIdx++) slot_fp[sIdx] = 0u;
+			for (int j = 0; j < SPAN_ILP; j++)
+			{
+				if (!alive_local[j]) continue;
+				const unsigned int fp = span_fingerprint(working_code + j * 32);
+				unsigned int idx = (fp >> 8) & (SPAN_NSLOT - 1u);
+				for (int probe = 0; probe < SPAN_NSLOT; probe++)
+				{
+					if (slot_fp[idx] == 0u) { slot_fp[idx] = fp; slot_rep[idx] = (unsigned char)j; break; }
+					if (slot_fp[idx] == fp) { rep_local[j] = slot_rep[idx]; alive_local[j] = 0u; break; }
+					idx = (idx + 1u) & (SPAN_NSLOT - 1u);
+				}
+			}
+		}
+		barrier(CLK_LOCAL_MEM_FENCE);
+	}
+
+	if (mode == 2)
+	{
+		for (int j = 0; j < SPAN_ILP; j++)
+		{
+			decrypted_carnival[int_index] = working_code[j * 32 + int_index] ^ ((__global unsigned int*)carnival_data)[int_index];
+			((__local unsigned char*)decrypted_other)[int_index * 4 + 0] = ((__local unsigned char*)(working_code + j * 32))[int_index * 4 + 0] ^ other_world_data_k[int_index * 4 + 0];
+			((__local unsigned char*)decrypted_other)[int_index * 4 + 1] = ((__local unsigned char*)(working_code + j * 32))[int_index * 4 + 1] ^ other_world_data_k[int_index * 4 + 1];
+			((__local unsigned char*)decrypted_other)[int_index * 4 + 2] = ((__local unsigned char*)(working_code + j * 32))[int_index * 4 + 2] ^ other_world_data_k[int_index * 4 + 2];
+			((__local unsigned char*)decrypted_other)[int_index * 4 + 3] = ((__local unsigned char*)(working_code + j * 32))[int_index * 4 + 3] ^ other_world_data_k[int_index * 4 + 3];
+			barrier(CLK_LOCAL_MEM_FENCE);
+			if (int_index == 0u && (base + (unsigned int)j) < M)
+			{
+				unsigned char f = 0;
+				if (checksum_ok(decrypted_carnival, 0x72)) f = CHECKSUM_SENTINEL;
+				else if (checksum_ok(decrypted_other, 0x53)) f = CHECKSUM_SENTINEL | OTHER_WORLD;
+				flag_out[orig_local[j]] = f;
+			}
+			barrier(CLK_LOCAL_MEM_FENCE);
+		}
+		return;
+	}
+
+	for (int j = 0; j < SPAN_ILP; j++)
+	{
+		const unsigned int s = base + (unsigned int)j;
+		if (s >= M) continue;
+		if (alive_local[j])
+		{
+			state[(size_t)orig_local[j] * 32u + int_index] = working_code[j * 32 + int_index];
+			if (int_index == 0u) alive_out[s] = 1u;
+		}
+		else if (int_index == 0u)
+		{
+			unsigned int cur = (unsigned int)j;
+			// Union-find path compression: the chain reaches a root in ~1-2 hops at
+			// runtime, so do NOT fully unroll the SPAN_ILP-bounded walk — that only
+			// bloats the kernel (the unrolled tail is branched over). Re-roll it.
+			#pragma unroll 1
+			for (int hop = 0; hop < SPAN_ILP; hop++) { unsigned int r = rep_local[cur]; if (r == cur || r >= SPAN_ILP) break; cur = r; }
+			rep_global[orig_local[j]] = orig_local[cur];
+			alive_out[s] = 0u;
+		}
+	}
+}
 
 
 
+// Block-stable ordered compaction: local prefix scan + one global atomic_add per
+// work-group for the base offset, ordered writes. 1-D launch.
+__kernel void compact_survivors_ordered(
+	__global unsigned char*  alive_in,
+	__global unsigned int*   live_idx_in,
+	unsigned int             M,
+	__global unsigned int*   out_live,
+	__global unsigned int*   counter,
+	int first_span)
+{
+	__local unsigned int s_scan[256];
+	__local unsigned int s_base;
+	const unsigned int gid = get_global_id(0);
+	const unsigned int lid = get_local_id(0);
+	const unsigned int lsz = get_local_size(0);
+	const unsigned int a = (gid < M && alive_in[gid] != 0u) ? 1u : 0u;
+	s_scan[lid] = a;
+	barrier(CLK_LOCAL_MEM_FENCE);
+	for (unsigned int off = 1u; off < lsz; off <<= 1)
+	{
+		unsigned int v = (lid >= off) ? s_scan[lid - off] : 0u;
+		barrier(CLK_LOCAL_MEM_FENCE);
+		s_scan[lid] += v;
+		barrier(CLK_LOCAL_MEM_FENCE);
+	}
+	if (lid == lsz - 1u) s_base = atomic_add(counter, s_scan[lid]);
+	barrier(CLK_LOCAL_MEM_FENCE);
+	if (a)
+	{
+		const unsigned int pos = s_base + s_scan[lid] - 1u;
+		out_live[pos] = first_span ? gid : live_idx_in[gid];
+	}
+}
 
-
-
+// Resolve every candidate's flag via the union-find chain (0xFFFFFFFF = root).
+__kernel void resolve_flags(
+	__global unsigned int*  rep_global,
+	__global unsigned char* flag,
+	__global unsigned char* result,
+	unsigned int N)
+{
+	const unsigned int c = get_global_id(0);
+	if (c >= N) return;
+	unsigned int root = c;
+	// Same union-find walk as run_span_dedup: a root resolves in ~1-2 hops, so the
+	// 64-bound loop should stay rolled rather than unrolling 64× of dead tail.
+	#pragma unroll 1
+	for (unsigned int hop = 0u; hop < 64u; hop++) { unsigned int r = rep_global[root]; if (r == 0xFFFFFFFFu) break; root = r; }
+	result[c] = flag[root];
+}

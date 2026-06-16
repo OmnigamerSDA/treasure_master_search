@@ -11,6 +11,17 @@ Master forward-search release. CUDA is faster on NVIDIA hardware, but this
 OpenCL build remains useful for **AMD GPUs, Intel GPUs, Apple Silicon, and
 any non-NVIDIA accelerator**.
 
+## Production engine: the bounded-wave raceway
+
+The **production forward engine (2026-06-16) is the bounded-wave raceway** — best
+across **both throughput and memory**, the default for any system. This OpenCL
+port runs at ~70% of the CUDA raceway and is the recommended path for non-NVIDIA
+devices. Run it via `--raceway-direct-offset` (with `--raceway-cap-bits/-ways`,
+`--raceway-direct-wave-span-ilp`, `--raceway-cap-boundaries`). Per-launch work is
+**watchdog-safe** (scaled by compute-unit count, so small integrated GPUs do not
+trip a GPU-recovery). The flat **checksum screen** and **compaction** paths below
+are retained as **research / A-B** comparisons (the screen is the parity reference).
+
 ## What the code does
 
 For each candidate `(key, data)`:
@@ -40,16 +51,22 @@ Algorithms 0, 1, 3, 4, 6, 7 are byte-parallel. Algorithms 2 and 5 (rotate
 left / rotate right by 1) need cross-lane carries — the last lane reads
 a precomputed carry from `alg2_values` / `alg5_values`.
 
-## Performance
+## Performance (research / A-B paths)
 
-Two screen kernels are available:
+Besides the production raceway above, three screen/compaction paths are available
+for comparison and as the bit-exact parity reference:
 
-* **Baseline** (default): universal RNG tables, 1 candidate per work-group.
+* **Baseline** (default fallback): universal RNG tables, 1 candidate per work-group.
   Stable, broadly portable. The original implementation.
 * **Offset-stream + ILP6** (`--ilp6`): per-key precomputed offset streams,
   6 candidates per work-group, all 6 algorithm-IDs precomputed before the
   alg-apply phase. **~2.3× faster on the GPUs measured.** Costs ~22 MB of
   extra device memory per key.
+* **On-GPU VRAM compaction** (`--compaction`, or auto-selected after `--calibrate`):
+  `run_span_dedup` + `compact_survivors_ordered` + `resolve_flags`. Keeps survivors
+  in device memory between spans and shrinks the effective work-group grid, recovering
+  idle occupancy. **~1.4–1.8× over baseline on high-R keys.** Use `--calibrate` to
+  measure the optimal span geometry for your GPU and key mix.
 
 Measured on a clean GPU (no contention). 2^24-candidate workunit, key
 `0x2CA5B42D`:
@@ -132,12 +149,10 @@ make
 ### Build output
 
 - `tm_opencl_forward` — the host binary.
-- The kernel `src/tm.cl` is loaded at runtime from `./tm.cl` relative
-  to the working directory. Either run the binary from the repo root
-  or copy `tm.cl` to wherever you run it from:
-  ```sh
-  cp src/tm.cl ./tm.cl
-  ```
+- The kernel `src/tm.cl` is loaded at runtime. The binary searches `./tm.cl`
+  then `src/tm.cl` relative to the working directory, so running it from the
+  package root works without copying anything. To run from elsewhere, either
+  `cd` into the package directory or copy `src/tm.cl` next to the binary.
 
 ## Run
 
@@ -192,7 +207,17 @@ Fast kernel (offset-stream + ILP6, ~2.3× faster):
                     --warmup_batches 1 --ilp6
 ```
 
-### 4. Larger sweep, closer to steady-state
+### 4. Calibrate compaction geometry for your GPU (recommended once per machine)
+
+```sh
+./tm_opencl_forward --platform 0 --device 0 --calibrate
+```
+
+Sweeps the pre-compiled span geometries and writes the winner to
+`tm_compaction.conf`, keyed by device fingerprint. Subsequent runs load this
+config and auto-select `--compaction` when it outperforms the screen path.
+
+### 5. Larger sweep, closer to steady-state
 
 ```sh
 ./tm_opencl_forward --platform 0 --device 0 \
@@ -201,7 +226,7 @@ Fast kernel (offset-stream + ILP6, ~2.3× faster):
                     --warmup_batches 1 --ilp6
 ```
 
-### 5. Parity check (verify the two kernels agree)
+### 6. Parity check (verify the two kernels agree)
 
 ```sh
 ./tm_opencl_forward --platform 0 --device 0 \
@@ -225,6 +250,10 @@ Expect: `PASS - all 16777216 flag bytes match` and a `speedup` value
 | `--output_csv <path>` | Optional CSV output of survivors                           |
 | `--ilp6`            | Use the offset-stream + ILP6 screen kernel (~2.3× faster).   |
 |                     | Uses ~22 MB extra device memory per key.                     |
+| `--compaction`      | Use the on-GPU VRAM compaction path (auto-selected after      |
+|                     | `--calibrate` if it wins on your device).                    |
+| `--calibrate`       | Sweep span geometries, measure vs screen, write              |
+|                     | `tm_compaction.conf`. Exits after calibration.               |
 | `--parity <count>`  | Run both screen kernels over `<count>` candidates, compare   |
 |                     | every flag byte, and report speedup + PASS/FAIL. Exits.      |
 
@@ -232,8 +261,11 @@ Expect: `PASS - all 16777216 flag bytes match` and a `speedup` value
 
 ```
 src/
-  main.cpp           OpenCL host: device init, kernel build, dispatch
-  tm.cl              OpenCL kernels (all of them)
+  main.cpp           OpenCL host: device init, kernel build, calibration,
+                     compaction pipeline, dispatch
+  tm.cl              OpenCL kernels: screen, ILP6, HLL, dump, materialize,
+                     and on-GPU compaction (run_span_dedup,
+                     compact_survivors_ordered, resolve_flags)
   key_schedule.{cpp,h}  Forward key-schedule generator (C-style)
   rng.{cpp,h}        PRNG functions — produces RNG tables for the kernel
   data_sizes.h       Compile-time size constants
