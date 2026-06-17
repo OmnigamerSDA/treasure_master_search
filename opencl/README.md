@@ -15,8 +15,8 @@ any non-NVIDIA accelerator**.
 
 The **production forward engine (2026-06-16) is the bounded-wave raceway** — best
 across **both throughput and memory**, the default for any system. This OpenCL
-port runs at ~70% of the CUDA raceway and is the recommended path for non-NVIDIA
-devices. Run it via `--raceway-direct-offset` (with `--raceway-cap-bits/-ways`,
+port reaches ~70% of CUDA on the same NVIDIA hardware and is the recommended
+portable path for non-NVIDIA devices. Run it via `--raceway-direct-offset` (with `--raceway-cap-bits/-ways`,
 `--raceway-direct-wave-span-ilp`, `--raceway-cap-boundaries`). Per-launch work is
 **watchdog-safe** (scaled by compute-unit count, so small integrated GPUs do not
 trip a GPU-recovery). The flat **checksum screen** and **compaction** paths below
@@ -29,23 +29,24 @@ For each candidate `(key, data)`:
 1. Run the **key schedule** on the host to derive 27 per-step RNG seeds
    and algorithm selectors.
 2. Upload all RNG tables to device memory.
-3. Run the kernel: 27 sequential algorithm steps (alg 0–7) over the 32-
-   byte working state, with cross-lane carries for the rotate variants.
-4. Run the **checksum-screen kernel** to filter survivors.
+3. Run the forward maps: 27 sequential algorithm steps (alg 0–7) over the
+   32-byte working state, with cross-lane carries for the rotate variants.
+4. **Production raceway:** drain the frontier through per-boundary fingerprint
+   caps (FN-safe dedup), screening survivors at the end. (Research baseline:
+   the flat checksum-screen kernel tests every candidate instead.)
 5. Optionally run `tm_materialize_survivors` to extract candidates.
 
 ## Kernels in `src/tm.cl`
 
 | Kernel                      | What it does                                  |
 |-----------------------------|-----------------------------------------------|
-| `tm_process`                | Single-step algorithm dispatch (alg 0..7)     |
-| `test_expand`               | IV expansion (8 B → 128 B via RNG accumulation) |
-| `test_alg`                  | Standalone algorithm test harness             |
-| `full_process`              | End-to-end (expand + schedule + alg loop)     |
-| `tm_stats`                  | Machine-flag stats accumulator                |
-| `tm_checksum_screen`        | Baseline checksum-only screen (1 candidate / work-group) |
-| `tm_checksum_screen_offset_ilp6` | Fast screen: offset-stream + ILP6 + preids (~2.3× faster) |
-| `tm_materialize_survivors`       | Emit survivor records to host buffer        |
+| **`raceway_boundary_cap_state_offset`** | **PRODUCTION** cap-span originate (carries boundary state) |
+| **`raceway_span_state_liveidx_cap_offset`** | **PRODUCTION** per-boundary cap-drain span |
+| **`raceway_boundary_cap_mark_offset`** | **PRODUCTION** direct offset-stream cap mark pass |
+| `tm_checksum_screen_offset_ilp6` | research: offset-stream + ILP6 flat screen (parity reference) |
+| `tm_checksum_screen`        | research: baseline checksum-only screen        |
+| `tm_materialize_survivors`  | Emit survivor records to host buffer          |
+| `tm_stats` / `tm_process` / `test_expand` / `test_alg` / `full_process` | dev/test harness helpers |
 
 Algorithms 0, 1, 3, 4, 6, 7 are byte-parallel. Algorithms 2 and 5 (rotate
 left / rotate right by 1) need cross-lane carries — the last lane reads
@@ -53,12 +54,25 @@ a precomputed carry from `alg2_values` / `alg5_values`.
 
 ## Raceway performance (production)
 
-The OpenCL raceway runs at **~70% of the CUDA raceway** on equivalent NVIDIA
-hardware, and is the recommended path for non-NVIDIA GPUs. It is FN-safe with
-flat memory (set by the cap, not the window), and per-launch work is scaled by
-compute-unit count so small integrated GPUs do not trip a GPU-recovery watchdog.
-For a bit-exact dedup count use the research screen/compaction paths below (the
-raceway never misses a hit).
+FN-safe, flat memory (set by the cap, not the window). Per-launch work is scaled
+by compute-unit count so small integrated GPUs do not trip a GPU-recovery watchdog.
+Regime-dependent: collapse keys are fast, the diffuse keys are the long pole.
+
+| Device | Raceway throughput (W16M, cadence 2,5,10,16) |
+|---|---:|
+| NVIDIA (same GPU) | ~70% of the CUDA raceway |
+| AMD RX 7800 XT (RDNA3, 30 CU, 16 GB, fp64 cap) | 58.3 M/s cap-span HM at W16M; tuned warm runs reach 77.0 M/s mid-key at W64M and ~45 M/s on diffuse long-pole keys |
+| AMD Ryzen iGPU (gfx1036, 1 CU) | ~2.2–2.8 M/s — runs the full fp64-cap pipeline; viable as a floor / CI smoke target |
+
+Parity PASS on all of the above (`--parity`). The RX 7800 XT W16M representative
+set measured 58.3 M/s cap-span HM and 49.0 M/s full-pipeline HM; the later AMD
+wave-size sweep found the best warm operating points at ILP 8, cadence
+`2,5,10,16`, W8M for diffuse keys and larger waves for mid/collapse keys. Discard
+the first run of a fresh process before benchmarking because AMD clocks ramp from
+idle. For a bit-exact dedup count use the research screen/compaction paths below
+(the raceway never misses a hit). The AMD cap path auto-selects fp64 when
+`cl_khr_int64_base_atomics` is present, else a portable fp32 cap
+(`--raceway-cap-fp32`).
 
 ## Research baseline (screen & compaction)
 
@@ -147,9 +161,18 @@ names — verify before benchmarking.
 
 ### Production run: the bounded-wave raceway
 
-Full `2^32` single-key sweep (FN-safe; the recommended path on non-NVIDIA GPUs):
+One W16M workunit (FN-safe; the recommended path on non-NVIDIA GPUs):
 ```sh
-./tm_opencl_forward --platform 0 --device 0 --key_id 0x2CA5B42D --raceway-direct-offset
+./tm_opencl_forward --platform 0 --device 0 --key_id 0x2CA5B42D \
+    --range_start 0 --workunit_size 16777216 --raceway-direct-offset
+```
+The OpenCL host takes 32-bit `--range_start` and `--workunit_size` values. For a
+full data-axis sweep, run multiple workunits:
+```sh
+for start in $(seq 0 16777216 4278190080); do
+  ./tm_opencl_forward --platform 0 --device 0 --key_id 0x2CA5B42D \
+      --range_start "$start" --workunit_size 16777216 --raceway-direct-offset
+done
 ```
 Tune cap/ILP with `--raceway-cap-bits/-ways`, `--raceway-direct-wave-span-ilp`,
 `--raceway-cap-boundaries`. The steps below (smoke test, screen/compaction
@@ -178,14 +201,14 @@ the raceway is FN-safe and validated against it. Research baseline runs
 | `--batch_size <N>`  | Kernel batch size (default 2^20 candidates)                  |
 | `--warmup_batches <N>` | Number of warm-up batches before timing                   |
 | `--output_csv <path>` | Optional CSV output of survivors                           |
-| `--ilp6`            | Use the offset-stream + ILP6 screen kernel (~2.3× faster).   |
-|                     | Uses ~22 MB extra device memory per key.                     |
-| `--compaction`      | Use the on-GPU VRAM compaction path (auto-selected after      |
-|                     | `--calibrate` if it wins on your device).                    |
-| `--calibrate`       | Sweep span geometries, measure vs screen, write              |
-|                     | `tm_compaction.conf`. Exits after calibration.               |
-| `--parity <count>`  | Run both screen kernels over `<count>` candidates, compare   |
-|                     | every flag byte, and report speedup + PASS/FAIL. Exits.      |
+| **`--raceway-direct-offset`** | **PRODUCTION** bounded-wave raceway (cap-span + wave compaction) |
+| `--raceway-cap-bits <B>` / `--raceway-cap-ways <W>` | raceway cap size (FN-safe over-keep)    |
+| `--raceway-direct-wave-span-ilp <N>` | cap-span phase ILP                              |
+| `--raceway-cap-boundaries <L>` | completed-map drain cadence, e.g. `2,5,10,16`         |
+| `--raceway-cap-fp32` | force the portable fp32 cap (else fp64 if int64 atomics present) |
+| `--ilp6`            | research: offset-stream + ILP6 flat screen (parity reference; +~22 MB/key) |
+| `--compaction` / `--calibrate` | research: on-GPU compaction A-B + per-device geometry sweep |
+| `--parity <count>`  | Compare screen kernels over `<count>` candidates flag-by-flag; PASS/FAIL. Exits. |
 
 ## Layout
 
@@ -205,31 +228,22 @@ README.md            This file
 
 ## Compared to the CUDA implementation
 
-The CUDA implementation reaches ~140 M cand/s on an RTX 5090 (using its
-`--screen-offsets --ilp 6` path) by exploiting NVIDIA-specific features
-that OpenCL 1.2 does not expose:
+This OpenCL port runs the same bounded-wave **raceway** architecture as CUDA. On
+the same NVIDIA GPU it reaches **~70% of the CUDA raceway**; on AMD RDNA3 (RX 7800
+XT) it is **≈0.21× a 5090's OpenCL raceway** and **≈0.14× the 5090 CUDA raceway**
+(the production ceiling). The 7800 XT trails the 5090 by ~2.85× in raw FP32/bandwidth,
+so it realizes ~60% of the per-FLOP efficiency the 5090 gets on the *same* OpenCL
+code — a ~40% portability gap.
 
-- Warp shuffles (`__shfl_sync`, `__shfl_down_sync`) for register-resident
-  inter-lane state — no need for shared memory or barriers in the inner
-  loop. The OpenCL build relies on `__local` memory + `barrier()`.
-- `__vadd4` / `__vsub4` byte-SIMD intrinsics for alg-1 / alg-4. The
-  OpenCL build emulates these with masked 16-bit arithmetic.
-- 4-warps-per-block scheduling at register pressure tuned for sm_120.
-
-The OpenCL build **does** implement the portable subset of the
-advancements:
-
-- Offset-stream RNG (`--ilp6` path): host pre-walks `rng_seed` per
-  schedule step and ships a 27 × 2048 × 128-byte stream per stream type,
-  removing the runtime `rng_forward_1 / rng_forward_128` walk.
-- ILP6: 6 candidates per work-group, sharing the 27-step schedule cost.
-- PreIDs: all 6 algorithm-IDs precomputed before the alg-apply phase.
-
-The net effect on RTX 5090 is ~86 M cand/s for the `--ilp6` OpenCL path
-vs ~37 M cand/s for the baseline — i.e. the OpenCL gap to CUDA is now
-~1.5× rather than ~3.5×. Further closing the gap would require either
-OpenCL 2.0+ subgroup extensions (where supported) or a vendor-specific
-intrinsic path. PRs welcome.
+The gap is structural to OpenCL 1.2, which lacks the NVIDIA-specific levers CUDA
+uses (warp shuffles for register-resident cross-lane state, `__vadd4`/`__vsub4`
+byte-SIMD, sm_120-tuned scheduling); the OpenCL build emulates these with `__local`
+memory + `barrier()` and masked 16-bit arithmetic. On the tested RX 7800 XT,
+subgroup/DPP-style cross-lane experiments regressed and benign-race plain cap
+stores were neutral; the measured ceiling is vector-memory-op throughput from
+divergent RNG-table reads, not LDS, atomics, or occupancy. The useful AMD tuning
+knob found so far is wave size: W8M for diffuse keys, larger waves for mid/collapse
+when VRAM allows. PRs welcome.
 
 ## License
 

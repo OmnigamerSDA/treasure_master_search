@@ -21,7 +21,7 @@ packages remain in the development repo.
 |------------------|------------------------------------------------------------------------|
 | Forward CPU      | **Bounded-wave raceway (production)** + AVX/SIMD screen baseline        |
 | Forward CUDA     | **Raceway (production)**, per-device `--calibrate-raceway`; screen baseline |
-| Forward OpenCL   | **Raceway (production)**, ~70% of CUDA on non-NVIDIA; screen baseline   |
+| Forward OpenCL   | **Raceway (production)**, portable AMD/Intel/Apple path; screen baseline |
 
 The **bounded-wave raceway** is the production engine on every backend (best
 across throughput AND memory; FN-safe). The flat checksum screen and
@@ -40,14 +40,15 @@ bit-exact parity reference.
 
 ## Measured forward rates
 
-Production raceway, full-key `2^32`, FN-safe (flat memory set by the cap):
+Production raceway, FN-safe (flat memory set by the cap):
 
 | Backend | Hardware | Raceway throughput |
 |---|---|---:|
 | CUDA   | RTX 5090 | ~310 M/s typical (population HM); ~224-261 M/s diffuse long pole |
 | CUDA   | RTX PRO 6000 Blackwell Max-Q | ~0.8x the 5090 (clock-bound) |
-| OpenCL | non-NVIDIA GPU | ~70% of the CUDA raceway |
-| CPU    | Ryzen 9 9900X, AVX-512, 24t | ~27 M/s typical HM (≈114 on collapse-heavy, ≈14 diffuse) |
+| OpenCL | NVIDIA via OpenCL | ~70% of the CUDA raceway on the same GPU |
+| OpenCL | AMD RX 7800 XT | 58.3 M/s W16M cap-span HM; tuned mid-key runs reach ~70-77 M/s |
+| CPU    | Ryzen 9 9900X, AVX-512, 24t | 27.49 M/s HM (113.79 collapse / 32.30 mid / 14.41 diffuse) |
 
 Per-device GPU tuning: `tm_cuda --calibrate-raceway` (sweeps span-ILP x cap-bits,
 auto-applied). The CPU raceway auto-selects its build/wave/cap via
@@ -71,5 +72,5 @@ See each subdirectory's Makefile.
 
 - `docs/password_conversion_algorithm.md` — codec details
 - `docs/decryption_execution_trace_reference.md` — algorithm walkthrough
-- `docs/forward_release_candidate_20260525.md` — current forward RC note
-- `docs/gpu_forward_benchmark_notes.md` — CUDA optimization log
+- `docs/forward_release_candidate_20260525.md` — historical screen/dedup RC note superseded by the raceway
+- `docs/gpu_forward_benchmark_notes.md` — historical GPU screen-benchmark notes

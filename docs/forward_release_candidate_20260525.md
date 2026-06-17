@@ -5,7 +5,7 @@
 > AND memory; FN-safe). The "production screen" / offset-stream and state-dedup paths
 > described below are now the **research / baseline + parity reference**, not the default.
 > For current status and rates see `docs/PROJECT_STATUS.md`; for operating the engines see
-> the dev-tree forward-engines operating guide. The measurements below remain valid as a
+> the CPU/CUDA/OpenCL READMEs. The measurements below remain valid as a
 > dated record of the screen/dedup work.
 
 This note captures the forward-search state after the CUDA offset-stream work

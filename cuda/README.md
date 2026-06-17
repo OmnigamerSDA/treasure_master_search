@@ -240,8 +240,8 @@ Linux: `NVreg_RestrictProfilingToAdminUsers=0` in
 ## Algorithm reference
 
 A 6502 disassembly of the unlock path and a step-by-step walkthrough of
-the algorithm are published in the consolidated repository's `wiki/` and
-`docs/` directories. This directory focuses on the CUDA implementation;
+the algorithm are published in the consolidated repository's `docs/`
+directory. This directory focuses on the CUDA implementation;
 the algorithm itself is also documented in the host `key_schedule.cpp`
 and `tm_cuda_primitives.cuh` / `tm_cuda_screen.cuh` sources.
 

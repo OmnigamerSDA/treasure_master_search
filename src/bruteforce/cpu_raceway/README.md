@@ -51,6 +51,21 @@ Linux only (peak-RSS reporting reads `/proc` + `<sys/resource.h>`).
 Useful env knobs: `RACEWAY_CAP=0|1` (cap off/on, default on), `DEEP_DISP=branched|blmerge`,
 `PRODUCER_CAP=exact|shadow|1`, `CONT=carry|recompute`, `SHARD_CHUNK=N`.
 
+## Reference performance
+
+Ryzen 9 9900X, AVX-512 natmap x10/blmerge, W16M, cap-on, K=5, best-of-3:
+
+| Threads | Pinning | Harmonic mean | Notes |
+|---:|---|---:|---|
+| 1 | one core | 2.43 M/s | baseline |
+| 8 | physical cores | 15.26 M/s | 72% efficiency vs 1T |
+| 12 | all physical cores | 21.08 M/s | full physical-core posture |
+| 24 | SMT on | 27.49 M/s | +30% over 12T |
+
+Full-SMT per-key rates on that host: collapse `113.79 M/s`, mid `32.30 M/s`,
+diffuse `14.41 M/s`. The AVX2 build measured `20.97 M/s` HM at 24 threads on the
+same host, about 76% of AVX-512 for this workload.
+
 ## Self-check (built-in parity)
 
 The cap path is exact on the final distinct count, so cap-off and cap-on must agree:
