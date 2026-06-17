@@ -51,55 +51,23 @@ Algorithms 0, 1, 3, 4, 6, 7 are byte-parallel. Algorithms 2 and 5 (rotate
 left / rotate right by 1) need cross-lane carries — the last lane reads
 a precomputed carry from `alg2_values` / `alg5_values`.
 
-## Performance (research / A-B paths)
+## Raceway performance (production)
 
-Besides the production raceway above, three screen/compaction paths are available
-for comparison and as the bit-exact parity reference:
+The OpenCL raceway runs at **~70% of the CUDA raceway** on equivalent NVIDIA
+hardware, and is the recommended path for non-NVIDIA GPUs. It is FN-safe with
+flat memory (set by the cap, not the window), and per-launch work is scaled by
+compute-unit count so small integrated GPUs do not trip a GPU-recovery watchdog.
+For a bit-exact dedup count use the research screen/compaction paths below (the
+raceway never misses a hit).
 
-* **Baseline** (default fallback): universal RNG tables, 1 candidate per work-group.
-  Stable, broadly portable. The original implementation.
-* **Offset-stream + ILP6** (`--ilp6`): per-key precomputed offset streams,
-  6 candidates per work-group, all 6 algorithm-IDs precomputed before the
-  alg-apply phase. **~2.3× faster on the GPUs measured.** Costs ~22 MB of
-  extra device memory per key.
-* **On-GPU VRAM compaction** (`--compaction`, or auto-selected after `--calibrate`):
-  `run_span_dedup` + `compact_survivors_ordered` + `resolve_flags`. Keeps survivors
-  in device memory between spans and shrinks the effective work-group grid, recovering
-  idle occupancy. **~1.4–1.8× over baseline on high-R keys.** Use `--calibrate` to
-  measure the optimal span geometry for your GPU and key mix.
+## Research baseline (screen & compaction)
 
-Measured on a clean GPU (no contention). 2^24-candidate workunit, key
-`0x2CA5B42D`:
-
-| GPU                                       | Path        | Screen rate    | Wall rate     |
-|-------------------------------------------|-------------|----------------|---------------|
-| NVIDIA RTX 5090                            | baseline    | 37.0 M cand/s  | 33.4 M cand/s |
-| NVIDIA RTX 5090                            | `--ilp6`    | **86.5 M cand/s** | **74.9 M cand/s** |
-| NVIDIA RTX PRO 6000 Blackwell Max-Q WS Ed. | baseline    | 32.6 M cand/s  | 30.5 M cand/s |
-| NVIDIA RTX PRO 6000 Blackwell Max-Q WS Ed. | `--ilp6`    | **72.2 M cand/s** | ~62 M cand/s |
-
-Survivor counts are byte-identical between the two paths (parity-verified
-across 5 keys at 2^24 candidates each). The `--ilp6` path closes most of
-the historical OpenCL-vs-CUDA gap: the CUDA implementation still wins on
-NVIDIA hardware, but the OpenCL path is now within ~1.5× rather than
-~3.5× on the RTX 5090 measurement.
-
-The 21-key ledger sweep (16 shards of 2^28 each, sequential) from the
-parent research project ran on this OpenCL path and matched later CUDA
-re-verification on the same survivor sets — i.e. the OpenCL kernel is
-slower but correct.
-
-At the measured screen-kernel rates, a full `2^32` single-key sweep is
-roughly **50 s** on RTX 5090 with `--ilp6`, **1.9 min** on RTX 5090
-baseline, and **60 s** on RTX PRO 6000 Blackwell Max-Q with `--ilp6`.
-The short-run wall-rate projections are about **57 s**, **2.1 min**, and
-**1.2 min** respectively because startup, precompute, launch, copy, and
-reporting overhead are a larger fraction of a small benchmark.
-
-To run your own benchmark, see the [Run](#run) section below.
-
-If you collect numbers worth sharing for AMD / Intel / Apple Silicon
-hardware, please open a PR adding them here.
+A flat **checksum screen** and an **on-GPU compaction** path are retained
+**purely as a stability baseline and the bit-exact parity reference** — use the
+raceway (or any dedup architecture) whenever possible; these are not the
+production engine. Deterministic, survivor-count-identical to the exact
+reference. Flags: `--ilp6` (flat offset-stream screen), `--compaction` /
+`--calibrate` (compaction A-B). Methodology: `docs/gpu_forward_benchmark_notes.md`.
 
 ## Build
 
@@ -177,64 +145,26 @@ clinfo -l
 The host's startup banner also prints the resolved platform and device
 names — verify before benchmarking.
 
-### 2. Smoke test
+### Production run: the bounded-wave raceway
 
-Confirm the kernel runs end-to-end on a 64K-candidate sweep:
+Full `2^32` single-key sweep (FN-safe; the recommended path on non-NVIDIA GPUs):
 ```sh
-./tm_opencl_forward --platform 0 --device 0 \
-                    --key_id 0x2CA5B42D --range_start 0 \
-                    --workunit_size 65536 --batch_size 65536 \
-                    --warmup_batches 0
+./tm_opencl_forward --platform 0 --device 0 --key_id 0x2CA5B42D --raceway-direct-offset
 ```
-You should see a `wall_rate` reported and survivor counts. For this
-specific small range and key, expect `checksum survivors: 0`.
+Tune cap/ILP with `--raceway-cap-bits/-ways`, `--raceway-direct-wave-span-ilp`,
+`--raceway-cap-boundaries`. The steps below (smoke test, screen/compaction
+benchmarks, `--calibrate`) drive the **research / A-B** paths — useful for
+validation and a bit-exact dedup count, not the production engine.
 
-### 3. Short throughput benchmark
-
-Baseline kernel:
-```sh
-./tm_opencl_forward --platform 0 --device 0 \
-                    --key_id 0x2CA5B42D --range_start 0 \
-                    --workunit_size 16777216 --batch_size 1048576 \
-                    --warmup_batches 1
-```
-
-Fast kernel (offset-stream + ILP6, ~2.3× faster):
-```sh
-./tm_opencl_forward --platform 0 --device 0 \
-                    --key_id 0x2CA5B42D --range_start 0 \
-                    --workunit_size 16777216 --batch_size 1048576 \
-                    --warmup_batches 1 --ilp6
-```
-
-### 4. Calibrate compaction geometry for your GPU (recommended once per machine)
+### Validation
 
 ```sh
-./tm_opencl_forward --platform 0 --device 0 --calibrate
+./tm_opencl_forward --platform 0 --device 0 --key_id 0x2CA5B42D \
+    --workunit_size 1048576 --parity 4096
 ```
-
-Sweeps the pre-compiled span geometries and writes the winner to
-`tm_compaction.conf`, keyed by device fingerprint. Subsequent runs load this
-config and auto-select `--compaction` when it outperforms the screen path.
-
-### 5. Larger sweep, closer to steady-state
-
-```sh
-./tm_opencl_forward --platform 0 --device 0 \
-                    --key_id 0x2CA5B42D --range_start 0 \
-                    --workunit_size 268435456 --batch_size 1048576 \
-                    --warmup_batches 1 --ilp6
-```
-
-### 6. Parity check (verify the two kernels agree)
-
-```sh
-./tm_opencl_forward --platform 0 --device 0 \
-                    --key_id 0x2CA5B42D --range_start 0 \
-                    --workunit_size 16777216 --parity 16777216
-```
-Expect: `PASS - all 16777216 flag bytes match` and a `speedup` value
-~2.0–2.4× depending on GPU.
+Expect `PASS - all flag bytes match`. The flat screen is the parity reference;
+the raceway is FN-safe and validated against it. Research baseline runs
+(`--ilp6`, `--compaction`, `--calibrate`) are described in the CLI table below.
 
 ### Full CLI
 
@@ -261,11 +191,11 @@ Expect: `PASS - all 16777216 flag bytes match` and a `speedup` value
 
 ```
 src/
-  main.cpp           OpenCL host: device init, kernel build, calibration,
-                     compaction pipeline, dispatch
-  tm.cl              OpenCL kernels: screen, ILP6, HLL, dump, materialize,
-                     and on-GPU compaction (run_span_dedup,
-                     compact_survivors_ordered, resolve_flags)
+  main.cpp           OpenCL host: device init, kernel build, calibration, dispatch
+  opencl_opcodes.h   6502 opcode tables + screen-flag bits (host validation)
+  opencl_validate.h  host-side machine-code validation (reverse_offset, check_machine_code)
+  tm.cl              OpenCL kernels: PRODUCTION raceway (raceway_boundary_cap_*,
+                     raceway_span_state_*) + research screen/ILP6/HLL/compaction
   key_schedule.{cpp,h}  Forward key-schedule generator (C-style)
   rng.{cpp,h}        PRNG functions — produces RNG tables for the kernel
   data_sizes.h       Compile-time size constants

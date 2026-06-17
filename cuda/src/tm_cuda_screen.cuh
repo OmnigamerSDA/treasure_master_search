@@ -7,9 +7,9 @@
 // __global__ entry points for the screening path and its diagnostic variants:
 //
 //   tm_checksum_screen_impl          — baseline ILP4 screen (byte-store)
-//   tm_checksum_screen_packed_store_impl — same, uint32-packed store (production base)
+//   tm_checksum_screen_packed_store_impl — same, uint32-packed store (screen baseline)
 //   tm_checksum_screen_offset_store_impl — offset-stream, no ILP promotion
-//   tm_checksum_screen_offset_store_ilp_impl — ILP6 offset-stream (production kernel)
+//   tm_checksum_screen_offset_store_ilp_impl — ILP6 offset-stream (fastest screen; research/parity baseline, not the production engine — that is the raceway)
 //   Experimental offset+ILP variants  — prefetch, carry-select, interleaved layouts
 //   tm_checksum_screen_maprng_impl    — map-RNG 54KB per-launch POC
 //   tm_checksum_screen_maprng_preext_impl — pre-extracted 3-stream maprng

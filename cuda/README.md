@@ -52,99 +52,31 @@ The 2^32 key space is searched by fixing a key and sweeping the data axis
 (or vice versa). The kernel is the data-sweep variant: one fixed key per
 launch, batched data values across threads.
 
-## Performance (research / A-B paths)
+## Raceway performance (production)
 
-Besides the production raceway above, three screen/compaction paths are available
-for comparison and as the bit-exact parity reference:
+Full-key `2^32`, FN-safe, flat memory (set by the cap, not the window):
 
-* **Baseline** (default fallback): universal RNG tables, ILP4. Stable, broadly portable.
-* **Offset-stream + ILP** (`--screen-offsets [--ilp 4|6|8]`): per-key
-  precomputed offset streams, configurable ILP. **~1.4× faster on
-  sm_120 Blackwell** than baseline. Costs ~22 MB of extra device memory per key.
-* **On-GPU VRAM compaction** (`--compaction`, or auto-selected after `--calibrate`):
-  `run_span_dedup` + `compact_survivors_ordered` + `resolve_flags`. Keeps survivors
-  in VRAM and shrinks subsequent grid launches, recovering idle occupancy lost to
-  within-block dedup. **~1.4–1.8× over baseline on high-R keys** (R = survivors/span).
-  Break-even at R ≈ 1.3; compaction is on-par or slightly below baseline at very low R.
-  Use `--calibrate` to measure the optimal span geometry for your GPU and key mix.
+| GPU | Raceway throughput |
+|---|---:|
+| RTX 5090 | ~310 M/s typical (population harmonic mean); ~224–261 M/s on the diffuse long pole |
+| RTX PRO 6000 Blackwell Max-Q | ~0.8× the 5090 (clock-bound) |
 
-Measured on a clean GPU (no contention). 2^24-candidate workunit, fixed
-key `0x2CA5B42D`:
+Tune once per device with `tm_cuda --calibrate-raceway` (sweeps span-ILP ×
+cap-bits, records `engine=raceway …` to `tm_compaction.conf`); production raceway
+runs auto-apply the calibrated span-ILP. The raceway never misses a hit; for a
+**bit-exact dedup count** use the research screen/compaction paths below, which
+it is validated against.
 
-| GPU                                       | Path                          | Screen rate    | Wall rate       |
-|-------------------------------------------|-------------------------------|----------------|-----------------|
-| NVIDIA RTX 5090                            | baseline                      | 102.6 M cand/s | 82.9 M cand/s  |
-| NVIDIA RTX 5090                            | `--screen-offsets --ilp 6`    | **141.2 M cand/s** | **108.2 M cand/s** |
-| NVIDIA RTX 5090                            | `--screen-offsets --ilp 4`    | 139.5 M cand/s | 105.2 M cand/s |
-| NVIDIA RTX 5090                            | `--screen-offsets --ilp 8`    | 136.6 M cand/s | 107.1 M cand/s |
-| NVIDIA RTX PRO 6000 Blackwell Max-Q WS Ed. | baseline                      | 74.8 M cand/s  | 72.8 M cand/s  |
+## Research baseline (screen & compaction)
 
-Survivor counts are byte-identical across all configurations (deterministic
-kernel). ILP6 is the empirical sweet spot on Blackwell; ILP4 and ILP8 are
-exposed for tuning on other GPU families where the optimum may shift (smaller
-register file → prefer ILP4; larger → ILP8 may win).
-
-At the measured screen-kernel rates, a full `2^32` single-key sweep on
-RTX 5090 is about **30-33 s** with `--screen-offsets --ilp 6`, or about
-**42 s** with the baseline path. The same short 2^24 benchmark reports
-wall-rate projections of about **40 s** and **52 s** respectively because
-startup, precompute, launch, copy, and reporting overhead are a larger
-fraction of a short run.
-
-Survivor count for `0x2CA5B42D` across the full 2^32:
-
-- 152,049 checksum survivors total
-- 92,538 carnival
-- 59,511 other-world
-
-### Kernel design (the wins that mattered)
-
-**Baseline kernel** (`tm_checksum_screen_cuda`):
-
-1. Removed block-wide synchronization from the hot schedule loop.
-2. Rewrote `alg2` and `alg5` to use warp shuffles instead of shared memory.
-3. Moved from 1 warp/block to **4 warps/block** (128 threads).
-4. Parallelized checksum reduction across the warp.
-5. Packed other-world and checksum-mask data into `uint32_t` `__constant__`
-   tables.
-6. Interleaved 4 candidates per warp inside the screen kernel (**ILP4**).
-   2× helped; 4× helped more; 8× regressed.
-
-**Offset-stream + ILP kernel** (`tm_checksum_screen_offset_store_ilp{4,6,8}_cuda`,
-added May 2026):
-
-7. **Per-key offset-stream RNG**: host precomputes `(regular / alg0 / alg6)`
-   byte streams and `(alg2 / alg5)` carry uint32 streams indexed by
-   `(schedule_step, rng_offset_within_step)`. The kernel does one indexed
-   read per alg call instead of walking `rng_seed` via the per-step
-   `rng_forward_1 / rng_forward_128` tables — fewer instructions per alg
-   and less dependency between successive steps.
-8. **PreIDs**: precompute all ILP candidates' `algorithm_id` from a single
-   `__shfl_sync` before dispatching the alg-apply, letting the compiler
-   hoist the LDGs as a block.
-9. **Packed flag store**: when ILP is divisible by 4, lane 0 packs the
-   flags into a `uint32_t` and writes once instead of 4 byte stores.
-10. ILP6 → I-cache sweet spot: smaller inner-loop code than ILP8 (the
-    `no_instruction` warp-issue stall drops ~34 %), avoids the
-    register-pressure hit of ILP12+.
-
-What didn't help (verified with Nsight Compute):
-
-- `__restrict__` on hot-path pointers.
-- `__constant__` for the schedule blob.
-- `__ldg()` qualifier (SASS-identical on sm_120 unified L1/RO cache).
-- `__constant__` for the alg-0/6 RNG tables (32 unique addresses/warp
-  serialize 32× through constant cache).
-- Manual software prefetch (NVCC was already overlapping LDGs across
-  ILP candidates; restructuring the loop into prefetch/apply phases
-  inflates the body too much for the unroll heuristic).
-- Forcing `#pragma unroll` on the schedule loop (5× slowdown from
-  I-cache thrash — NVCC's default heuristic is correct here; do NOT
-  add the pragma).
-- Small loop-unroll tweaks beyond the above.
-
-The remaining bottleneck is the dependent table-load chain in
-`run_alg_offset()` — see the inline notes in `src/tm_cuda_primitives.cuh`.
+A flat **checksum screen** and an **on-GPU VRAM compaction** path are retained
+**purely as a stability baseline and the bit-exact parity reference** — use the
+raceway (or any dedup architecture) whenever possible; these are not the
+production engine. They are deterministic and survivor-count-identical to the
+exact reference. Flags: `--screen-offsets [--ilp 4|6|8]` (flat screen),
+`--compaction` / `--calibrate` (compaction A-B). Implementation + tuning notes
+live in `src/tm_cuda_screen.cuh` and `src/tm_cuda_dedup.cuh`; broader methodology
+in `docs/gpu_forward_benchmark_notes.md`.
 
 ## Build
 
@@ -188,36 +120,9 @@ Output:
 
 ### Tuning for other GPUs
 
-Two launch-shape constants were hand-tuned on Blackwell hardware. On
-smaller / older GPUs the optimal point is often different (lower
-register file per SM, less occupancy headroom). Both are exposed as
-preprocessor macros:
-
-| Macro                      | Default | What it controls                          |
-|----------------------------|---------|-------------------------------------------|
-| `TM_WARPS_PER_BLOCK`       | `4`     | Warps per block (128 threads at default)  |
-| `TM_CANDIDATES_PER_WARP`   | `4`     | ILP factor inside the screen kernel       |
-
-Override at build time. The full `CXXFLAGS` value must be repeated
-because `make` overrides — not appends — when set on the command line:
-
-```sh
-# Conservative — try on older Turing / smaller Ampere
-make CXXFLAGS='-std=c++17 -O2 -m64 -DTM_WARPS_PER_BLOCK=2 -DTM_CANDIDATES_PER_WARP=2 -I$(CUDA_PATH)/include -I./src'
-
-# Or just ILP1 if 2 still regresses
-make CXXFLAGS='-std=c++17 -O2 -m64 -DTM_CANDIDATES_PER_WARP=1 -I$(CUDA_PATH)/include -I./src'
-```
-
-Empirical findings from the original tuning pass:
-- Going from 1 warp/block to 4 warps/block was a major win on Blackwell.
-- ILP1 → ILP2 was a major win.
-- ILP2 → ILP4 was a smaller but real win.
-- ILP4 → ILP8 *regressed* throughput (register pressure exceeds occupancy gain).
-
-Smaller GPUs hit that regression earlier. If your throughput numbers are
-significantly below what you'd expect from your card's memory bandwidth,
-try lowering ILP first, then warps-per-block.
+The default launch shape targets Blackwell. The research screen kernel exposes
+`-DTM_WARPS_PER_BLOCK` / `-DTM_CANDIDATES_PER_WARP` for older/smaller GPUs; the
+production raceway is tuned per device by `--calibrate-raceway` instead.
 
 ### Other arch features
 
@@ -243,67 +148,33 @@ Take the `GPU N` number for the device you want and pass it to `--device`.
 The host prints the resolved device name in its startup banner so you can
 double-check. For a single-GPU system, use `--device 0`.
 
-### 2. Parity check (recommended first run)
+### Production run: the bounded-wave raceway
 
-Verify CUDA matches the CPU reference for 64 candidates:
+One-time per device, tune the raceway geometry (sweeps span-ILP × cap-bits,
+writes `engine=raceway …` to `tm_compaction.conf`):
+```sh
+./tm_cuda --device 0 --calibrate-raceway
+```
+
+Full `2^32` single-key sweep (FN-safe; auto-applies the calibrated span-ILP;
+`auto` sizes the wave/cap to free VRAM):
+```sh
+./tm_cuda --device 0 --key_id 0x2CA5B42D \
+            --workunit_size 4294967296 --raceway-direct-wave-continue-batch auto
+```
+
+The steps below (parity, screen/compaction benchmarks, `--calibrate`) drive the
+**research / A-B** paths — useful for validation and for a bit-exact dedup count,
+but not the production engine.
+
+### Validation (parity vs the CPU reference)
+
 ```sh
 ./tm_cuda --device 0 --parity 64 --batch_size 64 --workunit_size 64 --warmup_batches 0
 ```
-Expect: `PASS — all 64 candidates match CPU (baseline kernel)`.
-
-To also verify the offset-store path agrees with the baseline:
-```sh
-./tm_cuda --device 0 --parity 4096 --batch_size 4096 --workunit_size 4096 \
-            --warmup_batches 0 --screen-offsets --ilp 6
-```
-Expect both lines: `PASS — all 4096 candidates match CPU (baseline kernel)`
-and `PASS — all 4096 flag bytes match`.
-
-### 3. Short throughput benchmark (~150 ms on a Blackwell GPU)
-
-Baseline kernel:
-```sh
-./tm_cuda --device 0 --key_id 0x2CA5B42D --range_start 0 \
-            --workunit_size 16777216 --batch_size 1048576 --warmup_batches 1
-```
-
-Fast kernel (offset-stream + ILP6, ~1.4× faster):
-```sh
-./tm_cuda --device 0 --key_id 0x2CA5B42D --range_start 0 \
-            --workunit_size 16777216 --batch_size 1048576 --warmup_batches 1 \
-            --screen-offsets --ilp 6
-```
-
-### 4. Calibrate compaction geometry for your GPU (recommended once per machine)
-
-```sh
-./tm_cuda --device 0 --calibrate
-```
-
-This sweeps the six pre-compiled span geometries (`w8i5`, `w8i6`, `w8i8`,
-`w8i10`, `w4i8`, `w8i4`) against screen throughput and writes the winner to
-`tm_compaction.conf` in the current directory, keyed by device fingerprint.
-Subsequent runs automatically load this config and use `--compaction` if the
-measured speedup exceeds the screen baseline.
-
-### 5. Full 2^32 sweep for one fixed key (~30-33 s screen time on RTX 5090)
-
-```sh
-./tm_cuda --device 0 --key_id 0x2CA5B42D --range_start 0 \
-            --workunit_size 4294967296 --batch_size 1048576 --warmup_batches 1 \
-            --screen-offsets --ilp 6
-```
-
-The `--screen-offsets` path uses ~22 MB of extra GPU memory per key (the
-precomputed offset streams). It must be re-uploaded if the key changes;
-for single-key workunits this is amortized once at startup.
-
-To use the on-GPU compaction path explicitly (after calibration, or to force it):
-```sh
-./tm_cuda --device 0 --key_id 0x2CA5B42D --range_start 0 \
-            --workunit_size 4294967296 --batch_size 1048576 --warmup_batches 1 \
-            --screen-offsets --ilp 6 --compaction
-```
+Expect `PASS`. The flat screen is the parity reference; the raceway is FN-safe
+(finds every hit) and validated against it. Research baseline runs
+(`--screen-offsets`, `--compaction`, `--calibrate`) are documented in the source.
 
 ### Note on device numbering
 
@@ -325,11 +196,13 @@ src/
   tm_cuda.cu              CUDA kernel compilation unit (thin stub — includes below)
   tm_cuda_primitives.cuh  Device helpers: __constant__ tables, run_alg, schedule
                           runners, HLL support, screen_candidate
-  tm_cuda_screen.cuh      Screen/HLL/dump/materialize kernels — baseline ILP4,
-                          offset-stream ILP4/6/8, maprng and experimental variants
-  tm_cuda_dedup.cuh       On-GPU VRAM compaction kernels: run_span_dedup,
-                          compact_survivors_ordered, resolve_flags, span-geometry
-                          variants used by --calibrate (w8i5/w8i6/w8i8/w8i10/w8i4/w4i8)
+  tm_cuda_raceway.cuh     PRODUCTION engine: bounded-wave raceway (cap-span +
+                          wave-local compaction) kernels and fixed-capacity caps
+  tm_cuda_screen.cuh      research: screen/HLL/dump/materialize kernels (also the
+                          bit-exact parity reference)
+  tm_cuda_dedup.cuh       research: on-GPU VRAM compaction kernels (run_span_dedup,
+                          compact_survivors_ordered, span geometries for --calibrate)
+  wide_merge_sort.cu      cub radix-sort / RLE host+device object (wide-merge path)
   key_schedule.{cpp,h}    Forward key-schedule generator
   rng_obj.{cpp,h}         PRNG class — produces all RNG tables fed to the kernel
   alignment2.{cpp,h}      Memory-alignment helpers

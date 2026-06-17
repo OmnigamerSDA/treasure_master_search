@@ -9,12 +9,15 @@ top-level directories.
 
 | Module                            | Purpose                                    |
 |-----------------------------------|--------------------------------------------|
-| `rng_obj.{cpp,h}`                 | Object-style PRNG wrapper                  |
+| `rng.{cpp,h}` / `rng_obj.{cpp,h}` | C-style and object-style PRNG              |
 | `key_schedule.{cpp,h}`            | Forward key schedule                       |
 | `carnival_targets.{cpp,h}`        | Hardcoded target hashes per world          |
 | `alignment2.{cpp,h}`              | Memory-alignment helpers                   |
 | `tm_base.{cpp,h}`                 | Forward algorithm reference implementation |
-| `state_dedup*.h`                  | CPU final-state deduplication helpers      |
+| `state_dedup*.h`                  | CPU final-state dedup helpers (raceway + research benches) |
+| `strong_hash.h`                   | Avalanched fingerprint for memcmp-free dedup |
+| `window_policy.h`                 | Window/tile index mapping (raceway)        |
+| `routing.h`                       | Shed-proxy routing helpers                 |
 | `key_file.h`                      | CSV/key-list parsing helper                |
 | `data_sizes.h`                    | Compile-time size constants                |
 

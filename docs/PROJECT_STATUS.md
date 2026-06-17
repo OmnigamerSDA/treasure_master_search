@@ -3,7 +3,7 @@
 > Snapshot of the public-release subset. The dev branch is more current;
 > this file is updated each public sync.
 
-**Last public sync:** release candidate refresh pending, 2026-05-25
+**Last public sync:** raceway-production refresh, 2026-06-16
 
 ## Where this sits
 
@@ -19,9 +19,14 @@ packages remain in the development repo.
 
 | Lane             | Status                                                                 |
 |------------------|------------------------------------------------------------------------|
-| Forward CPU SIMD | Full ladder, AVX2 native screen, state-dedup primitive                 |
-| Forward CUDA     | Offset-stream screen, 132M cand/s on RTX 5090                          |
-| Forward OpenCL   | Offset-stream ILP6 path; portable GPU fallback                        |
+| Forward CPU      | **Bounded-wave raceway (production)** + AVX/SIMD screen baseline        |
+| Forward CUDA     | **Raceway (production)**, per-device `--calibrate-raceway`; screen baseline |
+| Forward OpenCL   | **Raceway (production)**, ~70% of CUDA on non-NVIDIA; screen baseline   |
+
+The **bounded-wave raceway** is the production engine on every backend (best
+across throughput AND memory; FN-safe). The flat checksum screen and
+compaction/state-dedup paths are kept only as a stability baseline and the
+bit-exact parity reference.
 
 ## What stays in the dev repo
 
@@ -35,62 +40,30 @@ packages remain in the development repo.
 
 ## Measured forward rates
 
-CPU SIMD (Ryzen 9 9900X, GCC `-O3 -march=native`, key `0x2CA5B42D`,
-1M candidates; see `docs/forward_release_candidate_20260525.md`):
+Production raceway, full-key `2^32`, FN-safe (flat memory set by the cap):
 
-| Variant            | Rate (M cand/s) |
-|--------------------|-----------------:|
-| `tm_8` (scalar)    | 0.148            |
-| `tm_8` nway        | 0.191            |
-| `tm_avx_r128s_8`   | 0.304            |
-| `tm_avx_r256s_8`   | 0.260            |
-| `tm_avx2_r256s_8`  | 0.523            |
-| `tm_avx512_r512s_8`| 0.327            |
+| Backend | Hardware | Raceway throughput |
+|---|---|---:|
+| CUDA   | RTX 5090 | ~310 M/s typical (population HM); ~224-261 M/s diffuse long pole |
+| CUDA   | RTX PRO 6000 Blackwell Max-Q | ~0.8x the 5090 (clock-bound) |
+| OpenCL | non-NVIDIA GPU | ~70% of the CUDA raceway |
+| CPU    | Ryzen 9 9900X, AVX-512, 24t | ~27 M/s typical HM (≈114 on collapse-heavy, ≈14 diffuse) |
 
-`src/bruteforce/bench_cpu` also has an explicit `make pgo` target; on this
-host the PGO+hugepage AVX2 screen measured 0.556 M/s/thread on a 4M-candidate
-run.
+Per-device GPU tuning: `tm_cuda --calibrate-raceway` (sweeps span-ILP x cap-bits,
+auto-applied). The CPU raceway auto-selects its build/wave/cap via
+`src/bruteforce/cpu_raceway/raceway_autoconfig.sh`.
 
-State dedup: `src/common/state_dedup.h`, origin tracking in
-`src/common/state_dedup_origins.h`, with benchmarks under
-`src/bruteforce/state_dedup_*_bench`. Current flat/no-origin dedup can screen
-unique final states for checksum and machine-code flags, then re-run only rare
-strict-passing windows with origins to recover exact data values.
-
-The flat-dedup default merge policy is `--first-dedup-maps 1
---dedup-every-maps 4` ("f1k4") — dedup once after MAP1 to capture the ~52%
-entry-0 collapse, then merge after every 4 maps (7 merges total). This is
-the universal bathtub-bottom policy: it wins on both the r256s and map_8
-kernels and at both small (4096) and large (65536) windows from 1 to 24
-threads. Aggregate uplift over the previous K=1 default at the documented
-production shape (window=4096, threads=12-24) is **+9-14%**.
-
-The investigation behind this choice — geometric per-map collapse curve,
-per-stage threshold rule, concurrency-scaling sweep, and the i-cache
-pressure fix in `tm_avx2_r256_map_8::_run_maps_fixed` that was load-bearing
-for the f1k4 verdict — is in
-`docs/hybrid_dedup_architecture_notes_20260527.md`.
-
-CUDA offset-stream screen:
-
-| GPU                                 | Screen rate | Full-key screen time |
-|-------------------------------------|-------------|----------------------|
-| RTX 5090                            | 132.4-141.2 M/s | ~30-33 s          |
-| RTX PRO 6000 Blackwell Max-Q        | 105.1 M/s   | ~41 s               |
-
-OpenCL offset-stream ILP6 screen:
-
-| GPU                                 | Screen rate | Full-key screen time | Short-run wall rate |
-|-------------------------------------|-------------|----------------------|---------------------|
-| RTX 5090                            | 86.5 M/s    | ~50 s                | 74.9 M/s            |
-| RTX PRO 6000 Blackwell Max-Q        | 72.2 M/s    | ~60 s                | ~62 M/s             |
+**Research baseline (not production):** a flat AVX/SIMD/CUDA/OpenCL checksum
+screen and the state-dedup/compaction benches remain as a stability baseline and
+the bit-exact parity reference. The raceway never misses a hit; use the screen
+only for an exact dedup count or A-B validation.
 
 ## Building
 
-- Forward CUDA: `cd cuda && make all`
-- Forward CPU bench: `cd src/bruteforce/bench_cpu && make all`
-- CPU dedup benches: `make cpu-dedup`
-- Forward OpenCL: `cd opencl && make all`
+- Forward CPU raceway (production): `make raceway`
+- Forward CUDA: `cd cuda && make all`  (raceway + research paths)
+- Forward OpenCL: `cd opencl && make all`  (raceway + research paths)
+- Research CPU baselines: `make cpu` (bench) / `make cpu-dedup` (dedup benches)
 
 See each subdirectory's Makefile.
 

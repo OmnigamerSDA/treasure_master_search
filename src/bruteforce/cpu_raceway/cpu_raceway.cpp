@@ -384,7 +384,12 @@ static void worker(int id, std::uint64_t lo, std::uint64_t hi){
 static const char* fp_name(FpMode m){ return m==FpMode::fp128?"128":m==FpMode::fp96?"96":"64"; }
 
 int main(int c,char**v){
-  if(c<4){ std::fprintf(stderr,"usage: %s key window T [K] [count|screen] [wave_N] [cap_bits] [cap_ways] [fp64|fp96|fp128]\n",v[0]); return 2; }
+  if(c<4){
+    std::fprintf(stderr,"usage: %s key window T [K] [count|screen] [wave_N] [cap_bits] [cap_ways] [fp64|fp96|fp128]\n",v[0]);
+    std::fprintf(stderr,"  PRODUCTION CPU forward engine (bounded-wave raceway). window 0 = full 2^32 (needs PRODUCER_CAP=1).\n");
+    std::fprintf(stderr,"  ./raceway_autoconfig.sh --build picks the host's ISA build + wave/cap. Env: RACEWAY_CAP, DEEP_DISP,\n");
+    std::fprintf(stderr,"  PRODUCER_CAP/PCAP_BITS, CONT, SHARD_CHUNK, WIN_POLICY (see the cpu_raceway.cpp header block).\n");
+    return 2; }
   g_key=std::stoul(v[1],0,0); g_window=std::stoull(v[2],0,0); g_T=std::stoi(v[3]);
   if(c>4) g_K=std::stoi(v[4]);
   if(c>5) g_screen=(std::string(v[5])=="screen");
