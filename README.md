@@ -20,7 +20,7 @@ retained as **research / A-B comparisons** and as the bit-exact parity
 reference, but are no longer the default.
 
 - **CUDA** — fastest; the raceway on NVIDIA GPUs.
-- **OpenCL** — portable raceway for AMD/Intel/Apple/other non-NVIDIA GPUs (~70% of CUDA).
+- **OpenCL** — portable raceway for AMD/Intel/Apple/other non-NVIDIA GPUs; ~64% of CUDA on the same RTX 5090 default-precert HM.
 - **CPU** — the raceway for hosts without a GPU (AVX-512 / AVX2), auto-configured per host.
 
 ## Quick Build
@@ -73,18 +73,21 @@ a representative key mix.
 
 | Path | Hardware | Raceway throughput |
 |---|---|---:|
-| CUDA | RTX 5090 | ~310 M/s typical (population HM); ~224–261 M/s on the diffuse long pole |
+| CUDA | RTX 5090 | ~415 M represented/s default-precert HM (8-key W256M); ~252 M/s diffuse HM |
 | CUDA | RTX PRO 6000 Blackwell Max-Q | ~0.8× the 5090 (clock-bound) |
-| OpenCL | NVIDIA (same GPU) | ~70% of the CUDA raceway |
+| OpenCL | NVIDIA RTX 5090 | ~264 M represented/s default-precert HM (same 8-key W256M); ~64% of CUDA |
 | OpenCL | AMD RX 7800 XT (RDNA3) | ~70 M/s (updated OpenCL raceway) |
 | OpenCL | AMD Ryzen iGPU (1 CU) | runs the full pipeline (portability floor / CI-smoke) |
-| CPU (AVX-512) | Ryzen 9 9900X, 24 threads | ~27 M/s typical HM (≈114 M/s on collapse-heavy keys, ≈14 M/s diffuse) |
+| CPU (AVX-512) | Ryzen 9 9900X, 24 threads | ~22.9 M represented/s default-precert HM (same 8-key W256M); ~13.5 M/s diffuse HM |
 | CPU (AVX2) | host without AVX-512 | ~0.7× the AVX-512 raceway |
 
 Per-device GPU tuning: `tm_cuda --calibrate-raceway` sweeps span-ILP × cap-bits
 and records the result; production raceway runs auto-apply it. The research
 screen/compaction rates and methodology are in
 `docs/gpu_forward_benchmark_notes.md`.
+
+Default-precert represented-throughput details are in
+`docs/raceway_precert_hm_20260618.md`.
 
 ## Layout
 

@@ -5,8 +5,8 @@
 // reports survivors plus throughput.  Cross-vendor portable (OpenCL 1.2+).
 //
 // PRODUCTION ENGINE (2026-06-16): the bounded-wave raceway (cross-vendor; best across
-// BOTH throughput and memory). This OpenCL port of the raceway runs at ~70% of the CUDA
-// raceway and is the recommended path for non-NVIDIA devices. The flat checksum-screen
+// BOTH throughput and memory). This OpenCL port reaches ~64% of CUDA on the same
+// RTX 5090 default-precert HM and is the recommended path for non-NVIDIA devices. The flat checksum-screen
 // and on-GPU compaction kernels are RESEARCH / A-B paths (the screen is also the parity
 // reference). For NVIDIA devices prefer the CUDA build (../test_cuda/).
 // Watchdog-safe: per-launch candidate counts are scaled by CU count (small iGPUs run the
@@ -389,7 +389,7 @@ namespace
 					<< "  --precert / --no-precert    Enable/disable default MAP1 certified-shed pre-exclusion for supported raceway launches\n"
 					<< "\n"
 					<< "PRODUCTION engine = the bounded-wave raceway (best throughput AND memory, FN-safe;\n"
-					<< "~70% of the CUDA raceway, recommended for non-NVIDIA GPUs):\n"
+					<< "~64% of CUDA on RTX 5090 default-precert HM; recommended for non-NVIDIA GPUs):\n"
 					<< "  --raceway-wave-cap-mark     Run the production raceway (state-saving cap spans + wave compaction).\n"
 					<< "                              Tune with --raceway-cap-bits/-ways, --raceway-cap-ilp,\n"
 					<< "                              --raceway-cap-boundaries.\n"

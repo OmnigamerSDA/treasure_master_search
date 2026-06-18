@@ -73,7 +73,10 @@ the long pole). The AVX2 build runs ≈0.7× the AVX-512 build. Use
 
 The CPU raceway enables MAP1 certified-shed pre-exclusion by default. Certified
 keys scan only the logical support axis before MAP1; zero-cert keys are a
-no-op. Use `PRECERT=0` for raw contiguous-window parity tests.
+no-op. On the 2026-06-18 8-key W256M default-precert set, the 24-thread AVX-512
+build measured 22.9 M represented candidates/s HM, with certified collapsers at
+1.34 B/s HM and no-cert diffuse keys at 13.5 M/s HM. Use `PRECERT=0` for raw
+contiguous-window parity tests.
 
 ### Research / characterization tools
 
@@ -95,7 +98,7 @@ origin tracking) are documented in each tool's `--help`.
 
 The GPU engines live in `cuda/` and `opencl/` with their own READMEs. Both run
 the **bounded-wave raceway** as the production engine (CUDA fastest on NVIDIA;
-OpenCL ~70% of CUDA for non-NVIDIA devices); the flat screen / compaction paths
+OpenCL measured ~64% of CUDA on the same RTX 5090 default-precert HM); the flat screen / compaction paths
 are research/baseline only. Supported production raceway launches enable the
 same MAP1 certified-shed pre-exclusion by default; disable with `--no-precert`.
 Build with `make cuda` / `make opencl` from the repo root, then see the package

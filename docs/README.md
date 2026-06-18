@@ -13,6 +13,7 @@ disabled with `--no-precert` on CUDA/OpenCL or `PRECERT=0` on the CPU raceway.
 | Doc | Topic |
 |---|---|
 | `PROJECT_STATUS.md` | Public forward-release status and measured raceway rates |
+| `raceway_precert_hm_20260618.md` | Default-precert represented-throughput harmonic means |
 | `forward_release_candidate_20260525.md` | Historical (2026-05-25) screen/dedup RC snapshot — superseded by the raceway |
 | `gpu_forward_benchmark_notes.md` | GPU screen-benchmark methodology + history (research baseline) |
 | `decryption_execution_trace_reference.md` | Forward algorithm walkthrough |

@@ -58,7 +58,7 @@ Full-key `2^32`, FN-safe, flat memory (set by the cap, not the window):
 
 | GPU | Raceway throughput |
 |---|---:|
-| RTX 5090 | ~310 M/s typical (population harmonic mean); ~224–261 M/s on the diffuse long pole |
+| RTX 5090 | ~415 M represented/s default-precert HM (8-key W256M); ~252 M/s diffuse HM |
 | RTX PRO 6000 Blackwell Max-Q | ~0.8× the 5090 (clock-bound) |
 
 Tune once per device with `tm_cuda --calibrate-raceway` (sweeps span-ILP ×
@@ -66,6 +66,10 @@ cap-bits, records `engine=raceway …` to `tm_compaction.conf`); production race
 runs auto-apply the calibrated span-ILP. The raceway never misses a hit; for a
 **bit-exact dedup count** use the research screen/compaction paths below, which
 it is validated against.
+
+The default-precert headline uses represented candidates per second: certified
+keys keep one logical representative per shed group and multiply the logical
+scan by `2^certified_bits`.
 
 ## Research baseline (screen & compaction)
 

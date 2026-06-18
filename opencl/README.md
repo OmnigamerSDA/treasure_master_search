@@ -14,9 +14,10 @@ any non-NVIDIA accelerator**.
 ## Production engine: the bounded-wave raceway
 
 The **production forward engine (2026-06-16) is the bounded-wave raceway** — best
-across **both throughput and memory**, the default for any system. This OpenCL
-port runs at ~70% of the CUDA raceway and is the recommended path for non-NVIDIA
-devices. Run it via `--raceway-wave-cap-mark` (with `--raceway-cap-bits/-ways`,
+across **both throughput and memory**, the default for any system. On an RTX 5090
+this OpenCL port reaches ~64% of the CUDA default-precert represented-throughput
+HM, and it remains the recommended path for non-NVIDIA devices. Run it via
+`--raceway-wave-cap-mark` (with `--raceway-cap-bits/-ways`,
 `--raceway-cap-ilp`, `--raceway-cap-boundaries`). Per-launch work is
 **watchdog-safe** (scaled by compute-unit count, so small integrated GPUs do not
 trip a GPU-recovery). The flat **checksum screen** and **compaction** paths below
@@ -64,9 +65,9 @@ FN-safe, flat memory (set by the cap, not the window). Per-launch work is scaled
 by compute-unit count so small integrated GPUs do not trip a GPU-recovery watchdog.
 Regime-dependent: collapse keys are fast, the diffuse keys are the long pole.
 
-| Device | Raceway throughput (W16M, cadence 2,5,10,16) |
+| Device | Raceway throughput |
 |---|---:|
-| NVIDIA (same GPU) | ~70% of the CUDA raceway |
+| NVIDIA RTX 5090 | ~264 M represented/s default-precert HM (8-key W256M); ~64% of CUDA |
 | AMD RX 7800 XT (RDNA3, 30 CU, 16 GB, fp64 cap) | ~58 M/s cap-span aggregate; ~40 M/s diffuse, ~120 M/s collapse (≈0.21× a 5090's OpenCL raceway) |
 | AMD Ryzen iGPU (gfx1036, 1 CU) | ~2.2–2.8 M/s — runs the full fp64-cap pipeline; viable as a floor / CI smoke target |
 
@@ -74,6 +75,9 @@ Parity PASS on all of the above (`--parity`). For a bit-exact dedup count use th
 research screen/compaction paths below (the raceway never misses a hit). The AMD
 cap path auto-selects fp64 when `cl_khr_int64_base_atomics` is present, else a
 portable fp32 cap (`--raceway-cap-fp32`).
+The default-precert headline uses represented candidates per second: certified
+keys keep one logical representative per shed group and multiply the logical
+scan by `2^certified_bits`.
 
 ## Research baseline (screen & compaction)
 
@@ -229,9 +233,10 @@ README.md            This file
 ## Compared to the CUDA implementation
 
 This OpenCL port runs the same bounded-wave **raceway** architecture as CUDA. On
-the same NVIDIA GPU it reaches **~70% of the CUDA raceway**; on AMD RDNA3 (RX 7800
-XT) it is **≈0.21× a 5090's OpenCL raceway** and **≈0.14× the 5090 CUDA raceway**
-(the production ceiling). The 7800 XT trails the 5090 by ~2.85× in raw FP32/bandwidth,
+the same RTX 5090 it reaches **~64% of the CUDA default-precert represented HM**;
+on AMD RDNA3 (RX 7800 XT) older no-precert W16M measurements were **≈0.21× a
+5090's OpenCL raceway** and **≈0.14× the 5090 CUDA raceway**. The 7800 XT trails
+the 5090 by ~2.85× in raw FP32/bandwidth,
 so it realizes ~60% of the per-FLOP efficiency the 5090 gets on the *same* OpenCL
 code — a ~40% portability gap.
 
