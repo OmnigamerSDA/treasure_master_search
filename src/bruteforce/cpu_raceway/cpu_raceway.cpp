@@ -76,6 +76,7 @@
 #include "raceway_kernel_select.h"
 #include "strong_hash.h"
 #include "window_policy.h"
+#include "map1_certifier.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -103,6 +104,12 @@ enum class FpMode { fp64, fp96, fp128 };
 static FpMode        g_fp_mode = FpMode::fp128;  // MAP1 dedup fingerprint width
 static std::uint32_t g_win_polmask = 0;
 static std::size_t   g_ne = 0;           // schedule length (== entries.size(), e.g. 27)
+static bool          g_pre_active = false;
+static std::uint32_t g_pre_shed_mask = 0;
+static std::uint32_t g_pre_support_mask = 0xFFFFFFFFu;
+static std::uint32_t g_pre_bits = 0;
+static std::uint64_t g_pre_source_mult = 1;
+static std::uint64_t g_represented_eff = 0;
 
 // TILED enumeration (TILE_BITS=m): remap loop index d -> data so the m squeeze-selected (locally-
 // collapsible) bits are the WITHIN-TILE axis (vary fastest), and the complement bits index the tile
@@ -115,6 +122,7 @@ static std::uint32_t g_tile_inner_mask = 0;  // m squeeze-selected bit positions
 static std::uint32_t g_tile_outer_mask = 0;  // complement (tile index axis)
 
 static inline std::uint32_t win_map_data(std::uint64_t d){
+  if(g_pre_active) return tm_window_policy::deposit_bits32((std::uint32_t)d, g_pre_support_mask);
   if(g_tile_bits){
     const std::uint32_t inner=(std::uint32_t)d & ((1u<<g_tile_bits)-1u);
     const std::uint32_t tile =(std::uint32_t)(d>>g_tile_bits);
@@ -123,6 +131,18 @@ static inline std::uint32_t win_map_data(std::uint64_t d){
   }
   return g_win_polmask ? tm_window_policy::deposit_bits32((std::uint32_t)d, g_win_polmask)
                        : (std::uint32_t)d;
+}
+
+static std::vector<std::uint8_t> schedule_blob_from_key_schedule(const key_schedule& schedule){
+  std::vector<std::uint8_t> blob;
+  blob.reserve(schedule.entries.size() * 4u);
+  for(const auto& e : schedule.entries){
+    blob.push_back(e.rng1);
+    blob.push_back(e.rng2);
+    blob.push_back((std::uint8_t)((e.nibble_selector >> 8) & 0xFFu));
+    blob.push_back((std::uint8_t)(e.nibble_selector & 0xFFu));
+  }
+  return blob;
 }
 
 #include "raceway_cap.h"
@@ -387,8 +407,9 @@ int main(int c,char**v){
   if(c<4){
     std::fprintf(stderr,"usage: %s key window T [K] [count|screen] [wave_N] [cap_bits] [cap_ways] [fp64|fp96|fp128]\n",v[0]);
     std::fprintf(stderr,"  PRODUCTION CPU forward engine (bounded-wave raceway). window 0 = full 2^32 (needs PRODUCER_CAP=1).\n");
-    std::fprintf(stderr,"  ./raceway_autoconfig.sh --build picks the host's ISA build + wave/cap. Env: RACEWAY_CAP, DEEP_DISP,\n");
-    std::fprintf(stderr,"  PRODUCER_CAP/PCAP_BITS, CONT, SHARD_CHUNK, WIN_POLICY (see the cpu_raceway.cpp header block).\n");
+    std::fprintf(stderr,"  ./raceway_autoconfig.sh --build picks the host's ISA build + wave/cap. Env: PRECERT=0 disables the\n");
+    std::fprintf(stderr,"  default certifier pre-exclusion; RACEWAY_CAP, DEEP_DISP, PRODUCER_CAP/PCAP_BITS, CONT, SHARD_CHUNK,\n");
+    std::fprintf(stderr,"  WIN_POLICY (see the cpu_raceway.cpp header block).\n");
     return 2; }
   g_key=std::stoul(v[1],0,0); g_window=std::stoull(v[2],0,0); g_T=std::stoi(v[3]);
   if(c>4) g_K=std::stoi(v[4]);
@@ -423,7 +444,44 @@ int main(int c,char**v){
 #ifdef UNIVERSAL
   if(g_screen){ std::fprintf(stderr,"screen mode unsupported on universal build (screen_state_raw is a stub); use count\n"); return 2; }
 #endif
-  const std::uint64_t eff = g_window ? g_window : ((std::uint64_t)1<<32);
+  const std::uint64_t represented_eff = g_window ? g_window : ((std::uint64_t)1<<32);
+  std::uint64_t eff = represented_eff;
+  g_represented_eff = represented_eff;
+  {
+    const char* precert_env = std::getenv("PRECERT");
+    const bool precert_explicit = precert_env != nullptr;
+    const bool precert_requested = precert_env == nullptr || std::string(precert_env) != "0";
+    if(precert_requested){
+      key_schedule ps(g_key, key_schedule::ALL_MAPS);
+      g_pre_shed_mask = tm_map1_certifier::certified_shed_mask_from_schedule_blob(
+        g_key, schedule_blob_from_key_schedule(ps));
+      g_pre_bits = (std::uint32_t)__builtin_popcount(g_pre_shed_mask);
+      g_pre_support_mask = ~g_pre_shed_mask;
+      g_pre_source_mult = 1ull << g_pre_bits;
+      if(g_pre_bits){
+        const bool compatible =
+          ((represented_eff % g_pre_source_mult) == 0ull) &&
+          !std::getenv("WIN_POLICY") &&
+          !std::getenv("TILE_BITS");
+        if(!compatible){
+          if((represented_eff % g_pre_source_mult) != 0ull && precert_explicit)
+            throw std::runtime_error("PRECERT requires window divisible by 2^certified_bits");
+          if((std::getenv("WIN_POLICY") || std::getenv("TILE_BITS")) && precert_explicit)
+            throw std::runtime_error("PRECERT v1 disables WIN_POLICY/TILE_BITS; run without those env vars");
+        } else {
+          eff = represented_eff / g_pre_source_mult;
+          if(eff == 0 || eff > ((std::uint64_t)1<<32))
+            throw std::runtime_error("PRECERT logical support-axis window is out of range");
+          g_pre_active = true;
+          std::fprintf(stderr,"PRECERT active shed_bits=%u shed_mask=0x%08x support_mask=0x%08x represented=%llu logical=%llu source_mult=%llu\n",
+            g_pre_bits, g_pre_shed_mask, g_pre_support_mask,
+            (unsigned long long)represented_eff, (unsigned long long)eff, (unsigned long long)g_pre_source_mult);
+        }
+      } else {
+        if(precert_explicit) std::fprintf(stderr,"PRECERT requested: shed_bits=0 mask=0x%08x (no-op)\n", g_pre_shed_mask);
+      }
+    }
+  }
   g_eff = eff;
 
   // Window data-ordering policy (squeeze/backfill/...); identity at full 2^32 or unset.
@@ -508,6 +566,9 @@ int main(int c,char**v){
   if(g_tile_bits) std::printf("  tiled: tile_bits=%u inner=0x%08x outer=0x%08x partition=%s\n",
     g_tile_bits, g_tile_inner_mask, g_tile_outer_mask,
     ((g_tile_inner_mask&g_tile_outer_mask)==0 && (g_tile_inner_mask|g_tile_outer_mask)==(g_window?0u:0xFFFFFFFFu))?"OK(bijection)":"partial(subwindow)");
+  if(g_pre_active) std::printf("  precert: shed_bits=%u shed_mask=0x%08x support_mask=0x%08x represented_window=%llu logical_window=%llu source_mult=%llu\n",
+    g_pre_bits, g_pre_shed_mask, g_pre_support_mask,
+    (unsigned long long)g_represented_eff, (unsigned long long)g_eff, (unsigned long long)g_pre_source_mult);
   std::printf("  streamed=%zu  deep_map_evals=%zu  cap_probes=%zu  finals_kept=%zu  UNION_final=%zu  screen_hits=%llu\n",
     g_f1.load(), g_deep_map_evals.load(), g_cap_probes.load(), g_finals_kept.load(), uni, g_screen_hits.load());
   const std::size_t rtd=g_pcap_routed.load(), byp=g_pcap_bypassed.load();
@@ -551,7 +612,9 @@ int main(int c,char**v){
       std::printf("  deepcap ge%-2zu LF=%.3f (occ=%zu/%zu)\n", g_cap_ge[i], sl?(double)o/(double)sl:0.0, o, sl); }
     if(!g_screen) std::printf("  union  LF=%.3f\n", uni_lf);
   }
-  std::printf("  wall=%.2fs  cps=%.2f M/s  peakRSS=%.2f GB\n", wall, eff/(wall*1e6), ru.ru_maxrss/1048576.0);
+  std::printf("  wall=%.2fs  cps=%.2f M/s", wall, eff/(wall*1e6));
+  if(g_pre_active) std::printf("  represented_cps=%.2f M/s", g_represented_eff/(wall*1e6));
+  std::printf("  peakRSS=%.2f GB\n", ru.ru_maxrss/1048576.0);
   if(g_cap_on && g_drops) delete[] g_drops;
   return 0;
 }

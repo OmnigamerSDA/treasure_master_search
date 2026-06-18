@@ -4859,6 +4859,201 @@ __device__ __forceinline__ void tm_strong128_state(uint32_t value, uint64_t& h0,
 	h0 = a; h1 = b;
 }
 
+// Scatter the low set-bits of `bits` onto the set positions of `mask` (PDEP). Shared
+// by the window-policy remap (squeeze tiling) and the MAP-K selected-bit frontier probe.
+__device__ __forceinline__ uint32_t tm_deposit_bits32(uint32_t bits, uint32_t mask)
+{
+	uint32_t out = 0u;
+	while (mask != 0u)
+	{
+		const uint32_t bit = mask & (0u - mask);
+		if ((bits & 1u) != 0u) out |= bit;
+		bits >>= 1u;
+		mask ^= bit;
+	}
+	return out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Compression-study gather (2026-06-18): full-schedule (fp128, flag) dump over an
+// EXPLICIT list of data values. Used to turn a screen's hit list (the rare flag!=0
+// candidates) into a deduplicable (fingerprint, flag) stream so the host can count
+// UNIQUE passing outputs — not the weighted all-data hit count that inflates when
+// many inputs collapse to the same passing state. One warp per list entry; the full
+// schedule is run generically (schedule_count read at runtime, so variable-length
+// key schedules work). fp128 == tm_strong128_state (the canonical full-state hash,
+// bulletproof to billions), and the flag is recomputed via screen_candidate so the
+// (fp, flag) pair is internally consistent. data_list[i] is the absolute 32-bit data
+// value (not a tile offset). fp_lo/fp_hi/flag_out are parallel output arrays of
+// length count; lane 0 writes them.
+extern "C" __global__ __launch_bounds__(128) void tm_study_gather_fp_flag_cuda(
+	const uint32_t* data_list, uint32_t count,
+	uint64_t* fp_lo_out, uint64_t* fp_hi_out, uint8_t* flag_out,
+	const uint8_t* regular_rng_values, const uint8_t* alg0_values, const uint8_t* alg6_values,
+	const uint16_t* rng_forward_1, const uint16_t* rng_forward_128,
+	const uint32_t* alg2_values, const uint32_t* alg5_values,
+	const uint8_t* expansion_values, const uint8_t* schedule_data,
+	const uint8_t* carnival_data, uint32_t key, uint32_t schedule_count)
+{
+	const uint32_t lane = threadIdx.x & 31u;
+	const uint32_t warp_index = threadIdx.x >> 5;
+	const uint32_t warps_per_block = blockDim.x >> 5;
+	const uint32_t entry = blockIdx.x * warps_per_block + warp_index;
+	if (entry >= count) return;
+
+	const uint32_t data = data_list[entry];
+	uint32_t value = initialize_working_word(key, data, lane, expansion_values);
+	for (uint32_t schedule_index = 0u; schedule_index < schedule_count; schedule_index++)
+	{
+		uint32_t packed_schedule = 0u;
+		if (lane == 0u) packed_schedule = reinterpret_cast<const uint32_t*>(schedule_data)[schedule_index];
+		packed_schedule = __shfl_sync(0xFFFFFFFFu, packed_schedule, 0);
+		uint16_t rng_seed = static_cast<uint16_t>(((packed_schedule & 0x000000FFu) << 8)
+			| ((packed_schedule & 0x0000FF00u) >> 8));
+		uint16_t nibble_selector = static_cast<uint16_t>(((packed_schedule & 0x00FF0000u) >> 8)
+			| ((packed_schedule & 0xFF000000u) >> 24));
+		for (uint32_t i = 0u; i < 16u; i++)
+		{
+			const uint32_t source_lane = i >> 2;
+			const uint32_t source_shift = (i & 3u) * 8u;
+			const uint32_t source_word = __shfl_sync(0xFFFFFFFFu, value, source_lane);
+			uint8_t current_byte = static_cast<uint8_t>((source_word >> source_shift) & 0xFFu);
+			if ((nibble_selector & 0x8000u) != 0u) current_byte = static_cast<uint8_t>(current_byte >> 4);
+			const uint8_t algorithm_id = static_cast<uint8_t>((current_byte >> 1) & 0x07u);
+			value = run_alg(value, lane, algorithm_id, &rng_seed,
+				regular_rng_values, alg0_values, alg6_values, rng_forward_1, rng_forward_128, alg2_values, alg5_values);
+			nibble_selector = static_cast<uint16_t>(nibble_selector << 1);
+		}
+	}
+	uint64_t h0, h1;
+	tm_strong128_state(value, h0, h1);
+	const uint8_t f = (carnival_data != nullptr) ? screen_candidate(value, lane, carnival_data) : 0u;
+	if (lane == 0u)
+	{
+		fp_lo_out[entry] = h0;
+		fp_hi_out[entry] = h1;
+		flag_out[entry] = f;
+	}
+}
+
+// Compression-study screen+HLL with WINDOW-POLICY remap (2026-06-18). Identical to
+// tm_screen_and_hll_cuda except the candidate index is REMAPPED to a data value via a
+// bit-deposit: data = fixed_value | deposit(index, inner_mask). With inner_mask = the
+// squeeze-selected log2(tile) bits and fixed_value = deposit(tile_index, outer_mask),
+// each tile holds the co-collapsing inputs (the squeeze wave-locality enumeration the
+// CPU raceway uses), so the per-tile HLL distinct reflects squeeze tile compression
+// (not the linear contiguous tiling, which under-collapses). The global union over all
+// tiles is unchanged (squeeze is a bijection of 2^32), so true_R / flags are identical.
+extern "C" __global__ __launch_bounds__(128) void tm_screen_and_hll_remap_cuda(
+	uint8_t* result_data,
+	uint32_t* hll_registers,
+	const uint8_t* regular_rng_values,
+	const uint8_t* alg0_values,
+	const uint8_t* alg6_values,
+	const uint16_t* rng_forward_1,
+	const uint16_t* rng_forward_128,
+	const uint32_t* alg2_values,
+	const uint32_t* alg5_values,
+	const uint8_t* expansion_values,
+	const uint8_t* schedule_data,
+	const uint8_t* carnival_data,
+	uint32_t key,
+	uint32_t fixed_value,
+	uint32_t inner_mask,
+	uint32_t candidate_count)
+{
+	const uint32_t lane = threadIdx.x & 31u;
+	const uint32_t warp_index = threadIdx.x >> 5;
+	const uint32_t warps_per_block = blockDim.x >> 5;
+	const uint32_t candidate_base = (blockIdx.x * warps_per_block + warp_index) * 4u;
+	if (candidate_base >= candidate_count) return;
+
+	const uint32_t d0 = fixed_value | tm_deposit_bits32(candidate_base + 0u, inner_mask);
+	const uint32_t d1 = fixed_value | tm_deposit_bits32(candidate_base + 1u, inner_mask);
+	const uint32_t d2 = fixed_value | tm_deposit_bits32(candidate_base + 2u, inner_mask);
+	const uint32_t d3 = fixed_value | tm_deposit_bits32(candidate_base + 3u, inner_mask);
+
+	uint32_t v0 = initialize_working_word(key, d0, lane, expansion_values);
+	uint32_t v1 = initialize_working_word(key, d1, lane, expansion_values);
+	uint32_t v2 = initialize_working_word(key, d2, lane, expansion_values);
+	uint32_t v3 = initialize_working_word(key, d3, lane, expansion_values);
+
+	run_schedule_quad_t<27u>(&v0, &v1, &v2, &v3, lane,
+		regular_rng_values, alg0_values, alg6_values, rng_forward_1, rng_forward_128,
+		alg2_values, alg5_values, schedule_data);
+
+	const uint8_t f0 = screen_candidate(v0, lane, carnival_data);
+	const uint8_t f1 = screen_candidate(v1, lane, carnival_data);
+	const uint8_t f2 = screen_candidate(v2, lane, carnival_data);
+	const uint8_t f3 = screen_candidate(v3, lane, carnival_data);
+	if (lane == 0u)
+	{
+		result_data[candidate_base + 0u] = f0;
+		if ((candidate_base + 1u) < candidate_count) result_data[candidate_base + 1u] = f1;
+		if ((candidate_base + 2u) < candidate_count) result_data[candidate_base + 2u] = f2;
+		if ((candidate_base + 3u) < candidate_count) result_data[candidate_base + 3u] = f3;
+	}
+
+	uint32_t h_lo, h_hi;
+	warp_hash_state(v0, lane, &h_lo, &h_hi);
+	if (lane == 0u) hll_update(hll_registers, h_lo, h_hi);
+	if ((candidate_base + 1u) < candidate_count) { warp_hash_state(v1, lane, &h_lo, &h_hi); if (lane == 0u) hll_update(hll_registers, h_lo, h_hi); }
+	if ((candidate_base + 2u) < candidate_count) { warp_hash_state(v2, lane, &h_lo, &h_hi); if (lane == 0u) hll_update(hll_registers, h_lo, h_hi); }
+	if ((candidate_base + 3u) < candidate_count) { warp_hash_state(v3, lane, &h_lo, &h_hi); if (lane == 0u) hll_update(hll_registers, h_lo, h_hi); }
+}
+
+extern "C" __global__ __launch_bounds__(128) void tm_screen_remap_offset_cuda(
+	uint8_t* result_data,
+	const uint8_t* regular_rng_values,
+	const uint8_t* alg0_values,
+	const uint8_t* alg6_values,
+	const uint16_t* rng_forward_1,
+	const uint16_t* rng_forward_128,
+	const uint32_t* alg2_values,
+	const uint32_t* alg5_values,
+	const uint8_t* expansion_values,
+	const uint8_t* schedule_data,
+	const uint8_t* carnival_data,
+	uint32_t key,
+	uint32_t fixed_value,
+	uint32_t selected_mask,
+	uint32_t candidate_start,
+	uint32_t candidate_count)
+{
+	const uint32_t lane = threadIdx.x & 31u;
+	const uint32_t warp_index = threadIdx.x >> 5;
+	const uint32_t warps_per_block = blockDim.x >> 5;
+	const uint32_t candidate_base = (blockIdx.x * warps_per_block + warp_index) * 4u;
+	if (candidate_base >= candidate_count) return;
+
+	const uint32_t logical = candidate_start + candidate_base;
+	const uint32_t d0 = fixed_value | tm_deposit_bits32(logical + 0u, selected_mask);
+	const uint32_t d1 = fixed_value | tm_deposit_bits32(logical + 1u, selected_mask);
+	const uint32_t d2 = fixed_value | tm_deposit_bits32(logical + 2u, selected_mask);
+	const uint32_t d3 = fixed_value | tm_deposit_bits32(logical + 3u, selected_mask);
+
+	uint32_t v0 = initialize_working_word(key, d0, lane, expansion_values);
+	uint32_t v1 = initialize_working_word(key, d1, lane, expansion_values);
+	uint32_t v2 = initialize_working_word(key, d2, lane, expansion_values);
+	uint32_t v3 = initialize_working_word(key, d3, lane, expansion_values);
+
+	run_schedule_quad_t<27u>(&v0, &v1, &v2, &v3, lane,
+		regular_rng_values, alg0_values, alg6_values, rng_forward_1, rng_forward_128,
+		alg2_values, alg5_values, schedule_data);
+
+	const uint8_t f0 = screen_candidate(v0, lane, carnival_data);
+	const uint8_t f1 = screen_candidate(v1, lane, carnival_data);
+	const uint8_t f2 = screen_candidate(v2, lane, carnival_data);
+	const uint8_t f3 = screen_candidate(v3, lane, carnival_data);
+	if (lane == 0u)
+	{
+		result_data[candidate_base + 0u] = f0;
+		if ((candidate_base + 1u) < candidate_count) result_data[candidate_base + 1u] = f1;
+		if ((candidate_base + 2u) < candidate_count) result_data[candidate_base + 2u] = f2;
+		if ((candidate_base + 3u) < candidate_count) result_data[candidate_base + 3u] = f3;
+	}
+}
+
 // Classify every input candidate by a high-bit prefix of its MAP1 strong64
 // fingerprint. The full-domain byte label array lets the host process one
 // fingerprint partition at a time while computing MAP1 only twice overall:
@@ -5465,19 +5660,6 @@ extern "C" __global__ __launch_bounds__(128) void tm_map1_frontier_insertK128_cu
 		if (rep_out != nullptr && u < rep_cap) rep_out[u] = data;
 		if (unique_out != nullptr) unique_out[cand] = 1u;
 	}
-}
-
-__device__ __forceinline__ uint32_t tm_deposit_bits32(uint32_t bits, uint32_t mask)
-{
-	uint32_t out = 0u;
-	while (mask != 0u)
-	{
-		const uint32_t bit = mask & (0u - mask);
-		if ((bits & 1u) != 0u) out |= bit;
-		bits >>= 1u;
-		mask ^= bit;
-	}
-	return out;
 }
 
 // Arbitrary selected-bit MAP-K frontier insert. This is a research probe for

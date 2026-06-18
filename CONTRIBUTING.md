@@ -5,17 +5,18 @@ The development repo is private and is synced into this one periodically.
 
 ## What you can usefully contribute
 
-- **Bug reports** on the public code: forward kernels, password codec,
-  validation tools, and documentation.
+- **Bug reports** on the public code: forward kernels, reverse engines,
+  CNF generator, password codec, validation tools.
 - **Build fixes** for platforms outside the maintainer's environment
   (non-Linux, non-NVIDIA, alternate CUDA versions, etc.).
-- **Performance patches** for the forward CPU, CUDA, and OpenCL paths.
-- **Algorithm clarifications** in the `docs/` writeups.
+- **Performance patches** for the forward CPU SIMD and CUDA paths.
+- **Algorithm clarifications** in the `docs/` and `wiki/` writeups.
 
 ## What is harder to land
 
-- Requests for reverse/CNF/SAT internals — those systems live in the private
-  development repo and are not part of this forward-search snapshot.
+- Changes to the CNF emission shape — those are coupled to the
+  in-development solver-binding pipeline that lives in the private repo
+  and may not be visible here.
 - Sweeping refactors of `src/common/` — used by every lane.
 - New "hypothesis" directions. Active research lives on the dev side.
 
@@ -34,6 +35,6 @@ modify the attribution there.
 
 ## Out of scope
 
-This project is **not** a general SAT-solving or reverse-engineering toolkit. It is a focused
+This project is **not** a general SAT-solving toolkit. It is a focused
 attempt at one specific NES code-recovery problem. Issues asking for
 generic solver features will usually be closed with a pointer upstream.

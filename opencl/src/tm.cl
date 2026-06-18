@@ -1287,6 +1287,30 @@ int raceway_cap_probe_or_keep(
 	return 0;
 }
 
+unsigned int tm_deposit_bits32(unsigned int bits, unsigned int mask)
+{
+	unsigned int out = 0u;
+	while (mask != 0u)
+	{
+		const unsigned int bit = mask & (0u - mask);
+		if ((bits & 1u) != 0u) out |= bit;
+		bits >>= 1u;
+		mask ^= bit;
+	}
+	return out;
+}
+
+unsigned int raceway_precert_data_value(
+	unsigned int logical,
+	unsigned int fixed_value,
+	unsigned int support_mask,
+	unsigned int use_precert)
+{
+	return (use_precert != 0u)
+		? (fixed_value | tm_deposit_bits32(logical, support_mask))
+		: logical;
+}
+
 __kernel void raceway_boundary_cap_mark_offset(
 	__global unsigned char*  alive_out,
 	__global unsigned char*  drop_map_out,
@@ -1307,7 +1331,10 @@ __kernel void raceway_boundary_cap_mark_offset(
 	unsigned int first_cap_map,
 	__global unsigned int* cap_maps,
 	__global unsigned int* work_counter,
-	unsigned int persistent_queue)
+	unsigned int persistent_queue,
+	unsigned int precert_fixed_value,
+	unsigned int precert_support_mask,
+	unsigned int use_precert)
 {
 	__local unsigned int working_code[32 * RACEWAY_CAP_ILP];
 	__local unsigned char alive_local[RACEWAY_CAP_ILP];
@@ -1344,7 +1371,9 @@ __kernel void raceway_boundary_cap_mark_offset(
 
 		for (int j = 0; j < RACEWAY_CAP_ILP; j++)
 		{
-			const unsigned int cur_data = data_start + base + (unsigned int)j;
+			const unsigned int logical = data_start + base + (unsigned int)j;
+			const unsigned int cur_data = raceway_precert_data_value(
+				logical, precert_fixed_value, precert_support_mask, use_precert);
 			working_code[j * 32 + int_index] = ((int_index & 1u) == 0u) ? pack_be_u32(key) : pack_be_u32(cur_data);
 		}
 		barrier(CLK_LOCAL_MEM_FENCE);
@@ -1839,7 +1868,10 @@ __kernel void raceway_boundary_cap_state_offset(
 	unsigned int key,
 	unsigned int data_start,
 	unsigned int candidate_count,
-	unsigned int end_map)
+	unsigned int end_map,
+	unsigned int precert_fixed_value,
+	unsigned int precert_support_mask,
+	unsigned int use_precert)
 {
 	__local unsigned int working_code[32 * RACEWAY_CAP_ILP];
 	__local unsigned char alive_local[RACEWAY_CAP_ILP];
@@ -1861,7 +1893,9 @@ __kernel void raceway_boundary_cap_state_offset(
 
 	for (int j = 0; j < RACEWAY_CAP_ILP; j++)
 	{
-		const unsigned int cur_data = data_start + base + (unsigned int)j;
+		const unsigned int logical = data_start + base + (unsigned int)j;
+		const unsigned int cur_data = raceway_precert_data_value(
+			logical, precert_fixed_value, precert_support_mask, use_precert);
 		working_code[j * 32 + int_index] = ((int_index & 1u) == 0u) ? pack_be_u32(key) : pack_be_u32(cur_data);
 	}
 	barrier(CLK_LOCAL_MEM_FENCE);

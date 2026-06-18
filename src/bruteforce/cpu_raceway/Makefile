@@ -11,7 +11,7 @@
 # All targets pass -fno-builtin-memset (roots out an -O3 vectorized-memset SIGSEGV).
 # Linux only (reads /proc + <sys/resource.h> for peak-RSS reporting).
 
-CXX        := g++
+CXX        := $(shell command -v clang++-21 >/dev/null 2>&1 && echo clang++-21 || echo g++)
 CXXFLAGS   := -O3 -std=c++20 -m64 -march=native -mtune=native -I../../common -I.. -I../cpu -pthread
 CXXFLAGS_AVX2 := $(subst -march=native,-march=x86-64-v3,$(CXXFLAGS))
 SRC_COMMON := ../../common
@@ -25,7 +25,7 @@ COMMON_MAP  := $(COMMON_BASE) ../cpu/tm_avx512_r512_map_8.cpp
 COMMON_UNIV := $(COMMON_BASE) ../cpu/tm_avx512_r512s_8.cpp
 COMMON_AVX2 := $(COMMON_BASE) ../cpu/tm_avx2_r256_map_8.cpp
 
-HDRS := raceway_kernel_select.h raceway_cap.h raceway_deep.h
+HDRS := raceway_kernel_select.h raceway_cap.h raceway_deep.h $(SRC_COMMON)/map1_certifier.h
 
 AVX2_W ?= 2
 

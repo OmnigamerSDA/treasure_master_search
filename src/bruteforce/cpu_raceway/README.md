@@ -27,7 +27,7 @@ or pick a build directly:
 | `cpu_raceway_avx2` | AVX2 natmap       | x2 / blmerge   | clang≥19 (recommended) | hosts without AVX-512 |
 
 ```sh
-make CXX=clang++-21 cpu_raceway        # or cpu_raceway_avx2
+make cpu_raceway                       # prefers clang++-21 when available
 make                 cpu_raceway_u
 ```
 
@@ -49,33 +49,27 @@ Linux only (peak-RSS reporting reads `/proc` + `<sys/resource.h>`).
   sibling layout is host-specific; the autoconfig script prints both pin sets.
 
 Useful env knobs: `RACEWAY_CAP=0|1` (cap off/on, default on), `DEEP_DISP=branched|blmerge`,
-`PRODUCER_CAP=exact|shadow|1`, `CONT=carry|recompute`, `SHARD_CHUNK=N`.
+`PRODUCER_CAP=exact|shadow|1`, `CONT=carry|recompute`, `SHARD_CHUNK=N`,
+`PRECERT=0` (disable default MAP1 certified-shed pre-exclusion).
 
-## Reference performance
-
-Ryzen 9 9900X, AVX-512 natmap x10/blmerge, W16M, cap-on, K=5, best-of-3:
-
-| Threads | Pinning | Harmonic mean | Notes |
-|---:|---|---:|---|
-| 1 | one core | 2.43 M/s | baseline |
-| 8 | physical cores | 15.26 M/s | 72% efficiency vs 1T |
-| 12 | all physical cores | 21.08 M/s | full physical-core posture |
-| 24 | SMT on | 27.49 M/s | +30% over 12T |
-
-Full-SMT per-key rates on that host: collapse `113.79 M/s`, mid `32.30 M/s`,
-diffuse `14.41 M/s`. The AVX2 build measured `20.97 M/s` HM at 24 threads on the
-same host, about 76% of AVX-512 for this workload.
+`PRECERT` is enabled by default. When a key has certified-shed MAP1 data bits,
+the producer scans only the logical support axis and fixes the shed bits before
+MAP1. For zero-cert keys it is a no-op. The initial bridge backs off
+automatically for incompatible window policies; explicit `PRECERT=1` turns those
+shape mismatches into errors.
 
 ## Self-check (built-in parity)
 
 The cap path is exact on the final distinct count, so cap-off and cap-on must agree:
 
 ```sh
-RACEWAY_CAP=0 ./cpu_raceway 0x9e9d137b 1048576 8 5 count   # cap-off (exact ceiling)
-RACEWAY_CAP=1 ./cpu_raceway 0x9e9d137b 1048576 8 5 count   # cap-on  (same UNION_final)
+PRECERT=0 RACEWAY_CAP=0 ./cpu_raceway 0x9e9d137b 1048576 8 5 count   # cap-off (exact ceiling)
+PRECERT=0 RACEWAY_CAP=1 ./cpu_raceway 0x9e9d137b 1048576 8 5 count   # cap-on  (same UNION_final)
 ```
 
-Both print the same `UNION_final` — the cap dropped only true duplicates.
+Both print the same `UNION_final` — the cap dropped only true duplicates. Leave
+`PRECERT` at its default for production; `PRECERT=0` is useful when you want raw
+contiguous-window parity.
 
 ## Source layout
 

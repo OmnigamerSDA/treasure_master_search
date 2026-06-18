@@ -35,6 +35,8 @@ tm_cuda.fatbin: $(SRC_DIR)/tm_cuda.cu
 %.o: $(SRC_DIR)/%.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
+main.o: $(SRC_DIR)/map1_certifier.h $(SRC_DIR)/rng_obj.h $(SRC_DIR)/alignment2.h
+
 wide_merge_sort.o: $(SRC_DIR)/wide_merge_sort.cu
 	$(NVCC) $(NVCC_OBJFLAGS) -c $< -o $@
 

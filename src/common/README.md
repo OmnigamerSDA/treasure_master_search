@@ -17,6 +17,7 @@ top-level directories.
 | `state_dedup*.h`                  | CPU final-state dedup helpers (raceway + research benches) |
 | `strong_hash.h`                   | Avalanched fingerprint for memcmp-free dedup |
 | `window_policy.h`                 | Window/tile index mapping (raceway)        |
+| `map1_certifier.h`                | MAP1 certified-shed mask helper used by default raceway precert |
 | `routing.h`                       | Shed-proxy routing helpers                 |
 | `key_file.h`                      | CSV/key-list parsing helper                |
 | `data_sizes.h`                    | Compile-time size constants                |

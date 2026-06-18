@@ -1,9 +1,9 @@
 # GPU Forward Benchmark Notes
 
-This note preserves the historical GPU checksum-screen benchmark shape and measured CUDA results.
+This note tracks the current forward-path GPU benchmark shape and the latest measured CUDA results.
 
 > **Production engine (2026-06-16): the bounded-wave raceway** (best across throughput AND memory; see
-> the top-level CUDA/OpenCL READMEs, tuned per device by `tm_cuda --calibrate-raceway`).
+> `docs/forward_engines_operating_guide_20260614.md`, tuned per device by `test_cuda --calibrate-raceway`).
 > The flat **checksum screen** measured below is the throughput-methodology baseline and the bit-exact
 > parity reference — not the production engine.
 
@@ -52,9 +52,9 @@ Current CUDA benchmark output focuses on:
 - checksum survivor counts split by world
 - CPU machine-code flag counts over survivors
 
-## Historical CUDA Screen Design
+## Current CUDA Design
 
-This CUDA screen path was the best measured point from the pre-raceway optimization pass:
+The current CUDA path is the best measured point from the recent optimization pass:
 
 - one block = `128` threads = `4` warps
 - checksum-screen kernel processes `4` candidates per warp
@@ -64,7 +64,7 @@ This CUDA screen path was the best measured point from the pre-raceway optimizat
 - checksum accumulation is done as a warp reduction
 - other-world and checksum-mask constants are packed as `uint32_t` constant-memory words
 
-Relevant constants:
+Relevant current constants:
 
 - `kCudaWarpsPerBlock = 4` in `src/bruteforce/test_cuda/main.cpp`
 - `kCudaScreenCandidatesPerWarp = 4` in `src/bruteforce/test_cuda/main.cpp`
@@ -84,7 +84,7 @@ Measured outcome:
 
 - the structural warp-synchronous rewrite produced the first large gain
 - `2x` interleaving was a major additional win
-- `4x` interleaving improved further and was the best measured screen point
+- `4x` interleaving improved further and is the current best measured point
 - `8x` interleaving was correct but regressed throughput, so it was not kept
 
 ## Profiling Findings
@@ -182,13 +182,13 @@ Short throughput benchmark (baseline kernel, historical reference):
 ./test_cuda --device 1 --key_id 0x2CA5B42D --range_start 0 --workunit_size 16777216 --batch_size 1048576 --warmup_batches 1
 ```
 
-Short throughput benchmark (historical offset-stream + ILP6 screen baseline):
+Short throughput benchmark (production offset-stream + ILP6 kernel, current):
 
 ```bash
 ./test_cuda --device 1 --key_id 0x2CA5B42D --range_start 0 --workunit_size 16777216 --batch_size 1048576 --warmup_batches 1 --screen-offsets
 ```
 
-Full `2^32` sweep (historical screen baseline):
+Full `2^32` sweep (production):
 
 ```bash
 ./test_cuda --device 1 --key_id 0x2CA5B42D --range_start 0 --workunit_size 4294967296 --batch_size 1048576 --warmup_batches 1 --screen-offsets
@@ -237,7 +237,7 @@ Recent saved profiler artifacts in `src/bruteforce/test_cuda/`:
 
 ## Practical Conclusion
 
-The CUDA checksum-screen path was already strong enough to materially change the search budget:
+The current CUDA checksum-screen path is already strong enough to materially change the search budget:
 
 - the code is roughly two orders of magnitude faster than the default CPU forward path
 - a full `2^32` data sweep for one key is now comfortably measured in under a minute on either GPU in this machine

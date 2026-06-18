@@ -560,7 +560,10 @@ extern "C" __global__ __launch_bounds__(256, 4) void tm_raceway_boundary_cap_sta
 	const uint8_t* schedule_data,
 	uint32_t key,
 	uint32_t schedule_count,
-	uint32_t first_cap_map)
+	uint32_t first_cap_map,
+	uint32_t fixed_value,
+	uint32_t support_mask,
+	uint32_t use_precert)
 {
 	const uint32_t lane = threadIdx.x & 31u;
 	unsigned long long local_started = 0ull;
@@ -1378,7 +1381,10 @@ __device__ __forceinline__ void tm_raceway_boundary_cap_state_offset_ilp_body(
 	const uint8_t* schedule_data,
 	uint32_t key,
 	uint32_t schedule_count,
-	uint32_t first_cap_map)
+	uint32_t first_cap_map,
+	uint32_t fixed_value,
+	uint32_t support_mask,
+	uint32_t use_precert)
 {
 	const uint32_t lane = threadIdx.x & 31u;
 	unsigned long long local_started = 0ull;
@@ -1401,7 +1407,9 @@ __device__ __forceinline__ void tm_raceway_boundary_cap_state_offset_ilp_body(
 		#pragma unroll
 		for (uint32_t j = 0u; j < ILP; ++j)
 		{
-			working_value[j] = initialize_working_word(key, data_start + task_base + j, lane, expansion_values);
+			const uint32_t logical = data_start + task_base + j;
+			const uint32_t data = (use_precert != 0u) ? (fixed_value | tm_deposit_bits32(logical, support_mask)) : logical;
+			working_value[j] = initialize_working_word(key, data, lane, expansion_values);
 			alive[j] = (j < valid);
 			drop_map[j] = 0xFFFFFFFFu;
 		}
@@ -1480,7 +1488,7 @@ extern "C" __global__ __launch_bounds__(256, 4) void tm_raceway_boundary_cap_sta
 	tm_raceway_boundary_cap_state_offset_ilp_body<4u>(candidate_count, data_start, work_counter, alive_out,
 		drop_map_out, stats, state, cap_tables, cap_bits, cap_ways, cap_count,
 		offset_regular_rng_values, offset_alg0_values, offset_alg6_values, offset_alg2_values, offset_alg5_values,
-		expansion_values, schedule_data, key, schedule_count, first_cap_map);
+		expansion_values, schedule_data, key, schedule_count, first_cap_map, 0u, 0xFFFFFFFFu, 0u);
 }
 
 extern "C" __global__ __launch_bounds__(256, 4) void tm_raceway_boundary_cap_state_offset_ilp5_cuda(
@@ -1494,7 +1502,7 @@ extern "C" __global__ __launch_bounds__(256, 4) void tm_raceway_boundary_cap_sta
 	tm_raceway_boundary_cap_state_offset_ilp_body<5u>(candidate_count, data_start, work_counter, alive_out,
 		drop_map_out, stats, state, cap_tables, cap_bits, cap_ways, cap_count,
 		offset_regular_rng_values, offset_alg0_values, offset_alg6_values, offset_alg2_values, offset_alg5_values,
-		expansion_values, schedule_data, key, schedule_count, first_cap_map);
+		expansion_values, schedule_data, key, schedule_count, first_cap_map, 0u, 0xFFFFFFFFu, 0u);
 }
 
 // ILP3/ILP6 close-out variants (2026-06-13): added after the span-state register bottleneck was resolved,
@@ -1511,7 +1519,7 @@ extern "C" __global__ __launch_bounds__(256, 6) void tm_raceway_boundary_cap_sta
 	tm_raceway_boundary_cap_state_offset_ilp_body<3u>(candidate_count, data_start, work_counter, alive_out,
 		drop_map_out, stats, state, cap_tables, cap_bits, cap_ways, cap_count,
 		offset_regular_rng_values, offset_alg0_values, offset_alg6_values, offset_alg2_values, offset_alg5_values,
-		expansion_values, schedule_data, key, schedule_count, first_cap_map);
+		expansion_values, schedule_data, key, schedule_count, first_cap_map, 0u, 0xFFFFFFFFu, 0u);
 }
 
 extern "C" __global__ __launch_bounds__(256, 3) void tm_raceway_boundary_cap_state_offset_ilp6_cuda(
@@ -1525,7 +1533,67 @@ extern "C" __global__ __launch_bounds__(256, 3) void tm_raceway_boundary_cap_sta
 	tm_raceway_boundary_cap_state_offset_ilp_body<6u>(candidate_count, data_start, work_counter, alive_out,
 		drop_map_out, stats, state, cap_tables, cap_bits, cap_ways, cap_count,
 		offset_regular_rng_values, offset_alg0_values, offset_alg6_values, offset_alg2_values, offset_alg5_values,
-		expansion_values, schedule_data, key, schedule_count, first_cap_map);
+		expansion_values, schedule_data, key, schedule_count, first_cap_map, 0u, 0xFFFFFFFFu, 0u);
+}
+
+extern "C" __global__ __launch_bounds__(256, 4) void tm_raceway_boundary_cap_state_offset_ilp4_precert_cuda(
+	uint32_t candidate_count, uint32_t logical_start, uint32_t* work_counter, uint8_t* alive_out,
+	uint8_t* drop_map_out, tm_raceway_stats* stats, uint32_t* state, unsigned long long** cap_tables,
+	const uint32_t* cap_bits, const uint32_t* cap_ways, uint32_t cap_count,
+	const uint8_t* offset_regular_rng_values, const uint8_t* offset_alg0_values, const uint8_t* offset_alg6_values,
+	const uint32_t* offset_alg2_values, const uint32_t* offset_alg5_values, const uint8_t* expansion_values,
+	const uint8_t* schedule_data, uint32_t key, uint32_t schedule_count, uint32_t first_cap_map,
+	uint32_t fixed_value, uint32_t support_mask)
+{
+	tm_raceway_boundary_cap_state_offset_ilp_body<4u>(candidate_count, logical_start, work_counter, alive_out,
+		drop_map_out, stats, state, cap_tables, cap_bits, cap_ways, cap_count,
+		offset_regular_rng_values, offset_alg0_values, offset_alg6_values, offset_alg2_values, offset_alg5_values,
+		expansion_values, schedule_data, key, schedule_count, first_cap_map, fixed_value, support_mask, 1u);
+}
+
+extern "C" __global__ __launch_bounds__(256, 4) void tm_raceway_boundary_cap_state_offset_ilp5_precert_cuda(
+	uint32_t candidate_count, uint32_t logical_start, uint32_t* work_counter, uint8_t* alive_out,
+	uint8_t* drop_map_out, tm_raceway_stats* stats, uint32_t* state, unsigned long long** cap_tables,
+	const uint32_t* cap_bits, const uint32_t* cap_ways, uint32_t cap_count,
+	const uint8_t* offset_regular_rng_values, const uint8_t* offset_alg0_values, const uint8_t* offset_alg6_values,
+	const uint32_t* offset_alg2_values, const uint32_t* offset_alg5_values, const uint8_t* expansion_values,
+	const uint8_t* schedule_data, uint32_t key, uint32_t schedule_count, uint32_t first_cap_map,
+	uint32_t fixed_value, uint32_t support_mask)
+{
+	tm_raceway_boundary_cap_state_offset_ilp_body<5u>(candidate_count, logical_start, work_counter, alive_out,
+		drop_map_out, stats, state, cap_tables, cap_bits, cap_ways, cap_count,
+		offset_regular_rng_values, offset_alg0_values, offset_alg6_values, offset_alg2_values, offset_alg5_values,
+		expansion_values, schedule_data, key, schedule_count, first_cap_map, fixed_value, support_mask, 1u);
+}
+
+extern "C" __global__ __launch_bounds__(256, 6) void tm_raceway_boundary_cap_state_offset_ilp3_precert_cuda(
+	uint32_t candidate_count, uint32_t logical_start, uint32_t* work_counter, uint8_t* alive_out,
+	uint8_t* drop_map_out, tm_raceway_stats* stats, uint32_t* state, unsigned long long** cap_tables,
+	const uint32_t* cap_bits, const uint32_t* cap_ways, uint32_t cap_count,
+	const uint8_t* offset_regular_rng_values, const uint8_t* offset_alg0_values, const uint8_t* offset_alg6_values,
+	const uint32_t* offset_alg2_values, const uint32_t* offset_alg5_values, const uint8_t* expansion_values,
+	const uint8_t* schedule_data, uint32_t key, uint32_t schedule_count, uint32_t first_cap_map,
+	uint32_t fixed_value, uint32_t support_mask)
+{
+	tm_raceway_boundary_cap_state_offset_ilp_body<3u>(candidate_count, logical_start, work_counter, alive_out,
+		drop_map_out, stats, state, cap_tables, cap_bits, cap_ways, cap_count,
+		offset_regular_rng_values, offset_alg0_values, offset_alg6_values, offset_alg2_values, offset_alg5_values,
+		expansion_values, schedule_data, key, schedule_count, first_cap_map, fixed_value, support_mask, 1u);
+}
+
+extern "C" __global__ __launch_bounds__(256, 3) void tm_raceway_boundary_cap_state_offset_ilp6_precert_cuda(
+	uint32_t candidate_count, uint32_t logical_start, uint32_t* work_counter, uint8_t* alive_out,
+	uint8_t* drop_map_out, tm_raceway_stats* stats, uint32_t* state, unsigned long long** cap_tables,
+	const uint32_t* cap_bits, const uint32_t* cap_ways, uint32_t cap_count,
+	const uint8_t* offset_regular_rng_values, const uint8_t* offset_alg0_values, const uint8_t* offset_alg6_values,
+	const uint32_t* offset_alg2_values, const uint32_t* offset_alg5_values, const uint8_t* expansion_values,
+	const uint8_t* schedule_data, uint32_t key, uint32_t schedule_count, uint32_t first_cap_map,
+	uint32_t fixed_value, uint32_t support_mask)
+{
+	tm_raceway_boundary_cap_state_offset_ilp_body<6u>(candidate_count, logical_start, work_counter, alive_out,
+		drop_map_out, stats, state, cap_tables, cap_bits, cap_ways, cap_count,
+		offset_regular_rng_values, offset_alg0_values, offset_alg6_values, offset_alg2_values, offset_alg5_values,
+		expansion_values, schedule_data, key, schedule_count, first_cap_map, fixed_value, support_mask, 1u);
 }
 
 template<uint32_t ILP>

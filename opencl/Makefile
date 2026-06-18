@@ -24,7 +24,8 @@ INCLUDES  = -I$(OPENCL_HEADERS) -I$(SRC_DIR)
 LDFLAGS   = $(OPENCL_LIB)
 
 TARGET    = tm_opencl_forward
-SRCS      = $(SRC_DIR)/main.cpp $(SRC_DIR)/key_schedule.cpp $(SRC_DIR)/rng.cpp
+SRCS      = $(SRC_DIR)/main.cpp $(SRC_DIR)/key_schedule.cpp $(SRC_DIR)/rng.cpp \
+            $(SRC_DIR)/rng_obj.cpp $(SRC_DIR)/alignment2.cpp
 OBJS      = $(notdir $(SRCS:.cpp=.o))
 
 all: $(TARGET)
@@ -34,6 +35,8 @@ $(TARGET): $(OBJS)
 
 %.o: $(SRC_DIR)/%.cpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c -o $@ $<
+
+main.o: $(SRC_DIR)/map1_certifier.h $(SRC_DIR)/rng_obj.h $(SRC_DIR)/alignment2.h
 
 clean:
 	rm -f $(TARGET) $(OBJS)

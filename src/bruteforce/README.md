@@ -48,31 +48,42 @@ build (AVX-512 natmap / AVX2 legacy) and a host-appropriate wave/cap:
 
 ```sh
 cd src/bruteforce/cpu_raceway && ./raceway_autoconfig.sh --build
-PRODUCER_CAP=1 PCAP_BITS=24 ./cpu_raceway <key> 0 <threads>
+./cpu_raceway <key> 0 <threads>        # 0 = full 2^32 window (needs PRODUCER_CAP=1)
 ```
 
-The tools below (`bench_cpu`, `state_dedup_*_bench`) are **research / characterization**
-harnesses (throughput, dedup-collapse, parity), not the production search path:
+### Thread scaling
+
+Raceway throughput vs thread count, AVX-512 build on a Ryzen 9 9900X (12 physical
+cores / 24 SMT), W16M, cap-on, harmonic mean across the closer/mid/diffuse key
+classes:
+
+| Threads | Raceway throughput (HM) | vs 1 thread |
+|---|---:|---:|
+| 1                | 2.43 M/s  | 1.0×  |
+| 8                | 15.3 M/s  | 6.3×  |
+| 12 (all physical)| 21.1 M/s  | 8.7×  |
+| 24 (SMT on)      | 27.5 M/s  | 11.3× |
+
+≈72% multi-core efficiency out to all 12 physical cores; SMT (12→24 threads) adds
+a further ~30%. Per-thread throughput tapers at high counts from shared-L3
+pressure, so the cap (which bounds the working set) is the main lever there.
+Per-key spread at 24 threads: closer ≈114, mid ≈32, diffuse ≈14 M/s (diffuse is
+the long pole). The AVX2 build runs ≈0.7× the AVX-512 build. Use
+`raceway_autoconfig.sh` to pick the pin set and cap for a given host.
+
+The CPU raceway enables MAP1 certified-shed pre-exclusion by default. Certified
+keys scan only the logical support axis before MAP1; zero-cert keys are a
+no-op. Use `PRECERT=0` for raw contiguous-window parity tests.
+
+### Research / characterization tools
+
+`bench_cpu` (non-dedup AVX/SIMD throughput) and the `state_dedup_*_bench` family
+(flat/origin dedup + flag screening) are **baselines only** — use the raceway for
+real searches. They remain useful for kernel A-B throughput, dedup-collapse
+studies, and as the exact-screen parity reference. Examples:
 
 ```sh
-./src/bruteforce/bench_cpu/bench_cpu \
-  --impl avx2_r256_map_8 --threads 1 --workunit_size 1048576
-```
-
-Current 9900X raceway reference numbers (AVX-512 natmap, W16M, cap-on, K=5,
-best-of-3) scale from `2.43 M/s` HM at one thread to `15.26 M/s` at eight
-threads, `21.08 M/s` at all 12 physical cores, and `27.49 M/s` at 24 SMT
-threads. That is roughly 72% efficiency into the full physical-core count, then
-another ~30% from SMT. At full SMT the per-key spread is 113.79 M/s on collapse
-keys, 32.30 M/s on mid keys, and 14.41 M/s on diffuse keys.
-
-The other CPU tools here — `bench_cpu` (non-dedup AVX/SIMD throughput) and the
-`state_dedup_*_bench` family (flat/origin dedup + flag screening) — are
-**research / characterization baselines only**: use the raceway (any dedup
-architecture) for real searches. They remain useful for kernel A-B throughput,
-dedup-collapse studies, and as the exact-screen parity reference. Example:
-
-```sh
+./bench_cpu/bench_cpu --impl avx2_r256_map_8 --threads 1 --workunit_size 1048576
 ./state_dedup_screen_bench/state_dedup_screen_bench \
   --key 0x2CA5B42D --window 4096 --windows-per-key 16 --threads 4
 ```
@@ -84,15 +95,16 @@ origin tracking) are documented in each tool's `--help`.
 
 The GPU engines live in `cuda/` and `opencl/` with their own READMEs. Both run
 the **bounded-wave raceway** as the production engine (CUDA fastest on NVIDIA;
-OpenCL is the portable AMD/Intel/Apple path and reaches ~70% of CUDA on the
-same NVIDIA hardware); the flat screen / compaction paths
-are research/baseline only. Build with `make cuda` / `make opencl` from the repo
-root, then see the package README for raceway run + per-device calibration.
+OpenCL ~70% of CUDA for non-NVIDIA devices); the flat screen / compaction paths
+are research/baseline only. Supported production raceway launches enable the
+same MAP1 certified-shed pre-exclusion by default; disable with `--no-precert`.
+Build with `make cuda` / `make opencl` from the repo root, then see the package
+README for raceway run + per-device calibration.
 
 ## Notes
 
-- `docs/forward_release_candidate_20260525.md` contains the historical pre-raceway
-  screen/dedup release-candidate profiling summary.
+- `docs/forward_release_candidate_20260525.md` contains the current CPU/GPU
+  release-candidate profiling summary.
 - `docs/gpu_forward_benchmark_notes.md` contains the CUDA tuning history.
 - The public package is Makefile-first. Development-only legacy workers,
   reverse search, and CNF/SAT tooling are intentionally omitted.

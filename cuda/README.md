@@ -163,6 +163,13 @@ Full `2^32` single-key sweep (FN-safe; auto-applies the calibrated span-ILP;
             --workunit_size 4294967296 --raceway-direct-wave-continue-batch auto
 ```
 
+The raceway runs MAP1 certified-shed pre-exclusion by default where the selected
+production launch shape has a mask-aware bridge. For certified keys this reduces
+the work to the logical support axis before MAP1; for zero-cert keys it is a
+no-op. Use `--no-precert` to force the contiguous raw data sweep, or explicit
+`--precert` to require a supported certifier-aware shape. The bridge currently
+expects `--range_start 0` and a workunit divisible by `2^certified_bits`.
+
 The steps below (parity, screen/compaction benchmarks, `--calibrate`) drive the
 **research / A-B** paths — useful for validation and for a bit-exact dedup count,
 but not the production engine.
@@ -186,6 +193,10 @@ banner before drawing conclusions from a benchmark run.
 **Range bounds**: `--range_start` and `--workunit_size` accept 64-bit
 values on the host side, but the kernel is 32-bit candidate-indexed.
 `--range_start + --workunit_size` must stay within 2^32.
+
+**Precertifier**: `--precert` / `--no-precert` controls the default per-key
+MAP1 certified-shed pre-exclusion. It is enabled by default for supported
+production raceway launches and disabled with `--no-precert`.
 
 ## Layout
 
@@ -240,8 +251,8 @@ Linux: `NVreg_RestrictProfilingToAdminUsers=0` in
 ## Algorithm reference
 
 A 6502 disassembly of the unlock path and a step-by-step walkthrough of
-the algorithm are published in the consolidated repository's `docs/`
-directory. This directory focuses on the CUDA implementation;
+the algorithm are published in the consolidated repository's `wiki/` and
+`docs/` directories. This directory focuses on the CUDA implementation;
 the algorithm itself is also documented in the host `key_schedule.cpp`
 and `tm_cuda_primitives.cuh` / `tm_cuda_screen.cuh` sources.
 

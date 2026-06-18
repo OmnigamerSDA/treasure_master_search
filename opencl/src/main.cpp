@@ -13,12 +13,13 @@
 // same NDRange for seconds and would trip a GPU recovery), see wd_chunk_cands below.
 //
 // Build:    make                    (see Makefile)
-// Invoke:   ./tm_opencl_32_8_test --device <id> --key_id 0x...
+// Invoke:   ./tm_opencl_forward --device <id> --key_id 0x...
 //
 // Key flags:
 //   --map-list all|skip-car   choose ALL_MAPS or SKIP_CAR schedule variant
-//   --raceway-direct-offset   PRODUCTION bounded-wave raceway (+ --raceway-cap-bits/-ways,
-//                             --raceway-direct-wave-span-ilp, --raceway-cap-boundaries)
+//   --raceway-wave-cap-mark   PRODUCTION bounded-wave raceway (+ --raceway-cap-bits/-ways,
+//                             --raceway-cap-ilp, --raceway-cap-boundaries)
+//   --precert / --no-precert  enable/disable default MAP1 certified-shed pre-exclusion
 //   --calibrate               (research) measure screen-vs-compaction + write tm_compaction.conf
 //   --parity <N>              cross-check N candidates between screen variants
 //   --compaction-bench        on-GPU VRAM compaction architecture (research / A-B)
@@ -52,6 +53,7 @@
 
 #include "data_sizes.h"
 #include "key_schedule.h"
+#include "map1_certifier.h"
 #include "rng.h"
 
 namespace
@@ -78,6 +80,8 @@ namespace
 		uint32_t platform_index = 0u;
 		uint32_t device_index = 0u;
 		std::string output_csv_path;
+		bool precert = true;
+		bool precert_explicit = false;
 		bool use_ilp6 = false;       // Use offset-stream + ILP6 + preids screen kernel
 		uint32_t parity_count = 0u;  // Run parity vs baseline screen on N candidates and exit
 		uint32_t compaction_count = 0u;  // Run on-GPU compaction pipeline on N candidates vs ilp6 screen
@@ -261,6 +265,16 @@ namespace
 			{
 				args.output_csv_path = argv[++i];
 			}
+			else if (arg == "--precert")
+			{
+				args.precert = true;
+				args.precert_explicit = true;
+			}
+			else if (arg == "--no-precert")
+			{
+				args.precert = false;
+				args.precert_explicit = true;
+			}
 			else if (arg == "--ilp6")
 			{
 				args.use_ilp6 = true;
@@ -372,11 +386,12 @@ namespace
 					<< "  --warmup_batches <uint32>   Warm-up launches before timing (default 1)\n"
 					<< "  --platform <index>          OpenCL platform index (default 0; see `clinfo -l`)\n"
 					<< "  --device <index>            Device index within that platform (default 0)\n"
+					<< "  --precert / --no-precert    Enable/disable default MAP1 certified-shed pre-exclusion for supported raceway launches\n"
 					<< "\n"
 					<< "PRODUCTION engine = the bounded-wave raceway (best throughput AND memory, FN-safe;\n"
 					<< "~70% of the CUDA raceway, recommended for non-NVIDIA GPUs):\n"
-					<< "  --raceway-direct-offset     Run the production raceway (cap-span + wave compaction).\n"
-					<< "                              Tune with --raceway-cap-bits/-ways, --raceway-direct-wave-span-ilp,\n"
+					<< "  --raceway-wave-cap-mark     Run the production raceway (state-saving cap spans + wave compaction).\n"
+					<< "                              Tune with --raceway-cap-bits/-ways, --raceway-cap-ilp,\n"
 					<< "                              --raceway-cap-boundaries.\n"
 					<< "\n"
 					<< "Screen-kernel selection (RESEARCH / baseline + parity reference, not production):\n"
@@ -564,6 +579,89 @@ namespace
 		}
 
 		return blob;
+	}
+
+	uint32_t popcount32(uint32_t value)
+	{
+		uint32_t count = 0u;
+		while (value != 0u)
+		{
+			value &= value - 1u;
+			++count;
+		}
+		return count;
+	}
+
+	struct PrecertPlan
+	{
+		uint32_t shed_mask = 0u;
+		uint32_t support_mask = 0xFFFFFFFFu;
+		uint32_t fixed_value = 0u;
+		uint32_t bits = 0u;
+		uint64_t source_mult = 1ull;
+		uint32_t logical_window = 0u;
+		bool active = false;
+	};
+
+	PrecertPlan make_precert_plan(const Args& args, const char* path_name)
+	{
+		PrecertPlan plan;
+		plan.logical_window = args.workunit_size;
+		if (!args.precert)
+		{
+			return plan;
+		}
+
+		plan.shed_mask = tm_map1_certifier::certified_shed_mask_from_schedule_blob(
+			args.key_id, build_schedule_blob(args.key_id));
+		plan.support_mask = ~plan.shed_mask;
+		plan.bits = popcount32(plan.shed_mask);
+		plan.source_mult = 1ull << plan.bits;
+		if (plan.bits == 0u)
+		{
+			return plan;
+		}
+
+		const bool compatible =
+			args.range_start == 0u &&
+			(static_cast<uint64_t>(args.workunit_size) % plan.source_mult) == 0ull;
+		if (!compatible)
+		{
+			if (args.precert_explicit)
+			{
+				if (args.range_start != 0u)
+					throw std::runtime_error(std::string("--precert ") + path_name + " currently requires --range_start 0");
+				throw std::runtime_error(std::string("--precert ") + path_name + " requires --workunit_size divisible by 2^certified_bits");
+			}
+			return plan;
+		}
+
+		const uint64_t logical = static_cast<uint64_t>(args.workunit_size) / plan.source_mult;
+		if (logical == 0ull || logical > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()))
+		{
+			throw std::runtime_error(std::string("--precert ") + path_name + " logical support-axis window is out of range");
+		}
+		plan.logical_window = static_cast<uint32_t>(logical);
+		plan.active = true;
+		return plan;
+	}
+
+	void print_precert_plan(const PrecertPlan& plan, const Args& args)
+	{
+		if (!args.precert || (!plan.active && !args.precert_explicit))
+		{
+			return;
+		}
+		std::cout << "  precert: shed_bits=" << plan.bits
+		          << " shed_mask=0x" << std::hex << std::setw(8) << std::setfill('0') << plan.shed_mask
+		          << " support_mask=0x" << std::setw(8) << plan.support_mask
+		          << std::dec << std::setfill(' ') << "\n";
+		if (plan.active)
+		{
+			std::cout << "  precert-active: represented_window=" << args.workunit_size
+			          << " logical_window=" << plan.logical_window
+			          << " source_mult=" << plan.source_mult << "\n";
+		}
 	}
 
 	cl_mem create_read_only_buffer(cl_context context, cl_command_queue queue, const void* data, std::size_t size)
@@ -1268,8 +1366,10 @@ int main(int argc, char** argv)
 
 		if (args.raceway_wave_cap_mark)
 		{
-			const uint32_t N = args.workunit_size;
-			const uint32_t data_start = args.range_start;
+			const PrecertPlan precert_plan = make_precert_plan(args, "OpenCL wave raceway");
+			const uint32_t N = precert_plan.active ? precert_plan.logical_window : args.workunit_size;
+			const uint32_t data_start = precert_plan.active ? 0u : args.range_start;
+			const uint32_t use_precert = precert_plan.active ? 1u : 0u;
 			const std::vector<uint32_t> cap_maps_host = build_raceway_cap_maps(args);
 			if (cap_maps_host.empty())
 			{
@@ -1283,31 +1383,40 @@ int main(int argc, char** argv)
 			const std::size_t cap_slot_bytes = raceway_cap_fp64 ? sizeof(uint64_t) : sizeof(uint32_t);
 			const std::size_t cap_bytes = cap_slots * cap_slot_bytes;
 			const std::size_t cap_table_bytes = static_cast<std::size_t>(cap_slots_per_table_u64) * cap_slot_bytes;
+			const uint32_t kMaxWaveTile = 64u * 1024u * 1024u;
+			const uint64_t max_state_candidates = dev_max_alloc / (32ull * sizeof(uint32_t));
+			uint32_t wave_tile = std::min<uint32_t>(N, kMaxWaveTile);
+			if (max_state_candidates < wave_tile)
+			{
+				wave_tile = static_cast<uint32_t>(max_state_candidates);
+			}
+			if (wave_tile == 0u)
+			{
+				throw std::runtime_error("OpenCL wave raceway cannot fit even one saved-state candidate in CL_DEVICE_MAX_MEM_ALLOC_SIZE");
+			}
 
 			cl_int s_r = CL_SUCCESS;
-			cl_mem alive = clCreateBuffer(context, CL_MEM_READ_WRITE, N, nullptr, &s_r);
+			cl_mem alive = clCreateBuffer(context, CL_MEM_READ_WRITE, wave_tile, nullptr, &s_r);
 			throw_if_error(s_r, "clCreateBuffer(raceway.wave.alive)");
-			cl_mem drop_map = clCreateBuffer(context, CL_MEM_READ_WRITE, N, nullptr, &s_r);
+			cl_mem drop_map = clCreateBuffer(context, CL_MEM_READ_WRITE, wave_tile, nullptr, &s_r);
 			throw_if_error(s_r, "clCreateBuffer(raceway.wave.drop)");
-			cl_mem state = clCreateBuffer(context, CL_MEM_READ_WRITE, (size_t)N * 32u * sizeof(uint32_t), nullptr, &s_r);
+			cl_mem state = clCreateBuffer(context, CL_MEM_READ_WRITE, (size_t)wave_tile * 32u * sizeof(uint32_t), nullptr, &s_r);
 			throw_if_error(s_r, "clCreateBuffer(raceway.wave.state)");
-			cl_mem live_a = clCreateBuffer(context, CL_MEM_READ_WRITE, (size_t)N * sizeof(uint32_t), nullptr, &s_r);
+			cl_mem live_a = clCreateBuffer(context, CL_MEM_READ_WRITE, (size_t)wave_tile * sizeof(uint32_t), nullptr, &s_r);
 			throw_if_error(s_r, "clCreateBuffer(raceway.wave.live_a)");
-			cl_mem live_b = clCreateBuffer(context, CL_MEM_READ_WRITE, (size_t)N * sizeof(uint32_t), nullptr, &s_r);
+			cl_mem live_b = clCreateBuffer(context, CL_MEM_READ_WRITE, (size_t)wave_tile * sizeof(uint32_t), nullptr, &s_r);
 			throw_if_error(s_r, "clCreateBuffer(raceway.wave.live_b)");
 			cl_mem compact_counter = clCreateBuffer(context, CL_MEM_READ_WRITE, sizeof(uint32_t), nullptr, &s_r);
 			throw_if_error(s_r, "clCreateBuffer(raceway.wave.counter)");
 			cl_mem cap_table = clCreateBuffer(context, CL_MEM_READ_WRITE, cap_bytes, nullptr, &s_r);
 			throw_if_error(s_r, "clCreateBuffer(raceway.wave.cap_table)");
-			cl_mem continue_flags = clCreateBuffer(context, CL_MEM_READ_WRITE, N, nullptr, &s_r);
+			cl_mem continue_flags = clCreateBuffer(context, CL_MEM_READ_WRITE, wave_tile, nullptr, &s_r);
 			throw_if_error(s_r, "clCreateBuffer(raceway.wave.continue_flags)");
 
 			const uint8_t zero_u8 = 0u;
 			const uint8_t ff_u8 = 0xFFu;
 			const uint32_t zero_u32 = 0u;
 			const uint64_t zero_u64 = 0u;
-			throw_if_error(clEnqueueFillBuffer(queue, alive, &zero_u8, sizeof(zero_u8), 0, N, 0, nullptr, nullptr), "raceway.wave.fill(alive)");
-			throw_if_error(clEnqueueFillBuffer(queue, drop_map, &ff_u8, sizeof(ff_u8), 0, N, 0, nullptr, nullptr), "raceway.wave.fill(drop)");
 			if (raceway_cap_fp64)
 				throw_if_error(clEnqueueFillBuffer(queue, cap_table, &zero_u64, sizeof(zero_u64), 0, cap_bytes, 0, nullptr, nullptr), "raceway.wave.fill(cap64)");
 			else
@@ -1344,9 +1453,16 @@ int main(int argc, char** argv)
 			double compact_ms_total = 0.0;
 			double continue_ms_total = 0.0;
 			uint64_t estimated_map_evals = 0;
-			std::vector<uint32_t> boundary_inputs(effective_cap_count, 0u);
-			std::vector<uint32_t> boundary_survivors(effective_cap_count, 0u);
+			uint64_t total_survivors = 0u;
+			uint32_t batches = 0u;
+			std::vector<uint64_t> boundary_inputs(effective_cap_count, 0u);
+			std::vector<uint64_t> boundary_survivors(effective_cap_count, 0u);
 
+			auto run_wave_chunk = [&](uint32_t chunk_data_start, uint32_t chunk_n) {
+			const uint32_t data_start = chunk_data_start;
+			const uint32_t N = chunk_n;
+			throw_if_error(clEnqueueFillBuffer(queue, alive, &zero_u8, sizeof(zero_u8), 0, N, 0, nullptr, nullptr), "raceway.wave.fill(alive)");
+			throw_if_error(clEnqueueFillBuffer(queue, drop_map, &ff_u8, sizeof(ff_u8), 0, N, 0, nullptr, nullptr), "raceway.wave.fill(drop)");
 			throw_if_error(clSetKernelArg(raceway_wave_first_kernel, 0, sizeof(alive), &alive), "wave.first.alive");
 			throw_if_error(clSetKernelArg(raceway_wave_first_kernel, 1, sizeof(drop_map), &drop_map), "wave.first.drop");
 			throw_if_error(clSetKernelArg(raceway_wave_first_kernel, 2, sizeof(state), &state), "wave.first.state");
@@ -1367,6 +1483,9 @@ int main(int argc, char** argv)
 			throw_if_error(clSetKernelArg(raceway_wave_first_kernel, 16, sizeof(N), &N), "wave.first.N");
 			uint32_t end_map = cap_maps_host[0];
 			throw_if_error(clSetKernelArg(raceway_wave_first_kernel, 17, sizeof(end_map), &end_map), "wave.first.end");
+			throw_if_error(clSetKernelArg(raceway_wave_first_kernel, 18, sizeof(precert_plan.fixed_value), &precert_plan.fixed_value), "wave.first.precert.fixed");
+			throw_if_error(clSetKernelArg(raceway_wave_first_kernel, 19, sizeof(precert_plan.support_mask), &precert_plan.support_mask), "wave.first.precert.support");
+			throw_if_error(clSetKernelArg(raceway_wave_first_kernel, 20, sizeof(use_precert), &use_precert), "wave.first.precert.use");
 			const size_t first_global[3] = { 32u, (static_cast<size_t>(N) + args.raceway_cap_ilp - 1u) / args.raceway_cap_ilp, 1u };
 			const auto f0 = std::chrono::high_resolution_clock::now();
 			throw_if_error(clEnqueueNDRangeKernel(queue, raceway_wave_first_kernel, 3, nullptr, first_global, local3, 0, nullptr, nullptr), "wave.first.enqueue");
@@ -1374,11 +1493,11 @@ int main(int argc, char** argv)
 			const auto f1 = std::chrono::high_resolution_clock::now();
 			span_ms_total += std::chrono::duration<double, std::milli>(f1 - f0).count();
 			estimated_map_evals += static_cast<uint64_t>(N) * static_cast<uint64_t>(end_map + 1u);
-			boundary_inputs[0] = N;
+			boundary_inputs[0] += N;
 			auto compact0 = compact_alive(nullptr, N, live_a, 1);
 			uint32_t cur_count = compact0.first;
 			compact_ms_total += compact0.second;
-			boundary_survivors[0] = cur_count;
+			boundary_survivors[0] += cur_count;
 			cl_mem cur_live = live_a;
 			cl_mem next_live = live_b;
 			uint32_t prev_boundary = end_map;
@@ -1387,7 +1506,7 @@ int main(int argc, char** argv)
 			{
 				uint32_t start_map = prev_boundary + 1u;
 				end_map = cap_maps_host[bi];
-				boundary_inputs[bi] = cur_count;
+				boundary_inputs[bi] += cur_count;
 				estimated_map_evals += static_cast<uint64_t>(cur_count) * static_cast<uint64_t>(end_map - start_map + 1u);
 				throw_if_error(clSetKernelArg(raceway_wave_span_kernel, 0, sizeof(cur_live), &cur_live), "wave.span.live");
 				throw_if_error(clSetKernelArg(raceway_wave_span_kernel, 1, sizeof(cur_count), &cur_count), "wave.span.count");
@@ -1416,7 +1535,7 @@ int main(int argc, char** argv)
 				auto compacted = compact_alive(cur_live, cur_count, next_live, 0);
 				cur_count = compacted.first;
 				compact_ms_total += compacted.second;
-				boundary_survivors[bi] = cur_count;
+				boundary_survivors[bi] += cur_count;
 				std::swap(cur_live, next_live);
 				prev_boundary = end_map;
 			}
@@ -1456,6 +1575,16 @@ int main(int argc, char** argv)
 				const auto c1 = std::chrono::high_resolution_clock::now();
 				continue_ms_total += std::chrono::duration<double, std::milli>(c1 - c0).count();
 			}
+			total_survivors += cur_count;
+			++batches;
+			};
+
+			for (uint32_t done = 0u; done < N; )
+			{
+				const uint32_t chunk_n = std::min<uint32_t>(wave_tile, N - done);
+				run_wave_chunk(data_start + done, chunk_n);
+				done += chunk_n;
+			}
 
 			const double pipeline_ms = span_ms_total + compact_ms_total + continue_ms_total;
 			std::ostringstream boundary_list;
@@ -1467,7 +1596,10 @@ int main(int argc, char** argv)
 			std::cout << "OpenCL raceway wave-cap mark: " << N << " candidates, key=0x"
 			          << std::hex << std::setw(8) << std::setfill('0') << args.key_id
 			          << std::dec << std::setfill(' ') << "\n";
+			print_precert_plan(precert_plan, args);
 			std::cout << "  boundaries    : " << boundary_list.str()
+			          << "  tile=" << wave_tile
+			          << " batches=" << batches
 			          << "  cap: 2^" << args.raceway_cap_bits << " x " << args.raceway_cap_ways
 			          << " x " << effective_cap_count
 			          << " (" << std::fixed << std::setprecision(1)
@@ -1478,11 +1610,18 @@ int main(int argc, char** argv)
 			          << " ms continue=" << continue_ms_total
 			          << " ms pipeline=" << pipeline_ms << " ms  ("
 			          << std::setprecision(1) << (static_cast<double>(N) / 1.0e6 / (pipeline_ms / 1000.0))
-			          << " M input/s)\n";
+			          << " M logical input/s";
+			if (precert_plan.active)
+			{
+				std::cout << ", " << std::setprecision(1)
+				          << (static_cast<double>(args.workunit_size) / 1.0e6 / (pipeline_ms / 1000.0))
+				          << " M represented input/s";
+			}
+			std::cout << ")\n";
 			std::cout << "  cap-span only : " << std::fixed << std::setprecision(3) << span_ms_total << " ms   "
 			          << std::fixed << std::setprecision(0) << (static_cast<double>(N) / (span_ms_total / 1000.0)) << " c/s\n";
-			std::cout << "  survivors     : " << cur_count
-			          << " dropped=" << (static_cast<uint64_t>(N) - cur_count)
+			std::cout << "  survivors     : " << total_survivors
+			          << " dropped=" << (static_cast<uint64_t>(N) - total_survivors)
 			          << " map_evals=" << estimated_map_evals << "\n";
 			std::cout << "  boundary      :";
 			for (std::size_t i = 0; i < cap_maps_host.size(); i++)
@@ -1526,8 +1665,10 @@ int main(int argc, char** argv)
 		// screen+materialize workflow.
 		if (args.raceway_cap_mark)
 		{
-			const uint32_t N = args.workunit_size;
-			const uint32_t data_start = args.range_start;
+			const PrecertPlan precert_plan = make_precert_plan(args, "OpenCL raceway cap-mark");
+			const uint32_t N = precert_plan.active ? precert_plan.logical_window : args.workunit_size;
+			const uint32_t data_start = precert_plan.active ? 0u : args.range_start;
+			const uint32_t use_precert = precert_plan.active ? 1u : 0u;
 			const std::vector<uint32_t> cap_maps_host = build_raceway_cap_maps(args);
 			const uint32_t effective_cap_count = static_cast<uint32_t>(cap_maps_host.size());
 			const uint32_t cap_table_count = effective_cap_count == 0u ? 1u : effective_cap_count;
@@ -1583,6 +1724,9 @@ int main(int argc, char** argv)
 			throw_if_error(clSetKernelArg(raceway_cap_mark_kernel, 18, sizeof(work_counter), &work_counter), "raceway.work_counter");
 			const uint32_t persistent_flag = args.raceway_persistent ? 1u : 0u;
 			throw_if_error(clSetKernelArg(raceway_cap_mark_kernel, 19, sizeof(persistent_flag), &persistent_flag), "raceway.persistent");
+			throw_if_error(clSetKernelArg(raceway_cap_mark_kernel, 20, sizeof(precert_plan.fixed_value), &precert_plan.fixed_value), "raceway.precert.fixed");
+			throw_if_error(clSetKernelArg(raceway_cap_mark_kernel, 21, sizeof(precert_plan.support_mask), &precert_plan.support_mask), "raceway.precert.support");
+			throw_if_error(clSetKernelArg(raceway_cap_mark_kernel, 22, sizeof(use_precert), &use_precert), "raceway.precert.use");
 
 			const size_t span_count = (static_cast<size_t>(N) + args.raceway_cap_ilp - 1u) / args.raceway_cap_ilp;
 			size_t wg_count = span_count;
@@ -1692,12 +1836,13 @@ int main(int argc, char** argv)
 			std::cout << "OpenCL raceway boundary-cap mark: " << N << " candidates, key=0x"
 			          << std::hex << std::setw(8) << std::setfill('0') << args.key_id
 			          << std::dec << std::setfill(' ') << "\n";
+			print_precert_plan(precert_plan, args);
 			std::cout << "  cuda_equiv    : ./test_cuda --device <n> --key_id 0x"
 			          << std::hex << std::setw(8) << std::setfill('0') << args.key_id
 			          << std::dec << std::setfill(' ')
 			          << " --workunit_size " << N
-			          << " --raceway-direct-cap-mark --raceway-direct-offset"
-			          << " --raceway-direct-wave-span-ilp " << args.raceway_cap_ilp
+			          << " --raceway-cap-mark"
+			          << " --raceway-cap-ilp " << args.raceway_cap_ilp
 			          << " --raceway-cap-bits " << args.raceway_cap_bits
 			          << " --raceway-cap-ways " << args.raceway_cap_ways
 			          << " --raceway-first-cap-map " << args.raceway_first_cap_map
@@ -1717,7 +1862,14 @@ int main(int argc, char** argv)
 			          << " min/mean/max=" << std::fixed << std::setprecision(3)
 			          << raceway_min_ms << "/" << raceway_mean_ms << "/" << raceway_max_ms << " ms\n";
 			std::cout << "  mark kernel   : " << std::fixed << std::setprecision(3) << raceway_min_ms << " ms   "
-			          << std::fixed << std::setprecision(0) << raceway_cps << " c/s\n";
+			          << std::fixed << std::setprecision(0) << raceway_cps << " logical c/s";
+			if (precert_plan.active)
+			{
+				std::cout << "  represented="
+				          << std::fixed << std::setprecision(0)
+				          << (static_cast<double>(args.workunit_size) / (raceway_min_ms / 1000.0)) << " c/s";
+			}
+			std::cout << "\n";
 			std::cout << "  alive/dropped : " << alive_count << " / " << dropped_count << "\n";
 			std::cout << "  est work      : map_evals=" << estimated_map_evals
 			          << " (" << std::fixed << std::setprecision(1) << (map_rate / 1.0e6) << " M/s)"
