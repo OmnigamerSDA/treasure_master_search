@@ -3,7 +3,7 @@
 > Snapshot of the public-release subset. The dev branch is more current;
 > this file is updated each public sync.
 
-**Last public sync:** raceway precert-default refresh, 2026-06-18
+**Last public sync:** operator + FPGA + offset-prefetch/daemon refresh, 2026-07-10
 
 ## Where this sits
 
@@ -11,9 +11,10 @@ Treasure Master Bonus World 2 has never been unlocked. The 24-character
 password decodes to an 8-byte (key, data) pair; the key is injective in
 2^32, and the data axis collapses heavily, so key recovery is sufficient.
 This public repository is scoped to the actively maintained forward-search
-implementations: CPU SIMD/state-dedup, CUDA, and OpenCL. Reverse constraint
-propagation, CNF/SAT tooling, daily research notes, and legacy worker
-packages remain in the development repo.
+implementations — CPU SIMD/state-dedup, CUDA, OpenCL, and an FPGA (VHDL) map/screen
+engine — plus the durable cert-tier **operator** that clears a keyspace tier by tier.
+Reverse constraint propagation, CNF/SAT tooling, daily research notes, and legacy
+BOINC/worker packages remain in the development repo.
 
 ## What is public
 
@@ -22,6 +23,8 @@ packages remain in the development repo.
 | Forward CPU      | **Bounded-wave raceway (production)** + AVX/SIMD screen baseline        |
 | Forward CUDA     | **Raceway (production)**, per-device `--calibrate-raceway`; screen baseline |
 | Forward OpenCL   | **Raceway (production)**, ~64% of CUDA on same-GPU default-precert HM; screen baseline |
+| Forward FPGA     | VHDL map/RNG/screen engines + self-checking testbenches + OOC synth scripts (`src/fpga/`) |
+| Operator         | Durable cert-tier queue/runner (`scripts/cert_tier_ops.py`): background verify, event-driven reap, optional persistent-worker `--daemon`; ships with a runnable cert16 sample DB |
 
 The **bounded-wave raceway** is the production engine on every backend (best
 across throughput AND memory; FN-safe). The flat checksum screen and
@@ -73,8 +76,22 @@ only for an exact dedup count or A-B validation.
 - Forward CUDA: `cd cuda && make all`  (raceway + research paths)
 - Forward OpenCL: `cd opencl && make all`  (raceway + research paths)
 - Research CPU baselines: `make cpu` (bench) / `make cpu-dedup` (dedup benches)
+- Operator CPU receiver: `make receiver` (builds `inspect_bonus2_survivors`)
+- FPGA: VHDL sources under `src/fpga/` (simulate the self-checking testbenches with GHDL;
+  out-of-context synthesis scripts for Vivado/Quartus under `src/fpga/syn/`)
 
-See each subdirectory's Makefile.
+See each subdirectory's Makefile, and `src/fpga/README.md` for the FPGA flow.
+
+## Operator (clearing a keyspace)
+
+`scripts/cert_tier_ops.py` clears a key/data space **tier by tier** with a durable
+SQLite queue: lease → run one worker per GPU → checkpoint → CPU-verify survivors →
+record alerts. Verification overlaps the next batch's compute, batch relaunch is
+event-driven, and `--daemon` keeps a resident worker per device for the big tiers.
+Per-tier wave geometry is operator-supplied (`--raceway-*` flags or a
+`cert_tier_geometry_override.py` hook). A ready-to-run 64-key **cert16 sample**
+(`examples/cert16_sample/`) validates a fresh build end to end. See the repo README's
+"Clearing a keyspace (the operator)" section.
 
 ## Foundational docs
 

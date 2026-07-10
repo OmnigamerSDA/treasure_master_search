@@ -49,7 +49,15 @@
 #include <set>
 #include <string>
 #include <algorithm>
+#include <cctype>
+#include <condition_variable>
+#include <deque>
+#include <exception>
 #include <functional>
+#include <future>
+#include <limits>
+#include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -67,9 +75,20 @@ extern "C" int wms_sort_dedup_mult(const uint64_t* h_fps, const uint32_t* h_idx_
 #include "key_schedule.h"
 #include "window_policy.h"
 #include "map1_certifier.h"
+#include "tm_offset_stream.h"
+#include "tm_raceway_worker_cache.h"
+#include "tm_raceway_offset_prefetch.h"
 
 namespace
 {
+	// Per-key offset-stream builders (OffsetStreamBlob, build_offset_stream_blob*) live in
+	// tm_offset_stream.h; the persistent-worker device-allocation cache in tm_raceway_worker_cache.h;
+	// the offset-stream staging/prefetch resources (RacewayOffsetStaging) + the per-key prepared-blob
+	// struct (RacewayWorkerPrepared) in tm_raceway_offset_prefetch.h. Pull all in unqualified so
+	// existing call sites are unchanged.
+	using namespace tm_offset;
+	using namespace tm_raceway;
+
 	static const uint32_t kDefaultBatchSize = 1u << 20;
 	static const uint32_t kCudaWarpSize = 32u;
 	static const uint32_t kCudaWarpsPerBlock = 4u;
@@ -275,6 +294,18 @@ namespace
 		uint32_t compaction_global_cap_mb = 0u; // window-cap: max VRAM (MB) for the span-0 global table; 0 = auto (2x tile)
 		bool compaction_multiplicity = false; // carry per-original representative multiplicity through whole-tile dedup
 		std::string sweep_hit_file;         // --sweep-hit-file PATH: write every hitting (data,flag) across the 2^32 sweep
+		std::string raceway_hit_file;       // --raceway-hit-file PATH: write representative raceway hitting (data,flag) rows
+		std::string raceway_hit_dir;        // --raceway-hit-dir DIR: per-key representative raceway hit files
+		std::string raceway_key_file;       // --raceway-key-file PATH: persistent raceway worker key list
+		bool raceway_daemon = false;        // --raceway-daemon: after each key-file, read the next key-file path from stdin and process it in-process (reuse CUDA ctx/module/RNG/buffers); emit DAEMON_DONE per file. Eliminates per-batch ~420ms cuInit.
+		std::string raceway_worker_summary; // --raceway-worker-summary PATH: persistent worker TSV summary
+		uint32_t raceway_key_limit = 0u;    // --raceway-key-limit N: cap key-file rows for smoke runs
+		uint32_t raceway_key_batch_size = 1u; // --raceway-key-batch-size N: reuse worker device allocations across N compatible keys
+		bool raceway_key_batch_size_explicit = false; // set when --raceway-key-batch-size is given; else persistent worker defaults to whole-shard reuse
+		bool raceway_overlap_setup = true;  // persistent raceway worker: prepare next key's schedule/offset blob on a background thread while the GPU runs (BFS-parity); --no-raceway-overlap-setup disables
+		bool raceway_prefetch_offset = true; // persistent raceway worker: double-buffer the per-key offset-stream HtoD, issuing the NEXT key's async upload on a copy stream during THIS key's compute so it is fully hidden; --no-raceway-prefetch-offset disables (falls back to the synchronous per-key upload)
+		bool raceway_key_fast = false;      // --raceway-key-fast: persistent worker low-overhead summary mode
+		std::string worker_stop_file;       // --worker-stop-file PATH: persistent workers stop after current key when file appears
 		uint32_t sweep_hit_print = 64u;     // --sweep-hit-print N: inline-print the first N hits (0 = summary counts only)
 		// ── Compression study (2026-06-18): per-key true output-cardinality (HLL) +
 		// unique-flag dedup (gather fp128 over the rare hit list) + small-tile sampling
@@ -310,6 +341,15 @@ namespace
 			uint32_t wide_merge_first_maps = 1u; // merge point (1 or 2); biggest collapse at 0-1
 				std::string wide_merge_points;       // periodic multi-merge schedule, e.g. "1,4,13,27"
 				bool map1_frontier = false;          // W4B prototype: persistent MAP1 representative hash set
+				std::string map1_frontier_key_file;  // --map1-frontier-key-file PATH: persistent BFS worker key list
+				std::string map1_frontier_worker_summary; // --map1-frontier-worker-summary PATH
+				std::string map1_frontier_hit_dir;   // --map1-frontier-hit-dir DIR
+				std::string map1_frontier_hit_file;  // --map1-frontier-hit-file PATH: one buffered hit stream for the worker
+				std::string map1_frontier_verified_file; // --map1-frontier-verified-file PATH: CSV of online-verified plausible bonus2 rows
+				uint32_t map1_frontier_verify_batch = 65536u; // retained CLI compatibility; CPU verifier now consumes emitted hit states
+				bool map1_frontier_verify_final_rts = false; // require other-world final RTS in verified CSV
+				uint32_t map1_frontier_key_limit = 0u; // --map1-frontier-key-limit N
+				bool map1_frontier_overlap_setup = false; // --map1-frontier-overlap-setup: prepare next key's offset stream while GPU runs current key
 				bool map1_frontier_axis_sweep = false; // full 2^32 as independent workunit_size MAP-K windows
 				bool map1_frontier_mobile_bit_sweep = false; // 32M windows as two 16M slices, mobile high-byte bit
 				bool map1_frontier_backfill_sweep = false; // arbitrary build-from-byte-back selected-bit windows
@@ -327,6 +367,9 @@ namespace
 				uint32_t raceway_first_cap_map = 1u; // 1 => first probe after MAP2 completes
 				bool raceway_flag_parity = false;    // no-cap raceway flags vs existing offset consumer
 				bool raceway_drop_hist = false;      // copy drop_map_out and print per-boundary drops
+				bool raceway_host_breakdown = false; // diagnostic: per-key cap-occupancy scan + [raceway-host] phase line
+				bool raceway_async_cadence = false;  // device-driven cadence: counts on-device, fixed grids, no per-span DtoH/sync
+				bool raceway_fused_tail = false;     // fused-tail megakernel: maps [3..26] in registers, inline tail caps (requires async cadence)
 				bool raceway_flat_parity = false;    // no-cap raceway reps vs full-window flat screener
 				bool raceway_direct = false;         // full-window raceway: MAP1 calculation inline, no MAP1 dedup
 				bool raceway_direct_flat_parity = false; // direct raceway flags vs full-window flat screener
@@ -343,6 +386,7 @@ namespace
 				uint32_t raceway_direct_wave_continue_ilp = 0u; // 0=auto: ILP4 state continuation, ILP6 recompute continuation
 				uint32_t raceway_direct_wave_span_ilp = 4u; // cap-span/mark phase ILP: 4 = operational default (ILP4, +35% over ILP1, full occupancy); 1/5 also valid
 				bool raceway_span_ilp_explicit = false; // true if --raceway-direct-wave-span-ilp was passed (overrides the calibrated geom)
+				bool raceway_direct_wave_flags = false; // capture continuation flags without running flat parity
 				bool raceway_direct_wave_parity = false; // alive-only flat parity for bounded wave continuation
 				bool raceway_direct_wave_state = false; // bounded wave continuation reads saved boundary state
 				bool raceway_direct_wave_k_sweep = false; // sweep f1k-style completed-map drain cadences
@@ -538,6 +582,14 @@ namespace
 	uint32_t make_frontier_policy_bit_mask(const std::string& policy, uint32_t selected_bit_count, uint32_t map_depth)
 	{
 		return tm_window_policy::make_bit_mask(policy, selected_bit_count, map_depth);
+	}
+
+	bool worker_stop_requested(const std::string& path)
+	{
+		if (path.empty())
+			return false;
+		std::ifstream in(path);
+		return in.good();
 	}
 
 	Args parse_args(int argc, char** argv)
@@ -847,6 +899,61 @@ namespace
 			{
 				args.sweep_hit_file = argv[++i];
 			}
+			else if (arg == "--raceway-hit-file" && i + 1 < argc)
+			{
+				args.raceway_hit_file = argv[++i];
+			}
+			else if (arg == "--raceway-hit-dir" && i + 1 < argc)
+			{
+				args.raceway_hit_dir = argv[++i];
+			}
+			else if (arg == "--raceway-daemon")
+			{
+				args.raceway_daemon = true;
+			}
+			else if (arg == "--raceway-key-file" && i + 1 < argc)
+			{
+				args.raceway_key_file = argv[++i];
+			}
+			else if (arg == "--raceway-worker-summary" && i + 1 < argc)
+			{
+				args.raceway_worker_summary = argv[++i];
+			}
+			else if (arg == "--raceway-key-limit" && i + 1 < argc)
+			{
+				args.raceway_key_limit = numeric_arg<uint32_t>(argv[++i], "--raceway-key-limit");
+			}
+			else if (arg == "--raceway-key-batch-size" && i + 1 < argc)
+			{
+				args.raceway_key_batch_size = numeric_arg<uint32_t>(argv[++i], "--raceway-key-batch-size");
+				if (args.raceway_key_batch_size == 0u)
+					throw std::runtime_error("--raceway-key-batch-size must be > 0");
+				args.raceway_key_batch_size_explicit = true;
+			}
+			else if (arg == "--raceway-overlap-setup")
+			{
+				args.raceway_overlap_setup = true;
+			}
+			else if (arg == "--no-raceway-overlap-setup")
+			{
+				args.raceway_overlap_setup = false;
+			}
+			else if (arg == "--raceway-prefetch-offset")
+			{
+				args.raceway_prefetch_offset = true;
+			}
+			else if (arg == "--no-raceway-prefetch-offset")
+			{
+				args.raceway_prefetch_offset = false;
+			}
+			else if (arg == "--raceway-key-fast")
+			{
+				args.raceway_key_fast = true;
+			}
+			else if (arg == "--worker-stop-file" && i + 1 < argc)
+			{
+				args.worker_stop_file = argv[++i];
+			}
 			else if (arg == "--sweep-hit-print" && i + 1 < argc)  // inline-print the first N hits (0 = counts only)
 			{
 				args.sweep_hit_print = numeric_arg<uint32_t>(argv[++i], "--sweep-hit-print");
@@ -994,6 +1101,53 @@ namespace
 				else if (arg == "--map1-frontier")
 				{
 					args.map1_frontier = true;
+				}
+				else if (arg == "--map1-frontier-key-file" && i + 1 < argc)
+				{
+					args.map1_frontier = true;
+					args.map1_frontier_key_file = argv[++i];
+				}
+				else if (arg == "--map1-frontier-worker-summary" && i + 1 < argc)
+				{
+					args.map1_frontier = true;
+					args.map1_frontier_worker_summary = argv[++i];
+				}
+				else if (arg == "--map1-frontier-hit-dir" && i + 1 < argc)
+				{
+					args.map1_frontier = true;
+					args.map1_frontier_hit_dir = argv[++i];
+				}
+				else if (arg == "--map1-frontier-hit-file" && i + 1 < argc)
+				{
+					args.map1_frontier = true;
+					args.map1_frontier_hit_file = argv[++i];
+				}
+				else if (arg == "--map1-frontier-verified-file" && i + 1 < argc)
+				{
+					args.map1_frontier = true;
+					args.map1_frontier_verified_file = argv[++i];
+				}
+				else if (arg == "--map1-frontier-verify-batch" && i + 1 < argc)
+				{
+					args.map1_frontier = true;
+					args.map1_frontier_verify_batch = numeric_arg<uint32_t>(argv[++i], "--map1-frontier-verify-batch");
+					if (args.map1_frontier_verify_batch == 0u)
+						throw std::runtime_error("--map1-frontier-verify-batch must be > 0");
+				}
+				else if (arg == "--map1-frontier-verify-final-rts")
+				{
+					args.map1_frontier = true;
+					args.map1_frontier_verify_final_rts = true;
+				}
+				else if (arg == "--map1-frontier-key-limit" && i + 1 < argc)
+				{
+					args.map1_frontier = true;
+					args.map1_frontier_key_limit = numeric_arg<uint32_t>(argv[++i], "--map1-frontier-key-limit");
+				}
+				else if (arg == "--map1-frontier-overlap-setup")
+				{
+					args.map1_frontier = true;
+					args.map1_frontier_overlap_setup = true;
 				}
 					else if (arg == "--map1-frontier-axis-sweep")
 					{
@@ -1160,6 +1314,19 @@ namespace
 					args.map1_frontier_raceway = true;
 					args.raceway_drop_hist = true;
 				}
+				else if (arg == "--raceway-host-breakdown")
+				{
+					args.raceway_host_breakdown = true;
+				}
+				else if (arg == "--raceway-async-cadence")
+				{
+					args.raceway_async_cadence = true;
+				}
+				else if (arg == "--raceway-fused-tail")
+				{
+					args.raceway_fused_tail = true;
+					args.raceway_async_cadence = true;
+				}
 				else if (arg == "--raceway-flat-parity")
 				{
 					args.map1_frontier = true;
@@ -1235,6 +1402,11 @@ namespace
 				else if (arg == "--raceway-direct-wave-parity")
 				{
 					args.raceway_direct_wave_parity = true;
+					args.raceway_direct_wave_flags = true;
+				}
+				else if (arg == "--raceway-direct-wave-flags")
+				{
+					args.raceway_direct_wave_flags = true;
 				}
 				else if (arg == "--raceway-direct-wave-state")
 				{
@@ -1367,8 +1539,6 @@ namespace
 				else if (arg == "--map1-frontier-deep-k" && i + 1 < argc)
 				{
 					args.map1_frontier = true;
-					args.map1_frontier_consume = true;
-					args.map1_frontier_deep = true;
 					args.map1_frontier_deep_k = numeric_arg<uint32_t>(argv[++i], "--map1-frontier-deep-k");
 				}
 				else if (arg == "--map1-frontier-stream-cuts" && i + 1 < argc)
@@ -1540,6 +1710,28 @@ namespace
 						<< "  --compaction-global-cap M  Window-cap: max MB for the span-0 global table (0 = auto, 2x tile)\n"
 						<< "  --compaction-multiplicity  Carry uint32 representative multiplicity in whole-tile compaction\n"
 							<< "  --sweep-hit-file PATH      Hit-finder: write every hitting (data,flag) across the 2^32 sweep to PATH\n"
+							<< "  --raceway-hit-file PATH    Raceway parity: write representative hitting (data,flag) rows to PATH\n"
+							<< "  --raceway-hit-dir DIR      Persistent raceway: write per-key representative hit files under DIR\n"
+							<< "  --raceway-key-file PATH    Persistent raceway worker: read keys from TSV/text or little-endian bin32\n"
+							<< "  --raceway-worker-summary PATH  Persistent raceway worker TSV summary\n"
+							<< "  --raceway-key-limit N      Persistent raceway worker: stop after N keys from --raceway-key-file\n"
+							<< "  --raceway-key-batch-size N Persistent raceway worker: reuse CUDA allocations across N compatible keys (default: whole-shard reuse)\n"
+							<< "  --no-raceway-overlap-setup Persistent raceway worker: disable background prep of the next key's schedule/offset blob (on by default)\n"
+							<< "  --no-raceway-prefetch-offset Persistent raceway worker: disable double-buffered async prefetch of the per-key offset-stream upload (on by default; falls back to synchronous per-key HtoD)\n"
+							<< "  --raceway-key-fast         Persistent raceway worker: low-overhead summary, skip detailed pressure timing\n"
+							<< "  --raceway-daemon           Persistent worker DAEMON: after each key-file, read the next 'keyfile[TAB summary TAB hitdir]' from\n"
+							<< "                             stdin and process it in-process (reuse CUDA ctx/module/RNG/buffers); emit 'DAEMON_DONE' per file,\n"
+							<< "                             'STOP' or EOF exits. Eliminates the ~0.5s/batch startup. Driven by cert_tier_ops.py run --daemon\n"
+							<< "  --worker-stop-file PATH    Persistent workers: stop after current key when PATH appears\n"
+							<< "  --map1-frontier-key-file PATH  Experimental persistent MAP1/BFS worker key list\n"
+							<< "  --map1-frontier-worker-summary PATH  Experimental MAP1/BFS worker TSV summary\n"
+							<< "  --map1-frontier-hit-dir DIR  Experimental MAP1/BFS worker representative hit files under DIR\n"
+							<< "  --map1-frontier-hit-file PATH  Experimental MAP1/BFS worker buffered representative hit stream\n"
+							<< "  --map1-frontier-verified-file PATH  Experimental MAP1/BFS worker CSV of other-world all-entry verified hits\n"
+							<< "  --map1-frontier-verify-batch N  Compatibility no-op; verifier now consumes emitted hit states\n"
+							<< "  --map1-frontier-verify-final-rts  Verified CSV also requires other-world byte 0x50 == RTS\n"
+							<< "  --map1-frontier-key-limit N  Experimental MAP1/BFS worker: stop after N keys from key file\n"
+							<< "  --map1-frontier-overlap-setup  Experimental MAP1/BFS worker: prepare next key offsets while GPU runs\n"
 							<< "  --sweep-hit-print N        Inline-print the first N sweep hits (default 64; 0 = summary counts only)\n"
 							<< "  --compaction-run           Operational full-key sweep: settled host-appropriate defaults (global-span0,\n"
 							<< "                             64a cross-tile drains 2,4,8,14,20, map1-table-auto) + VRAM auto-tile. Overridable.\n"
@@ -1584,6 +1776,7 @@ namespace
 								<< "  --raceway-direct-wave-continue-batch N  Bounded mark+compact+continue waves\n"
 								<< "  --raceway-direct-wave-continue-ilp N  State continuation ILP for wave mode: 4, 6, or 8 (default auto)\n"
 								<< "  --raceway-direct-wave-span-ilp N  Cap-span/mark phase ILP: {1,3,4,5,6}, default 4 (auto-calibrated by --calibrate-raceway)\n"
+								<< "  --raceway-direct-wave-flags  Capture continuation flags/hits without running flat parity\n"
 								<< "  --raceway-direct-wave-parity  Alive-only flat parity for bounded wave continuation\n"
 								<< "  --raceway-direct-wave-state  Bounded wave continuation resumes from saved boundary state\n"
 								<< "  --raceway-direct-wave-k-sweep  Sweep f1k completed-map drain cadences (default K=2..8)\n"
@@ -1910,81 +2103,9 @@ namespace
 		return mr;
 	}
 
-	struct OffsetStreamBlob
-	{
-		std::vector<uint8_t> data;
-		std::size_t stream_bytes = 0;
-		std::size_t carry_bytes = 0;
-	};
-
-	OffsetStreamBlob build_offset_stream_blob(const std::vector<uint8_t>& schedule_blob)
-	{
-		const size_t entry_count = schedule_blob.size() / 4;
-		const size_t offset_count = entry_count * 2048ull;
-		const size_t stream_bytes = offset_count * 128ull;
-		const size_t carry_bytes = offset_count * sizeof(uint32_t);
-		OffsetStreamBlob blob;
-		blob.stream_bytes = stream_bytes;
-		blob.carry_bytes = carry_bytes;
-		blob.data.resize(stream_bytes * 3ull + carry_bytes * 2ull);
-
-		uint8_t* regular_stream = blob.data.data();
-		uint8_t* alg0_stream = regular_stream + stream_bytes;
-		uint8_t* alg6_stream = alg0_stream + stream_bytes;
-		uint32_t* alg2_stream = reinterpret_cast<uint32_t*>(alg6_stream + stream_bytes);
-		uint32_t* alg5_stream = reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(alg2_stream) + carry_bytes);
-
-		for (size_t m = 0; m < entry_count; ++m)
-		{
-			uint16_t seed = (static_cast<uint16_t>(schedule_blob[m * 4 + 0]) << 8)
-			              |  static_cast<uint16_t>(schedule_blob[m * 4 + 1]);
-			for (size_t pos = 0; pos < 2048ull; ++pos)
-			{
-				const size_t stream_offset = (m * 2048ull + pos) * 128ull;
-				std::memcpy(regular_stream + stream_offset, RNG::regular_rng_values_8 + static_cast<size_t>(seed) * 128ull, 128ull);
-				std::memcpy(alg0_stream + stream_offset, RNG::alg0_values_8 + static_cast<size_t>(seed) * 128ull, 128ull);
-				std::memcpy(alg6_stream + stream_offset, RNG::alg6_values_8 + static_cast<size_t>(seed) * 128ull, 128ull);
-				const size_t carry_offset = m * 2048ull + pos;
-				alg2_stream[carry_offset] = RNG::alg2_values_32_8[seed];
-				alg5_stream[carry_offset] = RNG::alg5_values_32_8[seed];
-				seed = RNG::rng_table[seed];
-			}
-		}
-		return blob;
-	}
-
-	std::vector<uint8_t> build_offset_stream_blob_interleaved(const std::vector<uint8_t>& schedule_blob)
-	{
-		const size_t entry_count = schedule_blob.size() / 4;
-		constexpr size_t schedule_stream_bytes = 2048ull * 128ull;
-		constexpr size_t schedule_carry_bytes = 2048ull * sizeof(uint32_t);
-		constexpr size_t schedule_bytes = schedule_stream_bytes * 3ull + schedule_carry_bytes * 2ull;
-		std::vector<uint8_t> data(entry_count * schedule_bytes);
-
-		for (size_t m = 0; m < entry_count; ++m)
-		{
-			uint8_t* schedule_base = data.data() + m * schedule_bytes;
-			uint8_t* regular_stream = schedule_base;
-			uint8_t* alg0_stream = regular_stream + schedule_stream_bytes;
-			uint8_t* alg6_stream = alg0_stream + schedule_stream_bytes;
-			uint32_t* alg2_stream = reinterpret_cast<uint32_t*>(alg6_stream + schedule_stream_bytes);
-			uint32_t* alg5_stream = reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(alg2_stream) + schedule_carry_bytes);
-
-			uint16_t seed = (static_cast<uint16_t>(schedule_blob[m * 4 + 0]) << 8)
-			              |  static_cast<uint16_t>(schedule_blob[m * 4 + 1]);
-			for (size_t pos = 0; pos < 2048ull; ++pos)
-			{
-				const size_t stream_offset = pos * 128ull;
-				std::memcpy(regular_stream + stream_offset, RNG::regular_rng_values_8 + static_cast<size_t>(seed) * 128ull, 128ull);
-				std::memcpy(alg0_stream + stream_offset, RNG::alg0_values_8 + static_cast<size_t>(seed) * 128ull, 128ull);
-				std::memcpy(alg6_stream + stream_offset, RNG::alg6_values_8 + static_cast<size_t>(seed) * 128ull, 128ull);
-				alg2_stream[pos] = RNG::alg2_values_32_8[seed];
-				alg5_stream[pos] = RNG::alg5_values_32_8[seed];
-				seed = RNG::rng_table[seed];
-			}
-		}
-		return data;
-	}
+	// OffsetStreamBlob + build_offset_stream_blob[_into|_interleaved] were extracted to
+	// tm_offset_stream.h (namespace tm_offset, brought in unqualified via a using-directive
+	// at the top of this anonymous namespace). See that header for the blob layout.
 
 	std::vector<uint8_t> build_schedule_blob(uint32_t key, const std::string& map_list = "all")
 	{
@@ -2230,6 +2351,88 @@ namespace
 	uint32_t certify_map1_shed_mask(uint32_t key, const std::string& map_list)
 	{
 		return tm_map1_certifier::certified_shed_mask_from_schedule_blob(key, build_schedule_blob(key, map_list));
+	}
+
+	CUdeviceptr upload_buffer(const void* data, std::size_t size);
+
+	uint32_t parse_key_token(const std::string& token, const char* context)
+	{
+		size_t pos = 0;
+		const uint64_t value = std::stoull(token, &pos, 0);
+		if (pos != token.size() || value > 0xFFFFFFFFull)
+			throw std::runtime_error(std::string("invalid key in ") + context + ": " + token);
+		return static_cast<uint32_t>(value);
+	}
+
+	std::vector<uint32_t> read_raceway_key_file(const std::string& path, uint32_t limit)
+	{
+		std::vector<uint32_t> keys;
+		if (path.size() >= 5 && path.substr(path.size() - 5) == ".bin5")
+		{
+			// bin32u8: 4-byte little-endian key + 1-byte cert_bits per record. The worker derives
+			// the precert mask itself, so the cert_bits byte is read and discarded here.
+			std::ifstream in(path, std::ios::binary);
+			if (!in) throw std::runtime_error("cannot open --raceway-key-file: " + path);
+			for (;;)
+			{
+				uint8_t b[5] = {};
+				in.read(reinterpret_cast<char*>(b), 5);
+				if (in.gcount() == 0) break;
+				if (in.gcount() != 5) throw std::runtime_error("truncated bin32u8 --raceway-key-file: " + path);
+				keys.push_back(static_cast<uint32_t>(b[0])
+					| (static_cast<uint32_t>(b[1]) << 8)
+					| (static_cast<uint32_t>(b[2]) << 16)
+					| (static_cast<uint32_t>(b[3]) << 24));
+				if (limit != 0u && keys.size() >= limit) break;
+			}
+			return keys;
+		}
+		if (path.size() >= 4 && path.substr(path.size() - 4) == ".bin")
+		{
+			std::ifstream in(path, std::ios::binary);
+			if (!in) throw std::runtime_error("cannot open --raceway-key-file: " + path);
+			for (;;)
+			{
+				uint8_t b[4] = {};
+				in.read(reinterpret_cast<char*>(b), 4);
+				if (in.gcount() == 0) break;
+				if (in.gcount() != 4) throw std::runtime_error("truncated bin32 --raceway-key-file: " + path);
+				keys.push_back(static_cast<uint32_t>(b[0])
+					| (static_cast<uint32_t>(b[1]) << 8)
+					| (static_cast<uint32_t>(b[2]) << 16)
+					| (static_cast<uint32_t>(b[3]) << 24));
+				if (limit != 0u && keys.size() >= limit) break;
+			}
+			return keys;
+		}
+
+		std::ifstream in(path);
+		if (!in) throw std::runtime_error("cannot open --raceway-key-file: " + path);
+		for (std::string line; std::getline(in, line); )
+		{
+			size_t p = 0;
+			while (p < line.size() && std::isspace(static_cast<unsigned char>(line[p]))) ++p;
+			if (p == line.size() || line[p] == '#') continue;
+			size_t q = p;
+			while (q < line.size() && !std::isspace(static_cast<unsigned char>(line[q]))) ++q;
+			keys.push_back(parse_key_token(line.substr(p, q - p), path.c_str()));
+			if (limit != 0u && keys.size() >= limit) break;
+		}
+		return keys;
+	}
+
+	void replace_schedule_asset(KernelAssets& assets, uint32_t key, const std::string& map_list)
+	{
+		if (assets.schedule_data != 0) cuMemFree(assets.schedule_data);
+		const std::vector<uint8_t> schedule_blob = build_schedule_blob(key, map_list);
+		assets.schedule_data = upload_buffer(schedule_blob.data(), schedule_blob.size());
+	}
+
+	std::string key_hex8(uint32_t key)
+	{
+		std::ostringstream s;
+		s << "0x" << std::hex << std::setw(8) << std::setfill('0') << key;
+		return s.str();
 	}
 
 	CUdeviceptr upload_buffer(const void* data, std::size_t size)
@@ -3542,14 +3745,248 @@ int main(int argc, char** argv)
 			(std::string("tm_checksum_screen_cuda_maprng") + (use_skipcar ? "_skipcar" : "_27")).c_str()),
 			"cuModuleGetFunction(tm_checksum_screen_cuda_maprng)");
 
-				KernelAssets assets = build_kernel_assets(args.key_id, args.map_list);
+					std::vector<uint32_t> raceway_worker_keys;
+					std::vector<uint32_t> map1_frontier_worker_keys;
+					if (!args.raceway_key_file.empty())
+					{
+						if (!args.raceway_direct)
+							throw std::runtime_error("--raceway-key-file is supported only with --raceway-direct");
+						raceway_worker_keys = read_raceway_key_file(args.raceway_key_file, args.raceway_key_limit);
+						if (raceway_worker_keys.empty())
+							throw std::runtime_error("--raceway-key-file contained no keys: " + args.raceway_key_file);
+						args.key_id = raceway_worker_keys.front();
+					}
+					else
+					{
+						raceway_worker_keys.push_back(args.key_id);
+					}
+					if (!args.map1_frontier_key_file.empty())
+					{
+						map1_frontier_worker_keys = read_raceway_key_file(args.map1_frontier_key_file, args.map1_frontier_key_limit);
+						if (map1_frontier_worker_keys.empty())
+							throw std::runtime_error("--map1-frontier-key-file contained no keys: " + args.map1_frontier_key_file);
+						args.key_id = map1_frontier_worker_keys.front();
+					}
 
-				if (args.raceway_direct)
-				{
-					if (use_skipcar)
-						throw std::runtime_error("--raceway-direct currently supports --map-list all only");
-					// Operational default cadence: a bounded-wave run with caps but no explicit cadence uses
-					// the locked operating point 2,5,10,16 (K=4 — +3% full-key vs the old 2,4,8,14,20 and one
+					KernelAssets assets = build_kernel_assets(args.key_id, args.map_list);
+
+						if (args.raceway_direct)
+						{
+							if (use_skipcar)
+								throw std::runtime_error("--raceway-direct currently supports --map-list all only");
+							const bool raceway_persistent_worker = !args.raceway_key_file.empty();
+							const bool raceway_worker_fast = raceway_persistent_worker && args.raceway_key_fast;
+							const uint32_t configured_wave_continue_batch = args.raceway_direct_wave_continue_batch;
+							const uint32_t configured_cap_bits = args.raceway_cap_bits;
+							const std::string configured_wave_boundaries = args.raceway_direct_wave_boundaries;
+							const bool configured_wave_state = args.raceway_direct_wave_state;
+							// RacewayWorkerDeviceCache (persistent-worker device-allocation cache: offset stream,
+							// cap tables, wave scratch; matches()/release() guard shape-compatible reuse) was
+							// extracted to tm_raceway_worker_cache.h (namespace tm_raceway, used unqualified via
+							// the using-directive at the top of this anonymous namespace).
+							RacewayWorkerDeviceCache raceway_worker_cache;
+							if (raceway_persistent_worker)
+							{
+								if (!args.raceway_direct_offset || args.raceway_direct_wave_continue_batch == 0u)
+									throw std::runtime_error("--raceway-key-file currently supports only production offset wave-cadence raceway");
+								if (!args.raceway_hit_dir.empty() || !args.raceway_hit_file.empty())
+									args.raceway_direct_wave_flags = true;
+								// Default to whole-shard allocation reuse: rebuilding the cap tables + wave state per
+								// key dominates host latency, and the shape-compatibility guard (RacewayWorkerDeviceCache::
+								// matches) auto-rebuilds when a key's window/cap shape actually changes. An explicit
+								// --raceway-key-batch-size still wins.
+								if (!args.raceway_key_batch_size_explicit)
+									args.raceway_key_batch_size = std::numeric_limits<uint32_t>::max();
+								std::cout << "[raceway-worker] device=" << device_name
+								          << " keys=" << raceway_worker_keys.size()
+								          << " source=" << args.raceway_key_file
+								          << " key_batch_size=" << args.raceway_key_batch_size
+								          << " overlap_setup=" << (args.raceway_overlap_setup ? 1 : 0)
+								          << " fast=" << (raceway_worker_fast ? 1 : 0) << "\n";
+							}
+						std::ofstream raceway_worker_summary_out;
+						auto open_worker_summary = [&](const std::string& _sum_path) {
+							if (_sum_path.empty()) return;
+							if (raceway_worker_summary_out.is_open()) raceway_worker_summary_out.close();
+							raceway_worker_summary_out.open(_sum_path, std::ios::trunc);
+							if (!raceway_worker_summary_out)
+								throw std::runtime_error("cannot open --raceway-worker-summary: " + _sum_path);
+							raceway_worker_summary_out
+								<< "index\tkey\treturncode\telapsed_s\tshed_bits\tlogical_window\t"
+								<< "parity_checked\tparity_diff\tflag_sum_continue\tflag_sum_flat\t"
+								<< "representative_hits\tpipeline_ms\n";
+						};
+						open_worker_summary(args.raceway_worker_summary);
+							// BFS-parity host/GPU overlap: prepare the next key's schedule blob, certified-shed
+							// mask, and offset-stream blob on a background thread while the GPU runs the current
+							// key. All three are pure CPU functions of (key, map_list) that read only the
+							// read-only RNG tables, so they are safe to run off the main thread.
+							// RacewayWorkerPrepared (per-key prepared-blob struct) + RacewayOffsetStaging (pinned
+							// staging + device double-buffer + copy stream/events) were extracted to
+							// tm_raceway_offset_prefetch.h; the prepare LOGIC stays here (it needs the key schedule
+							// + certifier). See that header for the prefetch/staging lifetime rules.
+							const bool race_prep_precert = args.precert;
+							const bool race_prep_offset = args.raceway_direct_offset || args.raceway_direct_flat_parity;
+							// The prepare also stages the offset stream into a caller-provided PINNED host buffer so
+							// the per-key HtoD is a fast DMA (~0.4ms) instead of a pageable copy (~1.6ms); the staging
+							// memcpy is hidden on the prepare thread. Two pinned buffers ping-pong by key parity so the
+							// in-flight prepare never writes the buffer the main thread is currently DMA-ing.
+							// When prefetch is enabled the prepare thread ALSO issues the offset-stream HtoD itself, as
+							// an async DMA on a dedicated non-blocking copy stream into a double-buffered device region,
+							// so the ~0.8-1.6ms upload overlaps THIS key's compute (the copy engine is independent of the
+							// SMs) and is fully hidden. The main thread only waits on the recorded event before launching
+							// the next key's wave (always already signalled). CUDA calls on this background thread require
+							// the context be made current on it (cuCtxSetCurrent); it is safe for a context to be current
+							// on the main and prepare threads simultaneously (driver API >= 4.0).
+							auto race_prepare = [map_list = args.map_list, race_prep_precert, race_prep_offset, context](
+								uint32_t key, void* pinned_dst, size_t pinned_cap,
+								int upload_slot, CUdeviceptr dbuf, size_t dbuf_cap, CUstream copy_stream, CUevent up_ev)
+								-> RacewayWorkerPrepared
+							{
+								RacewayWorkerPrepared p;
+								p.key = key;
+								const auto t0 = std::chrono::high_resolution_clock::now();
+								p.sched_blob = build_schedule_blob(key, map_list);
+								const auto t1 = std::chrono::high_resolution_clock::now();
+								if (race_prep_precert)
+									p.shed_mask = tm_map1_certifier::certified_shed_mask_from_schedule_blob(key, p.sched_blob);
+								const auto t2 = std::chrono::high_resolution_clock::now();
+								if (race_prep_offset)
+								{
+									build_offset_stream_blob_into(p.sched_blob, p.osb);
+									if (pinned_dst != nullptr && p.osb.data.size() <= pinned_cap)
+									{
+										std::memcpy(pinned_dst, p.osb.data.data(), p.osb.data.size());
+										p.pinned_ptr = pinned_dst;
+										p.pinned_filled = true;
+									}
+									// Prefetch: kick this key's async upload on the copy stream now, so it runs during the
+									// caller's current-key compute. Only when the pinned staging is filled and the device
+									// buffer for this parity slot is big enough; otherwise the main thread synchronously
+									// uploads this key (upload_slot stays -1).
+									if (upload_slot >= 0 && p.pinned_filled && dbuf != 0 && copy_stream != nullptr
+										&& up_ev != nullptr && p.osb.data.size() <= dbuf_cap)
+									{
+										cuCtxSetCurrent(context);
+										// The previous async copy into this slot (two keys ago) is long done, but wait on
+										// its event before overwriting the device buffer to be strictly correct.
+										cuEventSynchronize(up_ev);
+										if (cuMemcpyHtoDAsync(dbuf, p.pinned_ptr, p.osb.data.size(), copy_stream) == CUDA_SUCCESS
+											&& cuEventRecord(up_ev, copy_stream) == CUDA_SUCCESS)
+											p.upload_slot = upload_slot;
+									}
+								}
+								const auto t3 = std::chrono::high_resolution_clock::now();
+								p.schedule_build_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+								p.precert_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
+								p.offset_build_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
+								return p;
+							};
+							const bool raceway_overlap_setup = raceway_persistent_worker && args.raceway_overlap_setup;
+							// Offset-stream staging + prefetch resources (pinned ping-pong buffers, device
+							// double-buffer, copy stream, events) — see tm_raceway_offset_prefetch.h. Prefetch is
+							// gated to the production persistent-worker batch-reuse config (the only path with a
+							// persistent per-key offset upload); cold keys (key 0, each daemon batch's first key)
+							// fall back to the synchronous upload.
+							const bool race_prefetch_active =
+								raceway_overlap_setup && race_prep_offset && args.raceway_prefetch_offset
+								&& raceway_persistent_worker && args.raceway_key_batch_size > 1u
+								&& !args.calibrate_raceway;
+							RacewayOffsetStaging race_stage;
+							race_stage.init(race_prefetch_active);
+							// Warm the certifier RNG-table static-init guard on the main thread before any async
+							// prepare touches it, so the background thread only ever reads those tables.
+							tm_map1_certifier::ensure_rng_tables();
+							std::future<RacewayWorkerPrepared> race_prepare_future;
+							if (raceway_overlap_setup && !raceway_worker_keys.empty())
+								race_prepare_future = std::async(std::launch::async, race_prepare, raceway_worker_keys.front(), nullptr, size_t(0), -1, CUdeviceptr(0), size_t(0), CUstream(nullptr), CUevent(nullptr));
+							// Ping-pong survivor-count slots for the device-driven async cadence (2 x uint32).
+							CUdeviceptr wave_cnt2 = 0;
+							CUdeviceptr d_tail_maps = 0;
+							if (args.raceway_async_cadence)
+								check_cuda(cuMemAlloc(&wave_cnt2, 2u * sizeof(uint32_t)), "cuMemAlloc(raceway_wave_cnt2)");
+							if (args.raceway_fused_tail)
+								check_cuda(cuMemAlloc(&d_tail_maps, 8u * sizeof(uint32_t)), "cuMemAlloc(raceway_tail_maps)");
+							for (;;)
+							{
+							for (size_t raceway_worker_index = 0; raceway_worker_index < raceway_worker_keys.size(); ++raceway_worker_index)
+							{
+								if (raceway_worker_index != 0u && worker_stop_requested(args.worker_stop_file))
+								{
+									if (race_prepare_future.valid())
+										race_prepare_future.wait();
+									std::cout << "[raceway-worker] stop_file=" << args.worker_stop_file
+									          << " observed_after_index=" << (raceway_worker_index - 1u)
+									          << " processed=" << raceway_worker_index << "\n";
+									break;
+								}
+								if (raceway_persistent_worker && args.raceway_key_batch_size > 1u
+									&& raceway_worker_index != 0u
+									&& (raceway_worker_index % args.raceway_key_batch_size) == 0u)
+									raceway_worker_cache.release();
+								args.raceway_direct_wave_continue_batch = configured_wave_continue_batch;
+								args.raceway_cap_bits = configured_cap_bits;
+								args.raceway_direct_wave_boundaries = configured_wave_boundaries;
+								args.raceway_direct_wave_state = configured_wave_state;
+								args.key_id = raceway_worker_keys[raceway_worker_index];
+								// Acquire this key's prepared blobs (overlap: from the background future; else build
+								// inline), then prefetch the next key so its host prep overlaps this key's GPU run.
+								RacewayWorkerPrepared race_prepared;
+								double race_setup_wait_ms = 0.0;
+								if (raceway_overlap_setup)
+								{
+									const auto race_wait0 = std::chrono::high_resolution_clock::now();
+									race_prepared = race_prepare_future.get();
+									const auto race_wait1 = std::chrono::high_resolution_clock::now();
+									race_setup_wait_ms = std::chrono::duration<double, std::milli>(race_wait1 - race_wait0).count();
+									if (raceway_worker_index + 1u < raceway_worker_keys.size())
+									{
+										// Hand the next prepare the pinned buffer for ITS parity; the buffer the main thread
+										// is about to DMA (this key's parity) is the other slot, so there is no overwrite.
+										const int race_next_slot = static_cast<int>((raceway_worker_index + 1u) & 1u);
+										race_stage.ensure_pinned(race_next_slot, race_prepared.osb.data.size());
+										// Prefetch path: the next prepare also issues its offset HtoD async into race_stage.dbuf.
+										// Both device slots must exist before the background DMA fires; the offset stream is
+										// a fixed size (constant map count), so this allocates once on the first two keys.
+										int race_up_slot = -1; CUdeviceptr race_up_dbuf = 0; size_t race_up_cap = 0;
+										CUstream race_up_stream = nullptr; CUevent race_up_ev = nullptr;
+										if (race_prefetch_active)
+										{
+											race_stage.ensure_dbuf(0, race_prepared.osb.data.size());
+											race_stage.ensure_dbuf(1, race_prepared.osb.data.size());
+											race_up_slot = race_next_slot;
+											race_up_dbuf = race_stage.dbuf[race_next_slot];
+											race_up_cap = race_stage.dbuf_cap[race_next_slot];
+											race_up_stream = race_stage.copy_stream;
+											race_up_ev = race_stage.ev_upload[race_next_slot];
+										}
+										race_prepare_future = std::async(std::launch::async, race_prepare,
+											raceway_worker_keys[raceway_worker_index + 1u], race_stage.pinned[race_next_slot], race_stage.pinned_cap[race_next_slot],
+											race_up_slot, race_up_dbuf, race_up_cap, race_up_stream, race_up_ev);
+									}
+								}
+								else
+								{
+									race_prepared = race_prepare(args.key_id, nullptr, size_t(0), -1, CUdeviceptr(0), size_t(0), CUstream(nullptr), CUevent(nullptr));
+								}
+								(void)race_setup_wait_ms;
+								if (raceway_worker_index != 0)
+								{
+									if (assets.schedule_data != 0) cuMemFree(assets.schedule_data);
+									assets.schedule_data = upload_buffer(race_prepared.sched_blob.data(), race_prepared.sched_blob.size());
+								}
+							const auto raceway_key_wall0 = std::chrono::steady_clock::now();
+						// Host-overhead breakdown (investigation): the gap between elapsed_s and pipeline_ms.
+						double race_offset_htod_ms = 0.0;
+						double race_cap_clear_ms = 0.0;
+						// Capture/hit-extraction breakdown — these phases otherwise fall into `other`.
+						double race_flag_dtoh_ms = 0.0;   // DtoH of wave_flags (batch_n bytes/batch)
+						double race_live_dtoh_ms = 0.0;   // DtoH of cur_live survivor ids
+						double race_hit_loop_ms = 0.0;    // host loop classifying/writing hits
+						double race_stats_dtoh_ms = 0.0;  // DtoH of wave_stats per batch
+						double race_capocc_ms = 0.0;      // count_cap_occupied boundary scans
+						// Operational default cadence: a bounded-wave run with caps but no explicit cadence uses
+						// the locked operating point 2,5,10,16 (K=4 — +3% full-key vs the old 2,4,8,14,20 and one
 					// fewer cap table). State
 					// continuation (ILP4) is the right default for these deep boundaries.
 					if (args.raceway_direct_offset
@@ -3563,9 +4000,9 @@ int main(int argc, char** argv)
 						const bool raceway_wave_cadence_mode =
 							args.raceway_direct_wave_continue_batch != 0u
 							&& (args.raceway_direct_wave_k_sweep || !args.raceway_direct_wave_boundaries.empty());
-						const std::vector<uint8_t> sched_blob = build_schedule_blob(args.key_id, args.map_list);
+						const std::vector<uint8_t>& sched_blob = race_prepared.sched_blob;
 						const uint32_t schedule_count = static_cast<uint32_t>(sched_blob.size() / 4u);
-						const uint32_t raceway_precert_shed_mask = args.precert ? certify_map1_shed_mask(args.key_id, args.map_list) : 0u;
+						const uint32_t raceway_precert_shed_mask = args.precert ? race_prepared.shed_mask : 0u;
 						const uint32_t raceway_precert_bits = static_cast<uint32_t>(__builtin_popcount(raceway_precert_shed_mask));
 						const uint32_t raceway_precert_support_mask = ~raceway_precert_shed_mask;
 						const uint32_t raceway_precert_fixed_value = 0u;
@@ -3578,7 +4015,7 @@ int main(int argc, char** argv)
 							&& args.range_start == 0ull
 							&& (raceway_precert_source_mult == 1ull || (args.workunit_size % raceway_precert_source_mult) == 0ull);
 						const bool raceway_precert_active = args.precert && raceway_precert_bits != 0u && raceway_precert_supported;
-						if (args.precert && (raceway_precert_active || args.precert_explicit))
+						if (!raceway_worker_fast && args.precert && (raceway_precert_active || args.precert_explicit))
 						{
 							std::cout << "  precert: shed_bits=" << raceway_precert_bits
 							          << " shed_mask=0x" << std::hex << std::setw(8) << std::setfill('0') << raceway_precert_shed_mask
@@ -3610,7 +4047,12 @@ int main(int argc, char** argv)
 						CUfunction raceway_direct_k = nullptr, raceway_clear_k = nullptr, raceway_compact_k = nullptr;
 						CUfunction raceway_continue_k = nullptr;
 						CUfunction raceway_span_state_k = nullptr;
+						CUfunction raceway_span_devcount_k = nullptr;
+						CUfunction raceway_continue_devcount_k = nullptr;
+						CUfunction raceway_compact_devcount_k = nullptr;
+						CUfunction raceway_fused_tail_k = nullptr;
 						CUfunction screen_remap_offset_k = nullptr;
+						CUfunction raceway_collect_hits_k = nullptr;
 					const char* raceway_direct_name = "tm_raceway_stream_window_cuda";
 						if (args.raceway_direct_offset)
 						{
@@ -3664,6 +4106,14 @@ int main(int argc, char** argv)
 						}
 						const char* continue_name = continue_name_storage.c_str();
 						check_cuda(cuModuleGetFunction(&raceway_continue_k, module, continue_name), "cuModuleGetFunction(raceway_continue)");
+						check_cuda(cuModuleGetFunction(&raceway_collect_hits_k, module, "tm_raceway_collect_hits_cuda"), "cuModuleGetFunction(raceway_collect_hits)");
+						if (args.raceway_async_cadence)
+						{
+							check_cuda(cuModuleGetFunction(&raceway_continue_devcount_k, module, "tm_raceway_continue_state_liveidx_offset_ilp4_static_devcount_cuda"), "cuModuleGetFunction(raceway_continue_devcount)");
+							check_cuda(cuModuleGetFunction(&raceway_compact_devcount_k, module, "compact_survivors_ordered_devcount_cuda"), "cuModuleGetFunction(compact_devcount)");
+							if (args.raceway_fused_tail)
+								check_cuda(cuModuleGetFunction(&raceway_fused_tail_k, module, "tm_raceway_fused_tail_ilp4_cuda"), "cuModuleGetFunction(raceway_fused_tail)");
+						}
 					}
 						if (args.raceway_direct_wave_k_sweep || !args.raceway_direct_wave_boundaries.empty())
 						{
@@ -3673,6 +4123,8 @@ int main(int argc, char** argv)
 							: (args.raceway_direct_wave_span_ilp == 6u) ? "tm_raceway_span_state_liveidx_cap_offset_ilp6_cuda"
 							: "tm_raceway_span_state_liveidx_cap_offset_cuda";
 							check_cuda(cuModuleGetFunction(&raceway_span_state_k, module, span_state_name), "cuModuleGetFunction(raceway_span_state)");
+							if (args.raceway_async_cadence)
+								check_cuda(cuModuleGetFunction(&raceway_span_devcount_k, module, "tm_raceway_span_state_liveidx_cap_offset_ilp4_devcount_cuda"), "cuModuleGetFunction(raceway_span_devcount)");
 						}
 						if (args.raceway_direct_wave_parity && raceway_precert_active)
 						{
@@ -3756,6 +4208,8 @@ int main(int argc, char** argv)
 						throw std::runtime_error("--raceway-direct-wave-continue-batch requires direct offset ILP1 with caps enabled and no flat parity/cap-mark/static modes");
 					if (args.raceway_direct_wave_parity && args.raceway_direct_wave_continue_batch == 0u)
 						throw std::runtime_error("--raceway-direct-wave-parity requires --raceway-direct-wave-continue-batch");
+					if (args.raceway_direct_wave_flags && args.raceway_direct_wave_continue_batch == 0u)
+						throw std::runtime_error("--raceway-direct-wave-flags requires --raceway-direct-wave-continue-batch");
 					if (args.raceway_direct_wave_state && args.raceway_direct_wave_continue_batch == 0u)
 						throw std::runtime_error("--raceway-direct-wave-state requires --raceway-direct-wave-continue-batch");
 					if (args.raceway_direct_wave_continue_batch != 0u
@@ -3765,6 +4219,16 @@ int main(int argc, char** argv)
 					if ((args.raceway_direct_wave_k_sweep || !args.raceway_direct_wave_boundaries.empty())
 						&& args.raceway_direct_wave_continue_batch == 0u)
 						throw std::runtime_error("--raceway-direct-wave-k-sweep/--raceway-direct-wave-boundaries requires --raceway-direct-wave-continue-batch");
+					const bool raceway_worker_batch_reuse =
+						raceway_persistent_worker
+						&& args.raceway_key_batch_size > 1u
+						&& !args.calibrate_raceway
+						&& !wave_cadence_plans.empty();
+					const bool raceway_capture_flags =
+						args.raceway_direct_wave_flags
+						|| args.raceway_direct_wave_parity
+						|| !args.raceway_hit_file.empty()
+						|| !args.raceway_hit_dir.empty();
 
 					size_t race_mem_start_free = 0, race_mem_total = 0, race_mem_min_free = 0;
 					auto sample_race_mem = [&]() {
@@ -3798,17 +4262,54 @@ int main(int argc, char** argv)
 					// ever clamps DOWN, so a smaller downstream card cannot OOM.
 					if (raceway_wave_cadence_mode && cap_count != 0u && args.raceway_cap_bits != 0u)
 					{
-						const double budget     = static_cast<double>(race_mem_start_free) * 0.90;
 						const double offset_est  = 32.0 * 1048576.0;   // offset-stream + misc fixed buffers
 						const double per_state   = 144.0;              // per wave state: alive+live_idx+128B state+flags (~137 measured)
+						auto cached_wave_bytes = [&]() -> double {
+							if (!raceway_worker_cache.wave_work_counter || raceway_worker_cache.wave_cap == 0u)
+								return 0.0;
+							double bytes = static_cast<double>(sizeof(uint32_t) + sizeof(RacewayStatsHost) + sizeof(uint32_t) + sizeof(uint32_t));
+							bytes += static_cast<double>(raceway_worker_cache.wave_cap);
+							bytes += static_cast<double>(raceway_worker_cache.wave_cap) * 2.0 * static_cast<double>(sizeof(uint32_t));
+							bytes += static_cast<double>(raceway_worker_cache.wave_cap) * 32.0 * static_cast<double>(sizeof(uint32_t));
+							if (raceway_worker_cache.wave_flags_enabled)
+								bytes += static_cast<double>(raceway_worker_cache.wave_cap);
+							if (raceway_worker_cache.flat_parity)
+								bytes += static_cast<double>(raceway_worker_cache.wave_cap);
+							if (raceway_worker_cache.drop_hist)
+								bytes += static_cast<double>(raceway_worker_cache.wave_cap);
+							return bytes;
+						};
+						const double cached_worker_bytes =
+							(raceway_worker_batch_reuse && raceway_worker_cache.d_direct_ostream)
+							? (static_cast<double>(raceway_worker_cache.offset_bytes)
+								+ static_cast<double>(raceway_worker_cache.cap_slots_total) * static_cast<double>(sizeof(unsigned long long))
+								+ cached_wave_bytes())
+							: 0.0;
+						const double adjusted_free = std::min<double>(
+							static_cast<double>(race_mem_total),
+							static_cast<double>(race_mem_start_free) + cached_worker_bytes);
+						const double budget = adjusted_free * 0.90;
 						auto caps_bytes = [&](uint32_t bits) {
 							return static_cast<double>(cap_count) * static_cast<double>(1ull << bits)
 							     * static_cast<double>(args.raceway_cap_ways) * 8.0;
 						};
 							const bool auto_mode = args.raceway_wave_auto_size;
 							const uint32_t wave_ceiling = auto_mode ? 4194304u : args.raceway_direct_wave_continue_batch;
-							const uint32_t cap_ceiling  = auto_mode ? 27u : args.raceway_cap_bits; // auto scales cap up to 2^27 (VRAM-bounded; falls back automatically)
 							const uint32_t cap_floor    = 18u;
+							// Window-aware cap ceiling. The cap dedups LOGICAL reps, so it only needs to cover the
+							// logical window (direct_total), not free VRAM. A full-key sweep (direct_total=2^32) wants
+							// the big 2^27 cap for its 1.3-1.6B diffuse frontier, but a precert-reduced window (e.g.
+							// 2^24 for an 8-bit-certified key) has a proportionally smaller frontier; a 2^27 cap there is
+							// wasteful and its per-key clear dominates host latency. Target ~2x window slots across all
+							// ways, clamped to [cap_floor, 27]. For full-key this saturates at 27 (unchanged).
+							auto window_cap_bits = [&]() -> uint32_t {
+								const long double target = 2.0L * static_cast<long double>(direct_total)
+									/ static_cast<long double>(args.raceway_cap_ways);
+								uint32_t bits = cap_floor;
+								while (bits < 27u && static_cast<long double>(1ull << bits) < target) ++bits;
+								return bits;
+							};
+							const uint32_t cap_ceiling  = auto_mode ? window_cap_bits() : args.raceway_cap_bits; // auto scales cap to the logical window (VRAM-bounded; falls back automatically)
 							if (!auto_mode && cap_ceiling < cap_floor)
 							{
 								std::ostringstream e;
@@ -3840,7 +4341,8 @@ int main(int argc, char** argv)
 								  << ", logical_window=" << direct_total << ")";
 								throw std::runtime_error(e.str());
 							}
-						if (auto_mode || chosen_wave != args.raceway_direct_wave_continue_batch || chosen_bits != args.raceway_cap_bits)
+						if (!raceway_worker_fast
+							&& (auto_mode || chosen_wave != args.raceway_direct_wave_continue_batch || chosen_bits != args.raceway_cap_bits))
 							std::cout << "  [raceway-auto] free=" << static_cast<uint64_t>(mib(race_mem_start_free))
 							          << " MiB budget=0.90 -> wave=" << chosen_wave << " cap=2^" << chosen_bits << "x" << args.raceway_cap_ways
 							          << (auto_mode ? "  (auto)" : "  (clamped to fit)") << "\n";
@@ -3853,9 +4355,63 @@ int main(int argc, char** argv)
 					OffsetStreamBlob osb;
 					if (args.raceway_direct_offset || args.raceway_direct_flat_parity)
 					{
-						osb = build_offset_stream_blob(sched_blob);
-						check_cuda(cuMemAlloc(&d_direct_ostream, osb.data.size()), "cuMemAlloc(raceway_direct_ostream)");
-						check_cuda(cuMemcpyHtoD(d_direct_ostream, osb.data.data(), osb.data.size()), "HtoD(raceway_direct_ostream)");
+						// Built on the prepare thread (see race_prepare); move it in here.
+						osb = std::move(race_prepared.osb);
+					}
+					const uint32_t cadence_wave_cap = (!wave_cadence_plans.empty())
+						? static_cast<uint32_t>(std::min<uint64_t>(args.raceway_direct_wave_continue_batch, direct_total))
+						: 0u;
+					if (raceway_worker_batch_reuse
+						&& raceway_worker_cache.d_direct_ostream != 0
+						&& !raceway_worker_cache.matches(osb.data.size(), cap_count, args.raceway_cap_bits,
+							args.raceway_cap_ways, cadence_wave_cap, raceway_capture_flags,
+							args.raceway_direct_wave_parity, args.raceway_drop_hist))
+					{
+						raceway_worker_cache.release();
+					}
+					if (args.raceway_direct_offset || args.raceway_direct_flat_parity)
+					{
+						if (race_prefetch_active && raceway_worker_batch_reuse && race_prepared.upload_slot >= 0
+							&& race_stage.dbuf[race_prepared.upload_slot] != 0)
+						{
+							// Prefetch fast path: this key's offset stream was already DMA'd on the copy stream during
+							// the previous key's compute. Point at that device slot and make the null (compute) stream
+							// wait on the upload event -- always already signalled, so no host stall and no per-key
+							// synchronous HtoD (the ~0.8-1.6ms upload is fully hidden behind the previous key's compute).
+							d_direct_ostream = race_stage.dbuf[race_prepared.upload_slot];
+							const auto htod0 = std::chrono::high_resolution_clock::now();
+							check_cuda(cuStreamWaitEvent(0, race_stage.ev_upload[race_prepared.upload_slot], 0), "raceway prefetch offset wait");
+							const auto htod1 = std::chrono::high_resolution_clock::now();
+							race_offset_htod_ms += std::chrono::duration<double, std::milli>(htod1 - htod0).count();
+						}
+						else if (raceway_worker_batch_reuse)
+						{
+							if (raceway_worker_cache.d_direct_ostream == 0)
+							{
+								check_cuda(cuMemAlloc(&raceway_worker_cache.d_direct_ostream, osb.data.size()), "cuMemAlloc(raceway_direct_ostream)");
+								raceway_worker_cache.offset_bytes = osb.data.size();
+							}
+							d_direct_ostream = raceway_worker_cache.d_direct_ostream;
+							// DMA from the pinned staging buffer the prepare thread filled (fast path); fall back to the
+							// pageable vector if this key was not pinned (key 0 / daemon batch start, or a grown stream).
+							const void* htod_src = (race_prepared.pinned_filled && race_prepared.pinned_ptr != nullptr)
+								? race_prepared.pinned_ptr : static_cast<const void*>(osb.data.data());
+							const auto htod0 = std::chrono::high_resolution_clock::now();
+							check_cuda(cuMemcpyHtoD(d_direct_ostream, htod_src, osb.data.size()), "HtoD(raceway_direct_ostream)");
+							const auto htod1 = std::chrono::high_resolution_clock::now();
+							race_offset_htod_ms += std::chrono::duration<double, std::milli>(htod1 - htod0).count();
+						}
+						else
+						{
+							check_cuda(cuMemAlloc(&d_direct_ostream, osb.data.size()), "cuMemAlloc(raceway_direct_ostream)");
+							// cuMemcpyHtoD is host-blocking either way, so wall time around it is an accurate read.
+							const void* htod_src = (race_prepared.pinned_filled && race_prepared.pinned_ptr != nullptr)
+								? race_prepared.pinned_ptr : static_cast<const void*>(osb.data.data());
+							const auto htod0 = std::chrono::high_resolution_clock::now();
+							check_cuda(cuMemcpyHtoD(d_direct_ostream, htod_src, osb.data.size()), "HtoD(raceway_direct_ostream)");
+							const auto htod1 = std::chrono::high_resolution_clock::now();
+							race_offset_htod_ms += std::chrono::duration<double, std::milli>(htod1 - htod0).count();
+						}
 						off_regular = d_direct_ostream;
 						off_alg0 = off_regular + osb.stream_bytes;
 						off_alg6 = off_alg0 + osb.stream_bytes;
@@ -3869,62 +4425,147 @@ int main(int argc, char** argv)
 					std::vector<uint32_t> cap_ways_h(cap_count, args.raceway_cap_ways);
 					CUdeviceptr d_cap_tables = 0, d_cap_bits = 0, d_cap_ways = 0;
 					uint64_t cap_slots_total = 0ull;
-					for (uint32_t c = 0u; c < cap_count; ++c)
+					if (raceway_worker_batch_reuse)
 					{
-						const uint64_t cap_slots = (1ull << args.raceway_cap_bits) * static_cast<uint64_t>(args.raceway_cap_ways);
-						cap_slots_total += cap_slots;
-						check_cuda(cuMemAlloc(&cap_tables_h[c], cap_slots * sizeof(unsigned long long)), "cuMemAlloc(raceway_direct_cap)");
-						void* za[] = { &cap_tables_h[c], (void*)&cap_slots };
-						check_cuda(cuLaunchKernel(raceway_clear_k, static_cast<uint32_t>((cap_slots + 255ull) / 256ull), 1, 1,
-							256, 1, 1, 0, 0, za, nullptr), "launch(raceway_direct_cap_clear)");
+						if (cap_count != 0u && raceway_worker_cache.cap_tables_h.empty())
+						{
+							raceway_worker_cache.cap_tables_h.assign(cap_count, 0);
+							const uint64_t cap_slots = (1ull << args.raceway_cap_bits) * static_cast<uint64_t>(args.raceway_cap_ways);
+							raceway_worker_cache.cap_slots_total = cap_slots * static_cast<uint64_t>(cap_count);
+							for (uint32_t c = 0u; c < cap_count; ++c)
+								check_cuda(cuMemAlloc(&raceway_worker_cache.cap_tables_h[c], cap_slots * sizeof(unsigned long long)), "cuMemAlloc(raceway_direct_cap)");
+							check_cuda(cuMemAlloc(&raceway_worker_cache.d_cap_tables, static_cast<size_t>(cap_count) * sizeof(CUdeviceptr)), "cuMemAlloc(raceway_direct_cap_ptrs)");
+							check_cuda(cuMemAlloc(&raceway_worker_cache.d_cap_bits, static_cast<size_t>(cap_count) * sizeof(uint32_t)), "cuMemAlloc(raceway_direct_cap_bits)");
+							check_cuda(cuMemAlloc(&raceway_worker_cache.d_cap_ways, static_cast<size_t>(cap_count) * sizeof(uint32_t)), "cuMemAlloc(raceway_direct_cap_ways)");
+							raceway_worker_cache.cap_count = cap_count;
+							raceway_worker_cache.cap_bits = args.raceway_cap_bits;
+							raceway_worker_cache.cap_ways = args.raceway_cap_ways;
+							raceway_worker_cache.wave_cap = cadence_wave_cap;
+							raceway_worker_cache.wave_flags_enabled = raceway_capture_flags;
+							raceway_worker_cache.flat_parity = args.raceway_direct_wave_parity;
+							raceway_worker_cache.drop_hist = args.raceway_drop_hist;
+						}
+						cap_tables_h = raceway_worker_cache.cap_tables_h;
+						d_cap_tables = raceway_worker_cache.d_cap_tables;
+						d_cap_bits = raceway_worker_cache.d_cap_bits;
+						d_cap_ways = raceway_worker_cache.d_cap_ways;
+						cap_slots_total = raceway_worker_cache.cap_slots_total;
 					}
-					if (cap_count != 0u)
+					else
 					{
-						check_cuda(cuMemAlloc(&d_cap_tables, static_cast<size_t>(cap_count) * sizeof(CUdeviceptr)), "cuMemAlloc(raceway_direct_cap_ptrs)");
+						for (uint32_t c = 0u; c < cap_count; ++c)
+						{
+							const uint64_t cap_slots = (1ull << args.raceway_cap_bits) * static_cast<uint64_t>(args.raceway_cap_ways);
+							cap_slots_total += cap_slots;
+							check_cuda(cuMemAlloc(&cap_tables_h[c], cap_slots * sizeof(unsigned long long)), "cuMemAlloc(raceway_direct_cap)");
+							void* za[] = { &cap_tables_h[c], (void*)&cap_slots };
+							check_cuda(cuLaunchKernel(raceway_clear_k, static_cast<uint32_t>((cap_slots + 255ull) / 256ull), 1, 1,
+								256, 1, 1, 0, 0, za, nullptr), "launch(raceway_direct_cap_clear)");
+						}
+						if (cap_count != 0u)
+						{
+							check_cuda(cuMemAlloc(&d_cap_tables, static_cast<size_t>(cap_count) * sizeof(CUdeviceptr)), "cuMemAlloc(raceway_direct_cap_ptrs)");
+							check_cuda(cuMemcpyHtoD(d_cap_tables, cap_tables_h.data(), static_cast<size_t>(cap_count) * sizeof(CUdeviceptr)), "HtoD(raceway_direct_cap_ptrs)");
+							check_cuda(cuMemAlloc(&d_cap_bits, static_cast<size_t>(cap_count) * sizeof(uint32_t)), "cuMemAlloc(raceway_direct_cap_bits)");
+							check_cuda(cuMemcpyHtoD(d_cap_bits, cap_bits_h.data(), static_cast<size_t>(cap_count) * sizeof(uint32_t)), "HtoD(raceway_direct_cap_bits)");
+							check_cuda(cuMemAlloc(&d_cap_ways, static_cast<size_t>(cap_count) * sizeof(uint32_t)), "cuMemAlloc(raceway_direct_cap_ways)");
+							check_cuda(cuMemcpyHtoD(d_cap_ways, cap_ways_h.data(), static_cast<size_t>(cap_count) * sizeof(uint32_t)), "HtoD(raceway_direct_cap_ways)");
+						}
+					}
+					if (raceway_worker_batch_reuse && cap_count != 0u)
+					{
 						check_cuda(cuMemcpyHtoD(d_cap_tables, cap_tables_h.data(), static_cast<size_t>(cap_count) * sizeof(CUdeviceptr)), "HtoD(raceway_direct_cap_ptrs)");
-						check_cuda(cuMemAlloc(&d_cap_bits, static_cast<size_t>(cap_count) * sizeof(uint32_t)), "cuMemAlloc(raceway_direct_cap_bits)");
 						check_cuda(cuMemcpyHtoD(d_cap_bits, cap_bits_h.data(), static_cast<size_t>(cap_count) * sizeof(uint32_t)), "HtoD(raceway_direct_cap_bits)");
-						check_cuda(cuMemAlloc(&d_cap_ways, static_cast<size_t>(cap_count) * sizeof(uint32_t)), "cuMemAlloc(raceway_direct_cap_ways)");
 						check_cuda(cuMemcpyHtoD(d_cap_ways, cap_ways_h.data(), static_cast<size_t>(cap_count) * sizeof(uint32_t)), "HtoD(raceway_direct_cap_ways)");
 					}
 					sample_race_mem();
 
-					if (!wave_cadence_plans.empty())
-					{
-						const uint32_t wave_cap = static_cast<uint32_t>(std::min<uint64_t>(
-							args.raceway_direct_wave_continue_batch, direct_total));
+						if (!wave_cadence_plans.empty())
+						{
+							if (!args.raceway_hit_file.empty() && !raceway_capture_flags)
+								throw std::runtime_error("--raceway-hit-file requires --raceway-direct-wave-flags or --raceway-direct-wave-parity");
+							const uint32_t wave_cap = static_cast<uint32_t>(std::min<uint64_t>(
+								args.raceway_direct_wave_continue_batch, direct_total));
 						CUdeviceptr wave_work_counter = 0, wave_stats = 0, wave_alive = 0;
 						CUdeviceptr wave_live_a = 0, wave_live_b = 0, wave_compact_counter = 0, wave_flags = 0;
 						CUdeviceptr wave_flat_flags = 0, wave_state = 0, wave_drop_map = 0;
 						CUdeviceptr wave_occ_counter = 0;
-						check_cuda(cuMemAlloc(&wave_work_counter, sizeof(uint32_t)), "cuMemAlloc(raceway_wave_work_counter)");
-						check_cuda(cuMemAlloc(&wave_stats, sizeof(RacewayStatsHost)), "cuMemAlloc(raceway_wave_stats)");
-						check_cuda(cuMemAlloc(&wave_alive, wave_cap), "cuMemAlloc(raceway_wave_alive)");
-						check_cuda(cuMemAlloc(&wave_live_a, static_cast<size_t>(wave_cap) * sizeof(uint32_t)), "cuMemAlloc(raceway_wave_live_a)");
-						check_cuda(cuMemAlloc(&wave_live_b, static_cast<size_t>(wave_cap) * sizeof(uint32_t)), "cuMemAlloc(raceway_wave_live_b)");
-						check_cuda(cuMemAlloc(&wave_compact_counter, sizeof(uint32_t)), "cuMemAlloc(raceway_wave_compact_counter)");
-						check_cuda(cuMemAlloc(&wave_state, static_cast<size_t>(wave_cap) * 32u * sizeof(uint32_t)), "cuMemAlloc(raceway_wave_state)");
-						if (args.raceway_direct_wave_parity)
+						CUdeviceptr wave_hit_packed = 0;
+						if (raceway_worker_batch_reuse)
 						{
-							check_cuda(cuMemAlloc(&wave_flags, wave_cap), "cuMemAlloc(raceway_wave_flags)");
-							check_cuda(cuMemAlloc(&wave_flat_flags, wave_cap), "cuMemAlloc(raceway_wave_flat_flags)");
+							if (raceway_worker_cache.wave_work_counter == 0)
+							{
+								check_cuda(cuMemAlloc(&raceway_worker_cache.wave_work_counter, sizeof(uint32_t)), "cuMemAlloc(raceway_wave_work_counter)");
+								check_cuda(cuMemAlloc(&raceway_worker_cache.wave_stats, sizeof(RacewayStatsHost)), "cuMemAlloc(raceway_wave_stats)");
+								check_cuda(cuMemAlloc(&raceway_worker_cache.wave_alive, wave_cap), "cuMemAlloc(raceway_wave_alive)");
+								check_cuda(cuMemAlloc(&raceway_worker_cache.wave_live_a, static_cast<size_t>(wave_cap) * sizeof(uint32_t)), "cuMemAlloc(raceway_wave_live_a)");
+								check_cuda(cuMemAlloc(&raceway_worker_cache.wave_live_b, static_cast<size_t>(wave_cap) * sizeof(uint32_t)), "cuMemAlloc(raceway_wave_live_b)");
+								check_cuda(cuMemAlloc(&raceway_worker_cache.wave_compact_counter, sizeof(uint32_t)), "cuMemAlloc(raceway_wave_compact_counter)");
+								check_cuda(cuMemAlloc(&raceway_worker_cache.wave_state, static_cast<size_t>(wave_cap) * 32u * sizeof(uint32_t)), "cuMemAlloc(raceway_wave_state)");
+								if (raceway_capture_flags)
+								{
+									check_cuda(cuMemAlloc(&raceway_worker_cache.wave_flags, wave_cap), "cuMemAlloc(raceway_wave_flags)");
+									check_cuda(cuMemAlloc(&raceway_worker_cache.wave_hit_packed, static_cast<size_t>(wave_cap) * sizeof(uint32_t)), "cuMemAlloc(raceway_wave_hit_packed)");
+								}
+								if (args.raceway_direct_wave_parity)
+								{
+									check_cuda(cuMemAlloc(&raceway_worker_cache.wave_flat_flags, wave_cap), "cuMemAlloc(raceway_wave_flat_flags)");
+								}
+								if (args.raceway_drop_hist)
+									check_cuda(cuMemAlloc(&raceway_worker_cache.wave_drop_map, wave_cap), "cuMemAlloc(raceway_wave_drop_map)");
+								check_cuda(cuMemAlloc(&raceway_worker_cache.wave_occ_counter, sizeof(uint32_t)), "cuMemAlloc(raceway_wave_occ_counter)");
+							}
+							wave_work_counter = raceway_worker_cache.wave_work_counter;
+							wave_stats = raceway_worker_cache.wave_stats;
+							wave_alive = raceway_worker_cache.wave_alive;
+							wave_live_a = raceway_worker_cache.wave_live_a;
+							wave_live_b = raceway_worker_cache.wave_live_b;
+							wave_compact_counter = raceway_worker_cache.wave_compact_counter;
+							wave_state = raceway_worker_cache.wave_state;
+							wave_flags = raceway_worker_cache.wave_flags;
+							wave_flat_flags = raceway_worker_cache.wave_flat_flags;
+							wave_drop_map = raceway_worker_cache.wave_drop_map;
+							wave_occ_counter = raceway_worker_cache.wave_occ_counter;
+							wave_hit_packed = raceway_worker_cache.wave_hit_packed;
 						}
-						if (args.raceway_drop_hist)
-							check_cuda(cuMemAlloc(&wave_drop_map, wave_cap), "cuMemAlloc(raceway_wave_drop_map)");
-						check_cuda(cuMemAlloc(&wave_occ_counter, sizeof(uint32_t)), "cuMemAlloc(raceway_wave_occ_counter)");
+						else
+						{
+							check_cuda(cuMemAlloc(&wave_work_counter, sizeof(uint32_t)), "cuMemAlloc(raceway_wave_work_counter)");
+							check_cuda(cuMemAlloc(&wave_stats, sizeof(RacewayStatsHost)), "cuMemAlloc(raceway_wave_stats)");
+							check_cuda(cuMemAlloc(&wave_alive, wave_cap), "cuMemAlloc(raceway_wave_alive)");
+							check_cuda(cuMemAlloc(&wave_live_a, static_cast<size_t>(wave_cap) * sizeof(uint32_t)), "cuMemAlloc(raceway_wave_live_a)");
+							check_cuda(cuMemAlloc(&wave_live_b, static_cast<size_t>(wave_cap) * sizeof(uint32_t)), "cuMemAlloc(raceway_wave_live_b)");
+							check_cuda(cuMemAlloc(&wave_compact_counter, sizeof(uint32_t)), "cuMemAlloc(raceway_wave_compact_counter)");
+							check_cuda(cuMemAlloc(&wave_state, static_cast<size_t>(wave_cap) * 32u * sizeof(uint32_t)), "cuMemAlloc(raceway_wave_state)");
+							if (raceway_capture_flags)
+							{
+								check_cuda(cuMemAlloc(&wave_flags, wave_cap), "cuMemAlloc(raceway_wave_flags)");
+								check_cuda(cuMemAlloc(&wave_hit_packed, static_cast<size_t>(wave_cap) * sizeof(uint32_t)), "cuMemAlloc(raceway_wave_hit_packed)");
+							}
+							if (args.raceway_direct_wave_parity)
+							{
+								check_cuda(cuMemAlloc(&wave_flat_flags, wave_cap), "cuMemAlloc(raceway_wave_flat_flags)");
+							}
+							if (args.raceway_drop_hist)
+								check_cuda(cuMemAlloc(&wave_drop_map, wave_cap), "cuMemAlloc(raceway_wave_drop_map)");
+							check_cuda(cuMemAlloc(&wave_occ_counter, sizeof(uint32_t)), "cuMemAlloc(raceway_wave_occ_counter)");
+						}
 						sample_race_mem();
 						uint64_t wave_device_bytes = sizeof(uint32_t) + sizeof(RacewayStatsHost)
 							+ static_cast<uint64_t>(wave_cap)
 							+ static_cast<uint64_t>(wave_cap) * 2ull * sizeof(uint32_t)
 							+ sizeof(uint32_t)
 							+ static_cast<uint64_t>(wave_cap) * 32ull * sizeof(uint32_t);
+						if (raceway_capture_flags)
+							wave_device_bytes += static_cast<uint64_t>(wave_cap);
 						if (args.raceway_direct_wave_parity)
-							wave_device_bytes += static_cast<uint64_t>(wave_cap) * 2ull;
+							wave_device_bytes += static_cast<uint64_t>(wave_cap);
 						if (args.raceway_drop_hist)
 							wave_device_bytes += static_cast<uint64_t>(wave_cap);
 						wave_device_bytes += sizeof(uint32_t);
 
 						auto clear_raceway_caps = [&]() {
+							const auto clr0 = std::chrono::high_resolution_clock::now();
 							for (uint32_t c = 0u; c < cap_count; ++c)
 							{
 								const uint64_t cap_slots = (1ull << args.raceway_cap_bits) * static_cast<uint64_t>(args.raceway_cap_ways);
@@ -3933,6 +4574,8 @@ int main(int argc, char** argv)
 									256, 1, 1, 0, 0, za, nullptr), "launch(raceway_wave_cap_clear)");
 							}
 							check_cuda(cuCtxSynchronize(), "sync(raceway_wave_cap_clear)");
+							const auto clr1 = std::chrono::high_resolution_clock::now();
+							race_cap_clear_ms += std::chrono::duration<double, std::milli>(clr1 - clr0).count();
 						};
 						auto completed_map_string = [](const std::vector<uint32_t>& cap_indices) {
 							std::ostringstream s;
@@ -3963,42 +4606,80 @@ int main(int argc, char** argv)
 						const uint32_t continue_warps = continue_threads / kCudaWarpSize;
 						std::vector<uint8_t> h_cont, h_flat, h_drop;
 						std::vector<uint32_t> h_live;
-						if (args.raceway_direct_wave_parity)
+						if (raceway_capture_flags && args.raceway_direct_wave_parity)
 						{
+							// Parity path walks the full-width flag buffer on the host.
 							h_cont.resize(wave_cap);
-							h_flat.resize(wave_cap);
 							h_live.resize(wave_cap);
 						}
-						if (args.raceway_drop_hist) h_drop.resize(wave_cap);
-
-							std::cout << "[raceway-wave-cadence-sweep] device=" << device_name
-							          << " key=0x" << std::hex << std::setw(8) << std::setfill('0') << args.key_id
-							          << std::dec << std::setfill(' ')
-							          << " mode=offset state=1"
-							          << " batch=" << args.raceway_direct_wave_continue_batch
-							          << " span_ilp=" << args.raceway_direct_wave_span_ilp
-							          << " continue_ilp=" << selected_wave_continue_ilp
-							          << " window=" << direct_total
-							          << " data_start=" << direct_data_start
-							          << " cap_shape=2^" << args.raceway_cap_bits << "x" << args.raceway_cap_ways
-							          << " (" << (cap_slots_total * sizeof(unsigned long long) / (1ull << 20)) << " MB max)\n";
-							if (raceway_precert_active)
-							{
-								std::cout << "  precert-active: represented_window=" << args.workunit_size
-								          << " logical_window=" << direct_total
-								          << " source_mult=" << raceway_precert_source_mult << "\n";
+						// Non-parity fast path: h_cont is unused and h_live only receives the
+						// GPU-compacted hits (~1e3), so it is grown on demand below instead of
+						// allocating+zeroing ~42 MB/key here.
+						if (args.raceway_direct_wave_parity)
+						{
+							h_flat.resize(wave_cap);
 							}
-						std::cout << "  memory: observed_peak_used=" << std::fixed << std::setprecision(1)
-						          << mib(static_cast<uint64_t>(race_mem_total - race_mem_min_free)) << " MiB"
-						          << " delta_from_race_start="
-						          << mib(static_cast<uint64_t>(race_mem_start_free - race_mem_min_free)) << " MiB"
-						          << " expected_device_alloc="
-						          << mib(cap_slots_total * sizeof(unsigned long long)
-						                 + static_cast<uint64_t>(osb.data.size()) + wave_device_bytes) << " MiB"
-						          << " (caps=" << mib(cap_slots_total * sizeof(unsigned long long))
-						          << ", wave=" << mib(wave_device_bytes)
-						          << ", offset_stream=" << mib(static_cast<uint64_t>(osb.data.size())) << ")\n";
-						std::cout << "  Note: completed-map 27 is intentionally excluded because it cannot save downstream compute.\n";
+							if (args.raceway_drop_hist) h_drop.resize(wave_cap);
+							std::ofstream raceway_hit_out;
+							uint64_t raceway_hits_total = 0ull, raceway_hits_carnival = 0ull, raceway_hits_other = 0ull, raceway_hits_dual = 0ull;
+							std::string raceway_effective_hit_file = args.raceway_hit_file;
+							if (!args.raceway_hit_dir.empty())
+							{
+								raceway_effective_hit_file = args.raceway_hit_dir + "/key_"
+									+ key_hex8(args.key_id) + ".hits.tsv";
+							}
+							if (!raceway_effective_hit_file.empty())
+							{
+								raceway_hit_out.open(raceway_effective_hit_file, std::ios::trunc);
+								if (!raceway_hit_out) throw std::runtime_error("cannot open raceway hit file: " + raceway_effective_hit_file);
+								raceway_hit_out << "# representative_data_value\tflag  key=0x"
+								                << std::hex << std::setw(8) << std::setfill('0') << args.key_id
+								                << std::dec << std::setfill(' ')
+								                << "  flag: 0x08=carnival 0x09=other-world 0x0B=dual\n";
+								raceway_hit_out << "# NOTE: raceway/precert capture writes representative reduced-axis data values, not every weighted duplicate.\n";
+							}
+
+							if (raceway_worker_fast)
+							{
+								std::cout << "[raceway-worker-key] index=" << raceway_worker_index
+								          << " key=0x" << std::hex << std::setw(8) << std::setfill('0') << args.key_id
+								          << std::dec << std::setfill(' ')
+								          << " shed_bits=" << raceway_precert_bits
+								          << " logical_window=" << direct_total
+								          << " batch=" << args.raceway_direct_wave_continue_batch
+								          << " cap_shape=2^" << args.raceway_cap_bits << "x" << args.raceway_cap_ways << "\n";
+							}
+							else
+							{
+								std::cout << "[raceway-wave-cadence-sweep] device=" << device_name
+								          << " key=0x" << std::hex << std::setw(8) << std::setfill('0') << args.key_id
+								          << std::dec << std::setfill(' ')
+								          << " mode=offset state=1"
+								          << " batch=" << args.raceway_direct_wave_continue_batch
+								          << " span_ilp=" << args.raceway_direct_wave_span_ilp
+								          << " continue_ilp=" << selected_wave_continue_ilp
+								          << " window=" << direct_total
+								          << " data_start=" << direct_data_start
+								          << " cap_shape=2^" << args.raceway_cap_bits << "x" << args.raceway_cap_ways
+								          << " (" << (cap_slots_total * sizeof(unsigned long long) / (1ull << 20)) << " MB max)\n";
+								if (raceway_precert_active)
+								{
+									std::cout << "  precert-active: represented_window=" << args.workunit_size
+									          << " logical_window=" << direct_total
+									          << " source_mult=" << raceway_precert_source_mult << "\n";
+								}
+								std::cout << "  memory: observed_peak_used=" << std::fixed << std::setprecision(1)
+								          << mib(static_cast<uint64_t>(race_mem_total - race_mem_min_free)) << " MiB"
+								          << " delta_from_race_start="
+								          << mib(static_cast<uint64_t>(race_mem_start_free - race_mem_min_free)) << " MiB"
+								          << " expected_device_alloc="
+								          << mib(cap_slots_total * sizeof(unsigned long long)
+								                 + static_cast<uint64_t>(osb.data.size()) + wave_device_bytes) << " MiB"
+								          << " (caps=" << mib(cap_slots_total * sizeof(unsigned long long))
+								          << ", wave=" << mib(wave_device_bytes)
+								          << ", offset_stream=" << mib(static_cast<uint64_t>(osb.data.size())) << ")\n";
+								std::cout << "  Note: completed-map 27 is intentionally excluded because it cannot save downstream compute.\n";
+							}
 
 						// ===== PRODUCTION raceway calibration: empirical span-ILP x cap-bits sweep. =====
 						// Raceway is the production engine; pick its per-device geom by MEASURING the
@@ -4203,6 +4884,15 @@ int main(int argc, char** argv)
 							uint32_t empty_waves = 0u;
 							uint32_t batches = 0u;
 
+							// Upload this plan's tail-boundary maps (e.g. {6,16}) for the fused-tail megakernel.
+							uint32_t n_tail_caps = 0u;
+							if (args.raceway_fused_tail && plan.second.size() >= 2u)
+							{
+								std::vector<uint32_t> tail_maps_h;
+								for (size_t ti = 1u; ti < plan.second.size(); ++ti) tail_maps_h.push_back(plan.second[ti]);
+								n_tail_caps = static_cast<uint32_t>(tail_maps_h.size());
+								check_cuda(cuMemcpyHtoD(d_tail_maps, tail_maps_h.data(), tail_maps_h.size() * sizeof(uint32_t)), "HtoD(raceway_tail_maps)");
+							}
 							for (uint64_t done = 0u; done < direct_total; )
 							{
 								const uint32_t batch_n = static_cast<uint32_t>(std::min<uint64_t>(
@@ -4212,6 +4902,101 @@ int main(int argc, char** argv)
 								if (wave_flags) check_cuda(cuMemsetD8(wave_flags, 0u, batch_n), "memset(raceway_wave_flags)");
 								if (wave_drop_map) check_cuda(cuMemsetD8(wave_drop_map, 0xFFu, batch_n), "memset(raceway_wave_drop_map)");
 
+								// Hoisted so both the async and sync cadence branches feed the shared hit extraction below.
+								CUdeviceptr cur_live = wave_live_a;
+								CUdeviceptr next_live = wave_live_b;
+								uint32_t cur_count = 0u;
+								uint32_t prev_boundary = 0u;
+								uint32_t batch_n_arg = batch_n;
+								bool async_done = false;
+								if (args.raceway_async_cadence)
+								{
+									// Device-driven cadence: survivor counts live in wave_cnt2 (ping-pong); span/compact/continue
+									// read the count from a device pointer with fixed fill grids, so NO per-span DtoH/cuCtxSync.
+									// The whole per-batch chain issues in order on the NULL stream; one DtoH syncs at batch end.
+									if (args.raceway_direct_wave_span_ilp != 4u || selected_wave_continue_ilp != 4u)
+										throw std::runtime_error("--raceway-async-cadence prototype requires span-ilp=4 and continue-ilp=4");
+									uint32_t a_first_boundary = plan.second.front();
+									uint32_t a_sched_count = schedule_count;
+									uint32_t a_one_cap = 1u;
+									CUdeviceptr a_drop = wave_drop_map;
+									const uint32_t a_first_blocks = std::min<uint32_t>(8192u, std::max<uint32_t>(1u,
+										static_cast<uint32_t>((static_cast<uint64_t>(batch_n) + race_warps_per_block - 1ull) / race_warps_per_block)));
+									check_cuda(cuMemsetD32Async(wave_work_counter, 0u, 1u, 0), "memsetA(work0)");
+									void* a_fa[] = { (void*)&batch_n, (void*)&batch_data_start, &wave_work_counter, &wave_alive, &a_drop, &wave_stats,
+										&wave_state, &d_cap_tables, &d_cap_bits, &d_cap_ways, &a_one_cap,
+										&off_regular, &off_alg0, &off_alg6, &off_alg2, &off_alg5,
+										&assets.expansion_values, &assets.schedule_data, &args.key_id, &a_sched_count, &a_first_boundary };
+									void* a_fa_pre[] = { (void*)&batch_n, (void*)&batch_data_start, &wave_work_counter, &wave_alive, &a_drop, &wave_stats,
+										&wave_state, &d_cap_tables, &d_cap_bits, &d_cap_ways, &a_one_cap,
+										&off_regular, &off_alg0, &off_alg6, &off_alg2, &off_alg5,
+										&assets.expansion_values, &assets.schedule_data, &args.key_id, &a_sched_count, &a_first_boundary,
+										(void*)&raceway_precert_fixed_value, (void*)&raceway_precert_support_mask };
+									check_cuda(cuLaunchKernel(raceway_direct_k, a_first_blocks, 1, 1, race_threads_per_block, 1, 1, 0, 0,
+										raceway_precert_active ? a_fa_pre : a_fa, nullptr), "launch(async_first)");
+									CUdeviceptr a_cntA = wave_cnt2;
+									CUdeviceptr a_cntB = wave_cnt2 + sizeof(uint32_t);
+									const uint32_t a_compact_grid = std::max<uint32_t>(1u, (batch_n + 255u) / 256u);
+									check_cuda(cuMemsetD32Async(a_cntA, 0u, 1u, 0), "memsetA(cntA)");
+									uint32_t a_batch_n = batch_n; CUdeviceptr a_null_live = 0; int a_first_span = 1;
+									void* a_ca0[] = { &wave_alive, &a_null_live, &a_batch_n, &wave_live_a, &a_cntA, &a_first_span };
+									check_cuda(cuLaunchKernel(raceway_compact_k, a_compact_grid, 1, 1, 256, 1, 1, 0, 0, a_ca0, nullptr), "launch(async_compact0)");
+									cur_live = wave_live_a; next_live = wave_live_b;
+									CUdeviceptr a_cur_cnt = a_cntA, a_next_cnt = a_cntB;
+									prev_boundary = a_first_boundary;
+									if (args.raceway_fused_tail)
+									{
+										// One fused launch: maps [first_boundary+1 .. 26] carried in registers, tail caps inline,
+										// screen at map 26. No intermediate state writeback or compaction. a_cntB = alive-at-26 counter.
+										check_cuda(cuMemsetD32Async(wave_work_counter, 0u, 1u, 0), "memsetA(fusedwork)");
+										check_cuda(cuMemsetD32Async(a_cntB, 0u, 1u, 0), "memsetA(fusedsurv)");
+										uint32_t a_ft_cbits = args.raceway_cap_bits, a_ft_cways = args.raceway_cap_ways;
+										uint32_t a_ft_start = a_first_boundary + 1u;
+										CUdeviceptr a_tail_caps = d_cap_tables + sizeof(CUdeviceptr);
+										void* a_ft[] = { &cur_live, &a_cntA, &wave_work_counter, &wave_state, &wave_flags, &a_cntB,
+											&a_tail_caps, &a_ft_cbits, &a_ft_cways, &d_tail_maps, &n_tail_caps,
+											&off_regular, &off_alg0, &off_alg6, &off_alg2, &off_alg5,
+											&assets.schedule_data, &assets.carnival_data, &a_ft_start };
+										check_cuda(cuLaunchKernel(raceway_fused_tail_k, 8192u, 1, 1, race_threads_per_block, 1, 1, 0, 0, a_ft, nullptr), "launch(fused_tail)");
+										// collect_hits scans the post-map2 list (a_cntA = C0); survivors-to-26 carry their screen flag.
+										check_cuda(cuMemcpyDtoH(&cur_count, a_cntA, sizeof(uint32_t)), "DtoH(fused_scan_count)");
+									}
+									else
+									{
+									for (uint32_t bi = 1u; bi < plan.second.size(); ++bi)
+									{
+										check_cuda(cuMemsetD32Async(wave_work_counter, 0u, 1u, 0), "memsetA(spanwork)");
+										uint32_t a_start = prev_boundary + 1u, a_end = plan.second[bi];
+										uint32_t a_cbits = args.raceway_cap_bits, a_cways = args.raceway_cap_ways;
+										void* a_sa[] = { &cur_live, &a_cur_cnt, &wave_work_counter, &wave_state, &wave_alive, &a_drop,
+											&wave_stats, &cap_tables_h[bi], &a_cbits, &a_cways,
+											&off_regular, &off_alg0, &off_alg6, &off_alg2, &off_alg5,
+											&assets.schedule_data, &a_start, &a_end };
+										check_cuda(cuLaunchKernel(raceway_span_devcount_k, 8192u, 1, 1, race_threads_per_block, 1, 1, 0, 0, a_sa, nullptr), "launch(async_span)");
+										check_cuda(cuMemsetD32Async(a_next_cnt, 0u, 1u, 0), "memsetA(nextcnt)");
+										int a_not_first = 0;
+										void* a_ca[] = { &wave_alive, &cur_live, &a_cur_cnt, &next_live, &a_next_cnt, &a_not_first };
+										check_cuda(cuLaunchKernel(raceway_compact_devcount_k, a_compact_grid, 1, 1, 256, 1, 1, 0, 0, a_ca, nullptr), "launch(async_compact)");
+										std::swap(cur_live, next_live);
+										std::swap(a_cur_cnt, a_next_cnt);
+										prev_boundary = a_end;
+									}
+									uint32_t a_cont_start = prev_boundary + 1u;
+									const uint32_t a_cont_ilp = selected_wave_continue_ilp;
+									const uint32_t a_cont_grid = std::max<uint32_t>(1u, static_cast<uint32_t>(
+										(static_cast<uint64_t>(batch_n) + static_cast<uint64_t>(continue_warps) * a_cont_ilp - 1ull)
+										/ (static_cast<uint64_t>(continue_warps) * a_cont_ilp)));
+									void* a_cont[] = { &cur_live, &a_cur_cnt, &wave_state, &wave_flags,
+										&off_regular, &off_alg0, &off_alg6, &off_alg2, &off_alg5,
+										&assets.schedule_data, &assets.carnival_data, &a_cont_start };
+									check_cuda(cuLaunchKernel(raceway_continue_devcount_k, a_cont_grid, 1, 1, continue_threads, 1, 1, 0, 0, a_cont, nullptr), "launch(async_continue)");
+									check_cuda(cuMemcpyDtoH(&cur_count, a_cur_cnt, sizeof(uint32_t)), "DtoH(async_final_count)");
+									continuation_slots += ((static_cast<uint64_t>(cur_count) + a_cont_ilp - 1ull) / a_cont_ilp) * a_cont_ilp;
+									}
+									async_done = true;
+								}
+								if (!async_done)
+								{
 								uint32_t batch_blocks = static_cast<uint32_t>((static_cast<uint64_t>(batch_n) + race_warps_per_block - 1ull)
 									/ race_warps_per_block);
 								batch_blocks = std::min<uint32_t>(8192u, std::max<uint32_t>(1u, batch_blocks));
@@ -4235,17 +5020,20 @@ int main(int argc, char** argv)
 										&batch_schedule_count, &first_boundary,
 										(void*)&raceway_precert_fixed_value, (void*)&raceway_precert_support_mask };
 									void** first_launch_args = raceway_precert_active ? first_args_pre : first_args;
-									check_cuda(cuCtxSynchronize(), "sync(raceway_wave_first_pre)");
 									const auto f0 = std::chrono::high_resolution_clock::now();
 									check_cuda(cuLaunchKernel(raceway_direct_k, batch_blocks, 1, 1,
 										race_threads_per_block, 1, 1, 0, 0, first_launch_args, nullptr), "launch(raceway_wave_first)");
-								check_cuda(cuCtxSynchronize(), "sync(raceway_wave_first)");
-								const auto f1 = std::chrono::high_resolution_clock::now();
-								const double first_span_ms = std::chrono::duration<double, std::milli>(f1 - f0).count();
-								cap_ms_total += first_span_ms;
+								double first_span_ms = 0.0;
+								if (!raceway_worker_fast)
+								{
+									check_cuda(cuCtxSynchronize(), "sync(raceway_wave_first)");
+									const auto f1 = std::chrono::high_resolution_clock::now();
+									first_span_ms = std::chrono::duration<double, std::milli>(f1 - f0).count();
+									cap_ms_total += first_span_ms;
+								}
 
 								uint32_t compacted = 0u;
-								uint32_t batch_n_arg = batch_n;
+								batch_n_arg = batch_n;
 								CUdeviceptr null_live_in = 0;
 								int first_span = 1;
 								check_cuda(cuMemsetD32(wave_compact_counter, 0u, 1u), "memset(raceway_wave_compact_counter)");
@@ -4253,11 +5041,14 @@ int main(int argc, char** argv)
 								const auto c0 = std::chrono::high_resolution_clock::now();
 								check_cuda(cuLaunchKernel(raceway_compact_k, (batch_n + 255u) / 256u, 1, 1,
 									256, 1, 1, 0, 0, ca0, nullptr), "launch(raceway_wave_compact0)");
-								check_cuda(cuCtxSynchronize(), "sync(raceway_wave_compact0)");
-								const auto c1 = std::chrono::high_resolution_clock::now();
-								const double first_compact_ms = std::chrono::duration<double, std::milli>(c1 - c0).count();
-								compact_ms_total += first_compact_ms;
 								check_cuda(cuMemcpyDtoH(&compacted, wave_compact_counter, sizeof(uint32_t)), "DtoH(raceway_wave_compact_counter0)");
+								double first_compact_ms = 0.0;
+								if (!raceway_worker_fast)
+								{
+									const auto c1 = std::chrono::high_resolution_clock::now();
+									first_compact_ms = std::chrono::duration<double, std::milli>(c1 - c0).count();
+									compact_ms_total += first_compact_ms;
+								}
 								if (!boundary_stats.empty())
 								{
 									RacewayBoundaryStats& bs0 = boundary_stats[0];
@@ -4269,10 +5060,10 @@ int main(int argc, char** argv)
 									bs0.compact_ms += first_compact_ms;
 								}
 
-								CUdeviceptr cur_live = wave_live_a;
-								CUdeviceptr next_live = wave_live_b;
-								uint32_t cur_count = compacted;
-								uint32_t prev_boundary = first_boundary;
+								cur_live = wave_live_a;
+								next_live = wave_live_b;
+								cur_count = compacted;
+								prev_boundary = first_boundary;
 								for (uint32_t bi = 1u; bi < plan.second.size(); ++bi)
 								{
 									if (cur_count == 0u) break;
@@ -4291,10 +5082,14 @@ int main(int argc, char** argv)
 									const auto s0 = std::chrono::high_resolution_clock::now();
 									check_cuda(cuLaunchKernel(raceway_span_state_k, span_blocks, 1, 1,
 										race_threads_per_block, 1, 1, 0, 0, sa, nullptr), "launch(raceway_wave_span)");
-									check_cuda(cuCtxSynchronize(), "sync(raceway_wave_span)");
-									const auto s1 = std::chrono::high_resolution_clock::now();
-									const double span_ms = std::chrono::duration<double, std::milli>(s1 - s0).count();
-									cap_ms_total += span_ms;
+									double span_ms = 0.0;
+									if (!raceway_worker_fast)
+									{
+										check_cuda(cuCtxSynchronize(), "sync(raceway_wave_span)");
+										const auto s1 = std::chrono::high_resolution_clock::now();
+										span_ms = std::chrono::duration<double, std::milli>(s1 - s0).count();
+										cap_ms_total += span_ms;
+									}
 
 									int not_first_span = 0;
 									const uint32_t span_input = cur_count;
@@ -4302,11 +5097,14 @@ int main(int argc, char** argv)
 									const auto cc0 = std::chrono::high_resolution_clock::now();
 									check_cuda(cuLaunchKernel(raceway_compact_k, (cur_count + 255u) / 256u, 1, 1,
 										256, 1, 1, 0, 0, ca, nullptr), "launch(raceway_wave_span_compact)");
-									check_cuda(cuCtxSynchronize(), "sync(raceway_wave_span_compact)");
-									const auto cc1 = std::chrono::high_resolution_clock::now();
-									const double span_compact_ms = std::chrono::duration<double, std::milli>(cc1 - cc0).count();
-									compact_ms_total += span_compact_ms;
 									check_cuda(cuMemcpyDtoH(&cur_count, wave_compact_counter, sizeof(uint32_t)), "DtoH(raceway_wave_span_compact_counter)");
+									double span_compact_ms = 0.0;
+									if (!raceway_worker_fast)
+									{
+										const auto cc1 = std::chrono::high_resolution_clock::now();
+										span_compact_ms = std::chrono::duration<double, std::milli>(cc1 - cc0).count();
+										compact_ms_total += span_compact_ms;
+									}
 									if (bi < boundary_stats.size())
 									{
 										RacewayBoundaryStats& bsb = boundary_stats[bi];
@@ -4340,16 +5138,26 @@ int main(int argc, char** argv)
 									check_cuda(cuLaunchKernel(raceway_continue_k, continue_grid, 1, 1,
 										continue_threads, 1, 1, 0, 0, cont_state_args, nullptr), "launch(raceway_wave_cadence_continue)");
 								}
-								check_cuda(cuCtxSynchronize(), "sync(raceway_wave_cadence_continue)");
-								const auto k1 = std::chrono::high_resolution_clock::now();
-								continue_ms_total += std::chrono::duration<double, std::milli>(k1 - k0).count();
+								if (!raceway_worker_fast)
+								{
+									check_cuda(cuCtxSynchronize(), "sync(raceway_wave_cadence_continue)");
+									const auto k1 = std::chrono::high_resolution_clock::now();
+									continue_ms_total += std::chrono::duration<double, std::milli>(k1 - k0).count();
+								}
+								} // end sync cadence branch
 
-								RacewayStatsHost bs;
-								check_cuda(cuMemcpyDtoH(&bs, wave_stats, sizeof(bs)), "DtoH(raceway_wave_cadence_stats)");
-								total_stats.reps_started += bs.reps_started;
-								total_stats.reps_completed += bs.reps_completed;
-								total_stats.reps_dropped += bs.reps_dropped;
-								total_stats.map_evals += bs.map_evals;
+								if (!raceway_worker_fast)
+								{
+									const auto st0 = std::chrono::high_resolution_clock::now();
+									RacewayStatsHost bs;
+									check_cuda(cuMemcpyDtoH(&bs, wave_stats, sizeof(bs)), "DtoH(raceway_wave_cadence_stats)");
+									race_stats_dtoh_ms += std::chrono::duration<double, std::milli>(
+										std::chrono::high_resolution_clock::now() - st0).count();
+									total_stats.reps_started += bs.reps_started;
+									total_stats.reps_completed += bs.reps_completed;
+									total_stats.reps_dropped += bs.reps_dropped;
+									total_stats.map_evals += bs.map_evals;
+								}
 								total_survivors += cur_count;
 								min_survivors = std::min<uint32_t>(min_survivors, cur_count);
 								max_survivors = std::max<uint32_t>(max_survivors, cur_count);
@@ -4365,56 +5173,176 @@ int main(int argc, char** argv)
 										if (h_drop[i] < hist.size()) ++hist[h_drop[i]];
 									}
 								}
-									if (args.raceway_direct_wave_parity)
+						if (raceway_capture_flags)
+						{
+							if (!args.raceway_direct_wave_parity)
+							{
+								// GPU-compacted hit extraction: emit only nonzero-flag survivors (~1e3) instead of a
+								// host scan over all ~2e7 survivors. wave_occ_counter doubles as the hit counter
+								// (free between batches; reset by count_cap_occupied at end-of-key).
+								const auto hx0 = std::chrono::high_resolution_clock::now();
+								check_cuda(cuMemsetD32(wave_occ_counter, 0u, 1u), "memset(raceway_hit_count)");
+								{
+									uint32_t hit_cap = wave_cap;
+							void* hca[] = { &cur_live, &cur_count, &wave_flags, &wave_hit_packed, &wave_occ_counter, &hit_cap };
+									const uint32_t hit_grid = std::min<uint32_t>(8192u, std::max<uint32_t>(1u, (cur_count + 255u) / 256u));
+									check_cuda(cuLaunchKernel(raceway_collect_hits_k, hit_grid, 1, 1, 256, 1, 1, 0, 0, hca, nullptr), "launch(raceway_collect_hits)");
+								}
+								check_cuda(cuCtxSynchronize(), "sync(raceway_collect_hits)");
+								uint32_t hit_count = 0u;
+								check_cuda(cuMemcpyDtoH(&hit_count, wave_occ_counter, sizeof(uint32_t)), "DtoH(raceway_hit_count)");
+								if (hit_count > wave_cap) hit_count = wave_cap;
+								if (hit_count != 0u)
+								{
+									if (h_live.size() < hit_count) h_live.resize(hit_count);
+							check_cuda(cuMemcpyDtoH(h_live.data(), wave_hit_packed, static_cast<size_t>(hit_count) * sizeof(uint32_t)), "DtoH(raceway_hit_packed)");
+									for (uint32_t j = 0u; j < hit_count; ++j)
 									{
-										check_cuda(cuMemcpyDtoH(h_live.data(), cur_live, static_cast<size_t>(cur_count) * sizeof(uint32_t)), "DtoH(raceway_wave_cadence_live)");
-										check_cuda(cuMemsetD8(wave_flat_flags, 0u, batch_n), "memset(raceway_wave_cadence_flat)");
-										const auto pf0 = std::chrono::high_resolution_clock::now();
-										if (raceway_precert_active)
-										{
-											void* flat_args_pre[] = { &wave_flat_flags,
-												&assets.regular_rng_values, &assets.alg0_values, &assets.alg6_values,
-												&assets.rng_seed_forward_1, &assets.rng_seed_forward_128, &assets.alg2_values, &assets.alg5_values,
-												&assets.expansion_values, &assets.schedule_data, &assets.carnival_data,
-												&args.key_id, (void*)&raceway_precert_fixed_value, (void*)&raceway_precert_support_mask,
-												(void*)&batch_data_start, &batch_n_arg };
-											check_cuda(cuLaunchKernel(screen_remap_offset_k, screen_kernel_grid_x(batch_n), 1, 1,
-												kCudaThreadsPerBlock, 1, 1, 0, 0, flat_args_pre, nullptr), "launch(raceway_wave_cadence_flat_screen_precert)");
-										}
-										else
-										{
-											void* flat_args[] = { &wave_flat_flags, &off_regular, &off_alg0, &off_alg6, &off_alg2, &off_alg5,
-												&assets.expansion_values, &assets.schedule_data, &assets.carnival_data,
-												&args.key_id, (void*)&batch_data_start, &batch_n_arg };
-											check_cuda(cuLaunchKernel(screen_offset_ilp6_preids_kernel, screen_kernel_grid_x_ilp(batch_n, 6u), 1, 1,
-												kCudaThreadsPerBlock, 1, 1, 0, 0, flat_args, nullptr), "launch(raceway_wave_cadence_flat_screen)");
-										}
-										check_cuda(cuCtxSynchronize(), "sync(raceway_wave_cadence_flat_screen)");
-									const auto pf1 = std::chrono::high_resolution_clock::now();
-									flat_ms_total += std::chrono::duration<double, std::milli>(pf1 - pf0).count();
-									check_cuda(cuMemcpyDtoH(h_cont.data(), wave_flags, batch_n), "DtoH(raceway_wave_cadence_flags)");
-									check_cuda(cuMemcpyDtoH(h_flat.data(), wave_flat_flags, batch_n), "DtoH(raceway_wave_cadence_flat_flags)");
-									for (uint32_t i = 0u; i < cur_count; ++i)
-									{
-										const uint32_t orig = h_live[i];
-										++parity_checked;
-										cont_sum += h_cont[orig];
-										flat_sum += h_flat[orig];
-										if (h_cont[orig] != h_flat[orig]) ++parity_diff;
+										const uint32_t packed = h_live[j];
+										const uint32_t orig = packed >> 8;
+										const uint8_t cont_flag = static_cast<uint8_t>(packed & 0xFFu);
+										cont_sum += cont_flag;
+										const uint32_t logical = batch_data_start + orig;
+										const uint32_t data = raceway_precert_active
+											? (raceway_precert_fixed_value | tm_window_policy::deposit_bits32(logical, raceway_precert_support_mask))
+											: logical;
+										++raceway_hits_total;
+										if      (cont_flag == 0x0Bu) ++raceway_hits_dual;
+										else if (cont_flag == 0x09u) ++raceway_hits_other;
+										else                         ++raceway_hits_carnival;
+										if (raceway_hit_out.is_open())
+											raceway_hit_out << "0x" << std::hex << std::setw(8) << std::setfill('0') << data
+											                << "\t0x" << std::setw(2) << static_cast<uint32_t>(cont_flag)
+											                << std::dec << std::setfill(' ') << "\n";
 									}
 								}
+								race_hit_loop_ms += std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - hx0).count();
+							}
+							else
+							{
+										{
+										const auto lv0 = std::chrono::high_resolution_clock::now();
+										check_cuda(cuMemcpyDtoH(h_live.data(), cur_live, static_cast<size_t>(cur_count) * sizeof(uint32_t)), "DtoH(raceway_wave_cadence_live)");
+										race_live_dtoh_ms += std::chrono::duration<double, std::milli>(
+											std::chrono::high_resolution_clock::now() - lv0).count();
+										}
+										if (args.raceway_direct_wave_parity)
+										{
+											check_cuda(cuMemsetD8(wave_flat_flags, 0u, batch_n), "memset(raceway_wave_cadence_flat)");
+											const auto pf0 = std::chrono::high_resolution_clock::now();
+											if (raceway_precert_active)
+											{
+												void* flat_args_pre[] = { &wave_flat_flags,
+													&assets.regular_rng_values, &assets.alg0_values, &assets.alg6_values,
+													&assets.rng_seed_forward_1, &assets.rng_seed_forward_128, &assets.alg2_values, &assets.alg5_values,
+													&assets.expansion_values, &assets.schedule_data, &assets.carnival_data,
+													&args.key_id, (void*)&raceway_precert_fixed_value, (void*)&raceway_precert_support_mask,
+													(void*)&batch_data_start, &batch_n_arg };
+												check_cuda(cuLaunchKernel(screen_remap_offset_k, screen_kernel_grid_x(batch_n), 1, 1,
+													kCudaThreadsPerBlock, 1, 1, 0, 0, flat_args_pre, nullptr), "launch(raceway_wave_cadence_flat_screen_precert)");
+											}
+											else
+											{
+												void* flat_args[] = { &wave_flat_flags, &off_regular, &off_alg0, &off_alg6, &off_alg2, &off_alg5,
+													&assets.expansion_values, &assets.schedule_data, &assets.carnival_data,
+													&args.key_id, (void*)&batch_data_start, &batch_n_arg };
+												check_cuda(cuLaunchKernel(screen_offset_ilp6_preids_kernel, screen_kernel_grid_x_ilp(batch_n, 6u), 1, 1,
+													kCudaThreadsPerBlock, 1, 1, 0, 0, flat_args, nullptr), "launch(raceway_wave_cadence_flat_screen)");
+											}
+											if (!raceway_worker_fast)
+											{
+												check_cuda(cuCtxSynchronize(), "sync(raceway_wave_cadence_flat_screen)");
+												const auto pf1 = std::chrono::high_resolution_clock::now();
+												flat_ms_total += std::chrono::duration<double, std::milli>(pf1 - pf0).count();
+											}
+										}
+									{
+	const auto fc0 = std::chrono::high_resolution_clock::now();
+	check_cuda(cuMemcpyDtoH(h_cont.data(), wave_flags, batch_n), "DtoH(raceway_wave_cadence_flags)");
+	race_flag_dtoh_ms += std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - fc0).count();
+	}
+									if (args.raceway_direct_wave_parity)
+										check_cuda(cuMemcpyDtoH(h_flat.data(), wave_flat_flags, batch_n), "DtoH(raceway_wave_cadence_flat_flags)");
+										const auto hl0 = std::chrono::high_resolution_clock::now();
+						for (uint32_t i = 0u; i < cur_count; ++i)
+										{
+											const uint32_t orig = h_live[i];
+											const uint8_t cont_flag = h_cont[orig];
+											cont_sum += cont_flag;
+											if (args.raceway_direct_wave_parity)
+											{
+												++parity_checked;
+												const uint8_t flat_flag = h_flat[orig];
+												flat_sum += flat_flag;
+												if (cont_flag != flat_flag) ++parity_diff;
+											}
+											if (cont_flag != 0u && raceway_hit_out.is_open())
+											{
+												const uint32_t logical = batch_data_start + orig;
+												const uint32_t data = raceway_precert_active
+													? (raceway_precert_fixed_value | tm_window_policy::deposit_bits32(logical, raceway_precert_support_mask))
+													: logical;
+												++raceway_hits_total;
+												if      (cont_flag == 0x0Bu) ++raceway_hits_dual;
+												else if (cont_flag == 0x09u) ++raceway_hits_other;
+												else                         ++raceway_hits_carnival;
+												raceway_hit_out << "0x" << std::hex << std::setw(8) << std::setfill('0') << data
+												                << "\t0x" << std::setw(2) << static_cast<uint32_t>(cont_flag)
+												                << std::dec << std::setfill(' ') << "\n";
+											}
+										}
+									race_hit_loop_ms += std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - hl0).count();
+							}
+						}
 
 								done += batch_n;
 								++batches;
 							}
 
 							if (min_survivors == 0xFFFFFFFFu) min_survivors = 0u;
-							for (size_t bi = 0; bi < boundary_stats.size(); ++bi)
-								boundary_stats[bi].cap_occupied = count_cap_occupied(cap_tables_h[bi], boundary_stats[bi].cap_slots);
-							const double pipeline_ms = cap_ms_total + compact_ms_total + continue_ms_total;
+							// The cap-occupancy scan is a per-key full-table reduction over every cap slot
+							// (3 boundaries x ~134M slots) used only for the [raceway-host] diagnostic; it is
+							// off by default and gated behind --raceway-host-breakdown.
+							if (!raceway_worker_fast && args.raceway_host_breakdown)
+							{
+								const auto co0 = std::chrono::high_resolution_clock::now();
+						for (size_t bi = 0; bi < boundary_stats.size(); ++bi)
+									boundary_stats[bi].cap_occupied = count_cap_occupied(cap_tables_h[bi], boundary_stats[bi].cap_slots);
+					race_capocc_ms += std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - co0).count();
+							}
+							else if (raceway_worker_fast && !raceway_capture_flags && !args.raceway_drop_hist)
+							{
+								check_cuda(cuCtxSynchronize(), "sync(raceway_worker_fast_key)");
+							}
+							const double pipeline_ms = raceway_worker_fast ? 0.0 : (cap_ms_total + compact_ms_total + continue_ms_total);
 							const double avg_survivors = batches ? static_cast<double>(total_survivors) / static_cast<double>(batches) : 0.0;
 							const double wave_fill = static_cast<double>(total_survivors) / static_cast<double>(direct_total);
 							const double cont_fill = continuation_slots ? static_cast<double>(total_survivors) / static_cast<double>(continuation_slots) : 1.0;
+							if (raceway_worker_fast)
+							{
+								std::cout << "  cadence=" << plan.first
+								          << " completed_maps=" << completed_map_string(plan.second)
+								          << " drains=" << plan.second.size()
+								          << " survivors=" << total_survivors
+								          << " avg_survivors=" << std::fixed << std::setprecision(1) << avg_survivors
+								          << " min=" << min_survivors
+								          << " max=" << max_survivors
+								          << " empty=" << empty_waves
+								          << " wave_fill=" << std::setprecision(3) << wave_fill
+								          << " continuation_slot_fill=" << cont_fill;
+								if (raceway_capture_flags)
+								{
+									std::cout << " flag_sum(continue)=" << cont_sum;
+									if (args.raceway_direct_wave_parity)
+										std::cout << " parity_diff=" << parity_diff
+										          << (parity_diff == 0ull ? " [MATCH]" : " [DIFFER]")
+										          << " checked=" << parity_checked
+										          << " flag_sum(flat)=" << flat_sum;
+								}
+								std::cout << "  [fast-summary]\n";
+							}
+							else
+							{
 							std::cout << "  cadence=" << plan.first
 							          << " completed_maps=" << completed_map_string(plan.second)
 							          << " drains=" << plan.second.size()
@@ -4440,11 +5368,16 @@ int main(int argc, char** argv)
 							          << " empty=" << empty_waves
 							          << " wave_fill=" << std::setprecision(3) << wave_fill
 							          << " continuation_slot_fill=" << cont_fill;
-							if (args.raceway_direct_wave_parity)
-								std::cout << " parity_diff=" << parity_diff
-								          << (parity_diff == 0ull ? " [MATCH]" : " [DIFFER]")
-								          << " checked=" << parity_checked
-								          << " flat=" << std::setprecision(3) << flat_ms_total << " ms";
+								if (raceway_capture_flags)
+								{
+									std::cout << " flag_sum(continue)=" << cont_sum;
+									if (args.raceway_direct_wave_parity)
+										std::cout << " parity_diff=" << parity_diff
+										          << (parity_diff == 0ull ? " [MATCH]" : " [DIFFER]")
+										          << " checked=" << parity_checked
+										          << " flag_sum(flat)=" << flat_sum
+										          << " flat=" << std::setprecision(3) << flat_ms_total << " ms";
+								}
 							std::cout << "\n";
 							std::cout << "    boundary pressure:\n";
 							for (const RacewayBoundaryStats& b : boundary_stats)
@@ -4462,36 +5395,87 @@ int main(int argc, char** argv)
 								          << " cap_occ=" << b.cap_occupied << "/" << b.cap_slots
 								          << " load=" << load << "\n";
 							}
-							if (args.raceway_drop_hist)
-							{
-								std::cout << "    drop histogram:";
-								for (uint32_t m = 0u; m < hist.size(); ++m)
-									if (hist[m] != 0ull) std::cout << " m" << m << "=" << hist[m];
-								std::cout << " total=" << hist_total << "\n";
 							}
+								if (args.raceway_drop_hist)
+								{
+									std::cout << "    drop histogram:";
+									for (uint32_t m = 0u; m < hist.size(); ++m)
+										if (hist[m] != 0ull) std::cout << " m" << m << "=" << hist[m];
+									std::cout << " total=" << hist_total << "\n";
+								}
+								if (raceway_hit_out.is_open())
+								{
+									raceway_hit_out.close();
+									std::cout << "  wrote " << raceway_hits_total
+									          << " representative raceway hits to " << raceway_effective_hit_file
+									          << " [carnival=" << raceway_hits_carnival
+									          << " other-world=" << raceway_hits_other
+									          << " dual=" << raceway_hits_dual << "]\n";
+								}
+								if (raceway_worker_summary_out.is_open())
+								{
+									const auto raceway_key_wall1 = std::chrono::steady_clock::now();
+									const double elapsed_s = std::chrono::duration<double>(raceway_key_wall1 - raceway_key_wall0).count();
+									raceway_worker_summary_out
+										<< raceway_worker_index << "\t"
+										<< key_hex8(args.key_id) << "\t"
+										<< 0 << "\t"
+										<< std::fixed << std::setprecision(6) << elapsed_s << "\t"
+										<< raceway_precert_bits << "\t"
+										<< direct_total << "\t"
+										<< parity_checked << "\t"
+										<< parity_diff << "\t"
+										<< cont_sum << "\t"
+										<< flat_sum << "\t"
+										<< raceway_hits_total << "\t"
+										<< std::setprecision(3) << pipeline_ms << "\n";
+									raceway_worker_summary_out.flush();
+								}
+							if (!raceway_worker_fast && args.raceway_host_breakdown)
+							{
+								const auto race_wallx = std::chrono::steady_clock::now();
+								const double elapsed_ms = std::chrono::duration<double, std::milli>(race_wallx - raceway_key_wall0).count();
+								const double other_ms = elapsed_ms - pipeline_ms - race_offset_htod_ms - race_cap_clear_ms
+								          - race_flag_dtoh_ms - race_live_dtoh_ms - race_hit_loop_ms
+								          - race_stats_dtoh_ms - race_capocc_ms;
+								std::cout << "  [raceway-host] setup_wait=" << std::fixed << std::setprecision(3) << race_setup_wait_ms
+								          << " offset_htod=" << race_offset_htod_ms
+								          << " cap_clear=" << race_cap_clear_ms
+								          << " flag_dtoh=" << race_flag_dtoh_ms
+								          << " live_dtoh=" << race_live_dtoh_ms
+								          << " hit_loop=" << race_hit_loop_ms
+								          << " stats_dtoh=" << race_stats_dtoh_ms
+								          << " capocc=" << race_capocc_ms
+								          << " other=" << other_ms
+								          << " (elapsed=" << elapsed_ms << " pipeline=" << pipeline_ms << ")\n";
+							}
+							}
+							if (!raceway_worker_batch_reuse)
+							{
+								cuMemFree(wave_work_counter);
+								cuMemFree(wave_stats);
+								cuMemFree(wave_alive);
+								cuMemFree(wave_live_a);
+								cuMemFree(wave_live_b);
+								cuMemFree(wave_compact_counter);
+								cuMemFree(wave_state);
+								cuMemFree(wave_occ_counter);
+								if (wave_flags) cuMemFree(wave_flags);
+								if (wave_flat_flags) cuMemFree(wave_flat_flags);
+								if (wave_drop_map) cuMemFree(wave_drop_map);
+								if (d_cap_tables) cuMemFree(d_cap_tables);
+								if (d_cap_bits) cuMemFree(d_cap_bits);
+								if (d_cap_ways) cuMemFree(d_cap_ways);
+								if (d_direct_ostream) cuMemFree(d_direct_ostream);
+								for (CUdeviceptr p : cap_tables_h) if (p) cuMemFree(p);
+							}
+							if (raceway_persistent_worker)
+								continue;
+							release_assets(assets);
+							return 0;
 						}
 
-						cuMemFree(wave_work_counter);
-						cuMemFree(wave_stats);
-						cuMemFree(wave_alive);
-						cuMemFree(wave_live_a);
-						cuMemFree(wave_live_b);
-						cuMemFree(wave_compact_counter);
-						cuMemFree(wave_state);
-						cuMemFree(wave_occ_counter);
-						if (wave_flags) cuMemFree(wave_flags);
-						if (wave_flat_flags) cuMemFree(wave_flat_flags);
-						if (wave_drop_map) cuMemFree(wave_drop_map);
-						if (d_cap_tables) cuMemFree(d_cap_tables);
-						if (d_cap_bits) cuMemFree(d_cap_bits);
-						if (d_cap_ways) cuMemFree(d_cap_ways);
-						if (d_direct_ostream) cuMemFree(d_direct_ostream);
-						for (CUdeviceptr p : cap_tables_h) if (p) cuMemFree(p);
-						release_assets(assets);
-						return 0;
-					}
-
-					if (args.raceway_direct_wave_continue_batch != 0u)
+						if (args.raceway_direct_wave_continue_batch != 0u)
 					{
 						const uint32_t wave_cap = std::min<uint32_t>(args.raceway_direct_wave_continue_batch, direct_n);
 						CUdeviceptr wave_work_counter = 0, wave_stats = 0, wave_alive = 0;
@@ -5183,12 +6167,59 @@ int main(int argc, char** argv)
 					if (d_cap_tables) cuMemFree(d_cap_tables);
 						if (d_cap_bits) cuMemFree(d_cap_bits);
 						if (d_cap_ways) cuMemFree(d_cap_ways);
-						if (d_direct_ostream) cuMemFree(d_direct_ostream);
-						for (CUdeviceptr p : cap_tables_h) if (p) cuMemFree(p);
-						return 0;
+							if (d_direct_ostream) cuMemFree(d_direct_ostream);
+							for (CUdeviceptr p : cap_tables_h) if (p) cuMemFree(p);
+							return 0;
+						}
+							if (!args.raceway_daemon) break;
+							// Daemon: batch complete -> flush, signal, then block for the next key-file path on stdin.
+							// Reuses the resident CUDA ctx/module/RNG tables/wave buffers (no per-batch ~420ms cuInit).
+							if (raceway_worker_summary_out.is_open()) raceway_worker_summary_out.flush();
+							std::cout << "DAEMON_DONE" << std::endl; std::cout.flush();
+							{
+								std::string race_daemon_line;
+								if (!std::getline(std::cin, race_daemon_line)) break;
+								if (race_daemon_line == "STOP" || race_daemon_line.empty()) break;
+								// Protocol: keyfile[\tsummary[\thitdir]]. Re-target per-batch outputs so the orchestrator
+								// ingests each batch independently. hit-dir is read per-key (just update args); summary is reopened.
+								std::string d_keyfile = race_daemon_line, d_summary, d_hitdir;
+								{
+									size_t _t1 = race_daemon_line.find('\t');
+									if (_t1 != std::string::npos)
+									{
+										d_keyfile = race_daemon_line.substr(0, _t1);
+										size_t _t2 = race_daemon_line.find('\t', _t1 + 1);
+										if (_t2 != std::string::npos)
+										{
+											d_summary = race_daemon_line.substr(_t1 + 1, _t2 - _t1 - 1);
+											d_hitdir = race_daemon_line.substr(_t2 + 1);
+										}
+										else d_summary = race_daemon_line.substr(_t1 + 1);
+									}
+								}
+								raceway_worker_keys = read_raceway_key_file(d_keyfile, args.raceway_key_limit);
+								if (raceway_worker_keys.empty()) break;
+								args.key_id = raceway_worker_keys.front();
+								args.raceway_key_file = d_keyfile;
+								if (!d_hitdir.empty()) args.raceway_hit_dir = d_hitdir;
+								if (!d_summary.empty()) open_worker_summary(d_summary);
+								if (raceway_overlap_setup)
+									race_prepare_future = std::async(std::launch::async, race_prepare, raceway_worker_keys.front(), nullptr, size_t(0), -1, CUdeviceptr(0), size_t(0), CUstream(nullptr), CUevent(nullptr));
+							}
+							}
+							// Release the offset-stream staging + prefetch resources (drains the copy stream first).
+							race_stage.destroy();
+							if (wave_cnt2 != 0) cuMemFree(wave_cnt2);
+							if (d_tail_maps != 0) cuMemFree(d_tail_maps);
+							if (raceway_persistent_worker)
+							{
+								raceway_worker_cache.release();
+								release_assets(assets);
+								return 0;
+							}
 					}
 
-				// ── MAP1 frontier emitter prototype (2026-06-03) ─────────────────────────
+					// ── MAP1 frontier emitter prototype (2026-06-03) ─────────────────────────
 				// Streams the data axis in chunks while keeping one persistent strong64
 			// fingerprint table. This is the first GPU W4B-frontier shape: storage is
 			// proportional to MAP1 representatives/table budget, not to the input tile's
@@ -5197,6 +6228,726 @@ int main(int argc, char** argv)
 			{
 				if (use_skipcar)
 					throw std::runtime_error("--map1-frontier currently supports --map-list all only");
+				if (!map1_frontier_worker_keys.empty())
+				{
+					if (!args.precert)
+						throw std::runtime_error("--map1-frontier-key-file worker currently requires --precert");
+					if (!args.map1_frontier_wide || !args.map1_frontier_stream_deep)
+						throw std::runtime_error("--map1-frontier-key-file worker requires --map1-frontier-wide --map1-frontier-stream-deep");
+					if (args.map1_frontier_partitions != 1u || args.map1_frontier_multiplicity
+						|| args.map1_frontier_consume || args.map1_frontier_raceway)
+						throw std::runtime_error("--map1-frontier-key-file worker supports stream-deep only: no partitions/multiplicity/consume/raceway");
+					if (args.range_start != 0ull)
+						throw std::runtime_error("--map1-frontier-key-file worker requires --range_start 0");
+					if (args.map1_frontier_drain_shed_tau > 0u || args.map1_frontier_drain_shed_gate_tau > 0u
+						|| args.map1_frontier_drain_fp_gate_log > 0u || args.map1_frontier_drain_traj_bits > 0u
+						|| args.map1_frontier_drain_alg0_tau_explicit || args.map1_frontier_drain_mult_tau > 0u)
+						throw std::runtime_error("--map1-frontier-key-file worker currently supports plain Pool B caps only");
+
+					struct Map1WorkerKeyInfo
+					{
+						uint32_t key = 0u;
+						uint32_t shed_bits = 0u;
+						uint32_t support_mask = 0u;
+						uint64_t logical = 0ull;
+					};
+					std::vector<Map1WorkerKeyInfo> worker_info;
+					worker_info.reserve(map1_frontier_worker_keys.size());
+					uint64_t max_logical = 0ull;
+					const auto precert_scan0 = std::chrono::high_resolution_clock::now();
+					for (uint32_t key : map1_frontier_worker_keys)
+					{
+						const uint32_t shed_mask = certify_map1_shed_mask(key, args.map_list);
+						const uint32_t shed_bits = static_cast<uint32_t>(__builtin_popcount(shed_mask));
+						if (shed_bits == 0u)
+							throw std::runtime_error("--map1-frontier-key-file worker encountered a key with no precert bits");
+						const uint64_t source_mult = 1ull << shed_bits;
+						if ((args.workunit_size % source_mult) != 0ull)
+							throw std::runtime_error("--map1-frontier-key-file worker requires --workunit_size divisible by each key's 2^certified_bits");
+						const uint64_t logical = args.workunit_size / source_mult;
+						if (logical == 0ull || logical > 0xFFFFFFFFull)
+							throw std::runtime_error("--map1-frontier-key-file worker logical window out of range");
+						worker_info.push_back({ key, shed_bits, ~shed_mask, logical });
+						max_logical = std::max<uint64_t>(max_logical, logical);
+					}
+					const auto precert_scan1 = std::chrono::high_resolution_clock::now();
+					const double precert_scan_ms = std::chrono::duration<double, std::milli>(precert_scan1 - precert_scan0).count();
+					const uint32_t chunk_cap = static_cast<uint32_t>(std::min<uint64_t>(
+						static_cast<uint64_t>(args.map1_frontier_chunk), max_logical));
+					if (chunk_cap == 0u)
+						throw std::runtime_error("--map1-frontier-chunk must be > 0");
+					const std::vector<uint32_t> stream_cuts = args.map1_frontier_stream_cuts.empty()
+						? make_post_map1_cuts(args.map1_frontier_deep_k)
+						: make_post_map1_cuts_custom(parse_u32_list(args.map1_frontier_stream_cuts, "--map1-frontier-stream-cuts"));
+					const bool use_frontier_cap = args.map1_frontier_drain_cap_bits > 0u;
+					uint64_t frontier_cap_slots = 0ull;
+					uint32_t frontier_cap_ntab = 0u;
+					uint64_t frontier_cap_bytes_total = 0ull;
+					if (use_frontier_cap)
+					{
+						if (args.map1_frontier_drain_cap_bits > 31u)
+							throw std::runtime_error("--map1-frontier-key-file worker requires --map1-frontier-drain-cap-bits <= 31");
+						frontier_cap_slots = (1ull << args.map1_frontier_drain_cap_bits) * args.map1_frontier_drain_cap_ways;
+						if (frontier_cap_slots == 0ull)
+							throw std::runtime_error("--map1-frontier-key-file worker Pool B cap has zero slots");
+						frontier_cap_ntab = args.map1_frontier_drain_cap_distinct && stream_cuts.size() >= 4u
+							? static_cast<uint32_t>(stream_cuts.size() - 3u)
+							: 1u;
+						frontier_cap_bytes_total = frontier_cap_slots * 16ull * frontier_cap_ntab;
+					}
+
+					uint32_t logm = 10u;
+					const uint64_t desired_slots = std::max<uint64_t>(1024ull, max_logical * 2ull);
+					while (logm < 32u && (1ull << logm) < desired_slots) ++logm;
+					if ((1ull << logm) < desired_slots)
+						throw std::runtime_error("--map1-frontier-key-file worker table exceeds 2^32 slots");
+					const uint64_t slots = 1ull << logm;
+					const uint64_t table_bytes = slots * 16ull;
+
+					const bool verify_hits = !args.map1_frontier_verified_file.empty();
+					size_t free_b = 0, total_b = 0;
+					check_cuda(cuMemGetInfo(&free_b, &total_b), "cuMemGetInfo(map1_worker)");
+					const uint64_t stream_bytes_est =
+						static_cast<uint64_t>(chunk_cap) +
+						static_cast<uint64_t>(chunk_cap) * sizeof(uint32_t) +
+						static_cast<uint64_t>(chunk_cap) * 32ull * sizeof(uint32_t) +
+						static_cast<uint64_t>(chunk_cap) +
+						static_cast<uint64_t>(chunk_cap) * 2ull * sizeof(uint32_t) +
+						sizeof(uint32_t) + static_cast<uint64_t>(chunk_cap) +
+						(verify_hits
+							? sizeof(uint32_t) + static_cast<uint64_t>(chunk_cap) * (sizeof(uint32_t) + 1ull + 128ull)
+							: 0ull);
+					if (table_bytes + stream_bytes_est + frontier_cap_bytes_total + (512ull << 20) > static_cast<uint64_t>(free_b))
+						throw std::runtime_error("--map1-frontier-key-file worker does not fit available VRAM");
+
+					CUfunction insert_mask_k = nullptr, frontier_span_k = nullptr, frontier_span_cap_k = nullptr;
+					CUfunction frontier_span_emit_k = nullptr, frontier_span_cap_emit_k = nullptr;
+					CUfunction frontier_compact_k = nullptr, compact_mask_k = nullptr;
+					check_cuda(cuModuleGetFunction(&insert_mask_k, module, "tm_map1_frontier_insert_mask128_cuda"), "cuModuleGetFunction(map1_worker_insert_mask)");
+					check_cuda(cuModuleGetFunction(&frontier_span_k, module, "run_frontier_span_local_w8i10_cuda"), "cuModuleGetFunction(map1_worker_span)");
+					if (use_frontier_cap)
+						check_cuda(cuModuleGetFunction(&frontier_span_cap_k, module, "run_frontier_span_local_cap_w8i10_cuda"), "cuModuleGetFunction(map1_worker_span_cap)");
+					if (verify_hits)
+					{
+						check_cuda(cuModuleGetFunction(&frontier_span_emit_k, module, "run_frontier_span_local_emit_w8i10_cuda"), "cuModuleGetFunction(map1_worker_span_emit)");
+						if (use_frontier_cap)
+							check_cuda(cuModuleGetFunction(&frontier_span_cap_emit_k, module, "run_frontier_span_local_cap_emit_w8i10_cuda"), "cuModuleGetFunction(map1_worker_span_cap_emit)");
+					}
+					check_cuda(cuModuleGetFunction(&frontier_compact_k, module, "compact_survivors_ordered_cuda"), "cuModuleGetFunction(map1_worker_compact)");
+					check_cuda(cuModuleGetFunction(&compact_mask_k, module, "tm_map1_frontier_compact_data_mask_cuda"), "cuModuleGetFunction(map1_worker_compact_mask)");
+
+					CUdeviceptr table_fp = 0, d_unique = 0, d_overflow = 0;
+					CUdeviceptr stream_unique_flags = 0, stream_rep = 0, stream_state = 0, stream_alive = 0;
+					CUdeviceptr stream_live_a = 0, stream_live_b = 0, stream_counter = 0, stream_flag = 0;
+					CUdeviceptr stream_ostream = 0;
+					CUdeviceptr verify_hit_counter = 0, verify_hit_data = 0, verify_hit_flag = 0, verify_hit_state = 0;
+					std::vector<CUdeviceptr> frontier_cap_tables(frontier_cap_ntab, 0);
+					check_cuda(cuMemAlloc(&table_fp, static_cast<size_t>(table_bytes)), "cuMemAlloc(map1_worker_table)");
+					check_cuda(cuMemAlloc(&d_unique, sizeof(uint32_t)), "cuMemAlloc(map1_worker_unique)");
+					check_cuda(cuMemAlloc(&d_overflow, sizeof(uint32_t)), "cuMemAlloc(map1_worker_overflow)");
+					check_cuda(cuMemAlloc(&stream_unique_flags, chunk_cap), "cuMemAlloc(map1_worker_unique_flags)");
+					check_cuda(cuMemAlloc(&stream_rep, static_cast<size_t>(chunk_cap) * sizeof(uint32_t)), "cuMemAlloc(map1_worker_rep)");
+					check_cuda(cuMemAlloc(&stream_state, static_cast<size_t>(chunk_cap) * 32u * sizeof(uint32_t)), "cuMemAlloc(map1_worker_state)");
+					check_cuda(cuMemAlloc(&stream_alive, chunk_cap), "cuMemAlloc(map1_worker_alive)");
+					check_cuda(cuMemAlloc(&stream_live_a, static_cast<size_t>(chunk_cap) * sizeof(uint32_t)), "cuMemAlloc(map1_worker_live_a)");
+					check_cuda(cuMemAlloc(&stream_live_b, static_cast<size_t>(chunk_cap) * sizeof(uint32_t)), "cuMemAlloc(map1_worker_live_b)");
+					check_cuda(cuMemAlloc(&stream_counter, sizeof(uint32_t)), "cuMemAlloc(map1_worker_counter)");
+					check_cuda(cuMemAlloc(&stream_flag, chunk_cap), "cuMemAlloc(map1_worker_flag)");
+					if (verify_hits)
+					{
+						check_cuda(cuMemAlloc(&verify_hit_counter, sizeof(uint32_t)), "cuMemAlloc(map1_worker_verify_hit_counter)");
+						check_cuda(cuMemAlloc(&verify_hit_data, static_cast<size_t>(chunk_cap) * sizeof(uint32_t)), "cuMemAlloc(map1_worker_verify_hit_data)");
+						check_cuda(cuMemAlloc(&verify_hit_flag, chunk_cap), "cuMemAlloc(map1_worker_verify_hit_flag)");
+						check_cuda(cuMemAlloc(&verify_hit_state, static_cast<size_t>(chunk_cap) * 128ull), "cuMemAlloc(map1_worker_verify_hit_state)");
+					}
+					for (uint32_t ti = 0u; ti < frontier_cap_ntab; ++ti)
+						check_cuda(cuMemAlloc(&frontier_cap_tables[ti], frontier_cap_slots * 16ull), "cuMemAlloc(map1_worker_frontier_cap)");
+
+					std::vector<uint32_t> h_rep(chunk_cap);
+					std::vector<uint8_t> h_flag(chunk_cap);
+					std::vector<uint32_t> h_verify_data;
+					std::vector<uint8_t> h_verify_flag;
+					std::vector<uint8_t> h_verify_state;
+					std::ofstream summary_out;
+					if (!args.map1_frontier_worker_summary.empty())
+					{
+						summary_out.open(args.map1_frontier_worker_summary, std::ios::trunc);
+						if (!summary_out)
+							throw std::runtime_error("cannot open --map1-frontier-worker-summary: " + args.map1_frontier_worker_summary);
+						summary_out << "index\tkey\treturncode\telapsed_s\tshed_bits\tlogical_window\tF1\tfinal_frontier\tflag_sum\trepresentative_hits\tverify_enqueued_hits\tmap1_ms\tdeep_ms\ttotal_ms\thost_setup_ms\tsetup_wait_ms\tschedule_build_ms\tschedule_copy_ms\toffset_build_ms\toffset_copy_ms\thit_open_ms\thit_write_ms\tverify_enqueue_ms\tverify_state_copy_ms\n";
+					}
+
+					std::ofstream worker_hit_out;
+					if (!args.map1_frontier_hit_file.empty())
+					{
+						worker_hit_out.open(args.map1_frontier_hit_file, std::ios::out | std::ios::trunc);
+						if (!worker_hit_out)
+							throw std::runtime_error("cannot open --map1-frontier-hit-file: " + args.map1_frontier_hit_file);
+						worker_hit_out << "key\trepresentative_data_value\tflag\tshed_bits\tlogical_window\n";
+					}
+
+					OffsetStreamBlob osb;
+					size_t stream_ostream_bytes = 0u;
+					struct Map1WorkerPrepared
+					{
+						std::vector<uint8_t> sched_blob;
+						OffsetStreamBlob osb;
+						double schedule_build_ms = 0.0;
+						double offset_build_ms = 0.0;
+					};
+					auto prepare_worker_key = [map_list = args.map_list](uint32_t key) -> Map1WorkerPrepared
+					{
+						Map1WorkerPrepared prepared;
+						const auto s0 = std::chrono::high_resolution_clock::now();
+						prepared.sched_blob = build_schedule_blob(key, map_list);
+						const auto s1 = std::chrono::high_resolution_clock::now();
+						build_offset_stream_blob_into(prepared.sched_blob, prepared.osb);
+						const auto s2 = std::chrono::high_resolution_clock::now();
+						prepared.schedule_build_ms = std::chrono::duration<double, std::milli>(s1 - s0).count();
+						prepared.offset_build_ms = std::chrono::duration<double, std::milli>(s2 - s1).count();
+						return prepared;
+					};
+					std::future<Map1WorkerPrepared> prepare_future;
+					if (args.map1_frontier_overlap_setup && !worker_info.empty())
+						prepare_future = std::async(std::launch::async, prepare_worker_key, worker_info[0].key);
+					std::cout << "[map1-frontier-worker] device=" << device_name
+					          << " keys=" << worker_info.size()
+					          << " source=" << args.map1_frontier_key_file
+					          << " chunk=" << chunk_cap
+					          << " table=2^" << logm << " (" << (table_bytes >> 20) << " MiB)"
+					          << " precert_scan=" << std::fixed << std::setprecision(3) << precert_scan_ms << " ms"
+					          << " overlap_setup=" << (args.map1_frontier_overlap_setup ? "1" : "0")
+					          << " cuts=";
+					for (size_t i = 0; i < stream_cuts.size(); ++i)
+						std::cout << (i ? "," : "") << stream_cuts[i];
+					if (use_frontier_cap)
+						std::cout << " poolB=2^" << args.map1_frontier_drain_cap_bits
+						          << "x" << args.map1_frontier_drain_cap_ways
+						          << " tables=" << frontier_cap_ntab
+						          << " (" << (frontier_cap_bytes_total >> 20) << " MiB)";
+					std::cout << "\n";
+
+					struct VerifyJob
+					{
+						uint32_t key = 0u;
+						std::vector<uint32_t> data;
+						std::vector<uint8_t> flags;
+						std::vector<uint8_t> states;
+					};
+					struct VerifyTotals
+					{
+						uint64_t jobs = 0ull;
+						uint64_t input_hits = 0ull;
+						uint64_t verified_hits = 0ull;
+						double cpu_ms = 0.0;
+						double write_ms = 0.0;
+					};
+
+					std::mutex verify_mutex;
+					std::condition_variable verify_cv;
+					std::condition_variable verify_space_cv;
+					std::deque<VerifyJob> verify_queue;
+					const size_t verify_max_queue = 1024u;
+					bool verify_finish = false;
+					std::exception_ptr verify_error;
+					VerifyTotals verify_totals;
+					const std::string verify_file = args.map1_frontier_verified_file;
+					const bool verify_require_final_rts = args.map1_frontier_verify_final_rts;
+
+					auto verify_consume_job = [&](std::ofstream& verified_out, const VerifyJob& job, VerifyTotals& local_totals)
+					{
+						if (job.data.empty())
+							return;
+						if (job.flags.size() != job.data.size() || job.states.size() != job.data.size() * 128ull)
+							throw std::runtime_error("map1 verifier job has inconsistent buffered hit-state dimensions");
+
+						const auto cpu0 = std::chrono::high_resolution_clock::now();
+						for (size_t i = 0; i < job.data.size(); ++i)
+						{
+							const uint8_t screen_flag = job.flags[i];
+							if ((screen_flag & OTHER_WORLD) == 0u)
+								continue;
+							const uint8_t* state = &job.states[i * 128ull];
+							const uint8_t machine_flags = check_machine_code(state, true);
+							if ((machine_flags & ALL_ENTRIES_VALID) == 0u)
+								continue;
+							const bool final_rts = other_final_rts_shape(state);
+							if (verify_require_final_rts && !final_rts)
+								continue;
+							const bool entry_opcodes = other_entry_opcode_shape(state);
+							const bool control_flow = other_control_flow_shape(state);
+							const bool structural = entry_opcodes && control_flow;
+							const bool linear_clean = linear_scan_clean(state, true);
+							const int linear_score = linear_scan_score(state, true);
+							const uint8_t verified_flags = static_cast<uint8_t>(machine_flags | OTHER_WORLD);
+							const auto wr0 = std::chrono::high_resolution_clock::now();
+							verified_out << job.key << "," << job.data[i] << ","
+								<< static_cast<unsigned int>(verified_flags) << ","
+								<< static_cast<unsigned int>(screen_flag) << ","
+								<< static_cast<unsigned int>(machine_flags) << ","
+								<< (final_rts ? 1 : 0) << ","
+								<< (entry_opcodes ? 1 : 0) << ","
+								<< (control_flow ? 1 : 0) << ","
+								<< (structural ? 1 : 0) << ","
+								<< (linear_clean ? 1 : 0) << ","
+								<< linear_score;
+							const int offsets[] = { 0x00, 0x01, 0x02, 0x03, 0x04, 0x07, 0x2E, 0x50 };
+							for (int offset_value : offsets)
+							{
+								verified_out << ",0x" << std::hex << std::setw(2) << std::setfill('0')
+									<< static_cast<unsigned int>(code_byte_at(state, offset_value))
+									<< std::dec << std::setfill(' ');
+							}
+							verified_out << "\n";
+							const auto wr1 = std::chrono::high_resolution_clock::now();
+							local_totals.write_ms += std::chrono::duration<double, std::milli>(wr1 - wr0).count();
+							++local_totals.verified_hits;
+						}
+						const auto cpu1 = std::chrono::high_resolution_clock::now();
+						local_totals.cpu_ms += std::chrono::duration<double, std::milli>(cpu1 - cpu0).count();
+						verified_out.flush();
+					};
+
+					std::thread verifier_thread;
+					if (verify_hits)
+					{
+						verifier_thread = std::thread([&, verify_file]()
+						{
+							try
+							{
+								std::ofstream verified_out(verify_file, std::ios::out | std::ios::trunc);
+								if (!verified_out)
+									throw std::runtime_error("cannot open --map1-frontier-verified-file: " + verify_file);
+								verified_out << "key,data,flags,screen_flag,machine_flags,final_rts,entry_opcodes,control_flow,structural,linear_clean,linear_score,"
+								             << "b00,b01,b02,b03,b04,b07,b2e,b50\n";
+
+								VerifyTotals local_totals;
+								for (;;)
+								{
+									VerifyJob job;
+									{
+										std::unique_lock<std::mutex> lock(verify_mutex);
+										verify_cv.wait(lock, [&]() { return verify_finish || !verify_queue.empty(); });
+										if (verify_queue.empty())
+										{
+											if (verify_finish)
+												break;
+											continue;
+										}
+										job = std::move(verify_queue.front());
+										verify_queue.pop_front();
+										verify_space_cv.notify_one();
+									}
+									++local_totals.jobs;
+									local_totals.input_hits += job.data.size();
+									verify_consume_job(verified_out, job, local_totals);
+								}
+								{
+									std::lock_guard<std::mutex> lock(verify_mutex);
+									verify_totals = local_totals;
+								}
+							}
+							catch (...)
+							{
+								std::lock_guard<std::mutex> lock(verify_mutex);
+								verify_error = std::current_exception();
+							}
+							verify_space_cv.notify_all();
+						});
+					}
+					struct VerifyThreadJoiner
+					{
+						std::thread* thread = nullptr;
+						std::mutex* mutex = nullptr;
+						std::condition_variable* cv = nullptr;
+						bool* finish = nullptr;
+						~VerifyThreadJoiner()
+						{
+							if (thread != nullptr && thread->joinable())
+							{
+								{
+									std::lock_guard<std::mutex> lock(*mutex);
+									*finish = true;
+								}
+								cv->notify_one();
+								thread->join();
+							}
+						}
+					} verifier_joiner{ &verifier_thread, &verify_mutex, &verify_cv, &verify_finish };
+
+					auto enqueue_verify_job = [&](uint32_t key, std::vector<uint32_t>& hit_data, std::vector<uint8_t>& hit_flags, std::vector<uint8_t>& hit_states) -> double
+					{
+						if (!verify_hits || hit_data.empty())
+							return 0.0;
+						const auto q0 = std::chrono::high_resolution_clock::now();
+						std::unique_lock<std::mutex> lock(verify_mutex);
+						verify_space_cv.wait(lock, [&]() { return verify_queue.size() < verify_max_queue || verify_error != nullptr; });
+						if (verify_error)
+							std::rethrow_exception(verify_error);
+						VerifyJob job;
+						job.key = key;
+						job.data.swap(hit_data);
+						job.flags.swap(hit_flags);
+						job.states.swap(hit_states);
+						verify_queue.push_back(std::move(job));
+						lock.unlock();
+						verify_cv.notify_one();
+							const auto q1 = std::chrono::high_resolution_clock::now();
+							return std::chrono::duration<double, std::milli>(q1 - q0).count();
+						};
+
+					double verify_state_copy_total_ms = 0.0;
+					for (size_t wi = 0; wi < worker_info.size(); ++wi)
+					{
+						if (wi != 0u && worker_stop_requested(args.worker_stop_file))
+						{
+							if (prepare_future.valid())
+								prepare_future.wait();
+							std::cout << "[map1-frontier-worker] stop_file=" << args.worker_stop_file
+							          << " observed_after_index=" << (wi - 1u)
+							          << " processed=" << wi << "\n";
+							break;
+						}
+						const Map1WorkerKeyInfo& ki = worker_info[wi];
+						args.key_id = ki.key;
+						Map1WorkerPrepared prepared;
+						double setup_wait_ms = 0.0;
+						if (args.map1_frontier_overlap_setup)
+						{
+							const auto wait0 = std::chrono::high_resolution_clock::now();
+							prepared = prepare_future.get();
+							const auto wait1 = std::chrono::high_resolution_clock::now();
+							setup_wait_ms = std::chrono::duration<double, std::milli>(wait1 - wait0).count();
+							if (wi + 1u < worker_info.size())
+								prepare_future = std::async(std::launch::async, prepare_worker_key, worker_info[wi + 1u].key);
+						}
+						else
+						{
+							prepared = prepare_worker_key(args.key_id);
+						}
+						const auto setup_sched1 = std::chrono::high_resolution_clock::now();
+						if (wi != 0u)
+							check_cuda(cuMemcpyHtoD(assets.schedule_data, prepared.sched_blob.data(), prepared.sched_blob.size()), "HtoD(map1_worker_schedule)");
+						const auto setup_sched2 = std::chrono::high_resolution_clock::now();
+						osb = std::move(prepared.osb);
+						const auto setup_offset1 = std::chrono::high_resolution_clock::now();
+						if (stream_ostream == 0 || stream_ostream_bytes != osb.data.size())
+						{
+							if (stream_ostream) cuMemFree(stream_ostream);
+							check_cuda(cuMemAlloc(&stream_ostream, osb.data.size()), "cuMemAlloc(map1_worker_ostream)");
+							stream_ostream_bytes = osb.data.size();
+						}
+						check_cuda(cuMemcpyHtoD(stream_ostream, osb.data.data(), osb.data.size()), "HtoD(map1_worker_ostream)");
+						const auto setup_copy1 = std::chrono::high_resolution_clock::now();
+						CUdeviceptr stream_off_regular = stream_ostream;
+						CUdeviceptr stream_off_alg0 = stream_off_regular + osb.stream_bytes;
+						CUdeviceptr stream_off_alg6 = stream_off_alg0 + osb.stream_bytes;
+						CUdeviceptr stream_off_alg2 = stream_off_alg6 + osb.stream_bytes;
+						CUdeviceptr stream_off_alg5 = stream_off_alg2 + osb.carry_bytes;
+
+						std::ofstream hit_out;
+						std::string hit_path;
+						const auto setup_hit0 = std::chrono::high_resolution_clock::now();
+						if (!args.map1_frontier_hit_dir.empty())
+						{
+							hit_path = args.map1_frontier_hit_dir + "/key_" + key_hex8(args.key_id) + ".hits.tsv";
+							hit_out.open(hit_path, std::ios::trunc);
+							if (!hit_out)
+								throw std::runtime_error("cannot open map1 frontier hit file: " + hit_path);
+							hit_out << "# representative_data_value\tflag  key=" << key_hex8(args.key_id)
+							        << "  flag: 0x08=carnival 0x09=other-world 0x0B=dual\n";
+							hit_out << "# NOTE: MAP1/BFS capture writes representative reduced-axis data values, not every weighted duplicate.\n";
+						}
+						const auto setup_hit1 = std::chrono::high_resolution_clock::now();
+						double hit_write_ms = 0.0;
+
+						const auto wall0 = std::chrono::steady_clock::now();
+						const auto gpu0 = std::chrono::high_resolution_clock::now();
+						check_cuda(cuMemsetD8(table_fp, 0u, static_cast<size_t>(table_bytes)), "memset(map1_worker_table)");
+						check_cuda(cuMemsetD32(d_unique, 0u, 1u), "memset(map1_worker_unique)");
+						check_cuda(cuMemsetD32(d_overflow, 0u, 1u), "memset(map1_worker_overflow)");
+						for (CUdeviceptr cap_table : frontier_cap_tables)
+							check_cuda(cuMemsetD8(cap_table, 0u, frontier_cap_slots * 16ull), "memset(map1_worker_frontier_cap)");
+
+						uint64_t done = 0ull;
+						uint64_t final_frontier = 0ull;
+						uint64_t flag_sum = 0ull;
+						uint64_t hits_total = 0ull;
+						uint64_t hits_carnival = 0ull, hits_other = 0ull, hits_dual = 0ull;
+						uint64_t verify_enqueued_hits = 0ull;
+						double map1_ms = 0.0, deep_ms = 0.0;
+						double verify_enqueue_ms = 0.0;
+						double verify_state_copy_ms = 0.0;
+						while (done < ki.logical)
+						{
+							const uint32_t chunk = static_cast<uint32_t>(std::min<uint64_t>(chunk_cap, ki.logical - done));
+							check_cuda(cuMemsetD8(stream_unique_flags, 0u, chunk), "memset(map1_worker_unique_flags)");
+							const uint32_t fixed_value = 0u;
+							const uint32_t candidate_start = static_cast<uint32_t>(done);
+							const uint32_t insert_depth = 1u;
+							const uint32_t partition = 0u;
+							const uint32_t rep_cap = 0u;
+							CUdeviceptr null_u8 = 0, null_u32 = 0;
+							void* miargs[] = {
+								&table_fp, (void*)&logm, &d_unique, &d_overflow, &null_u32, (void*)&rep_cap,
+								&stream_unique_flags, &null_u8, (void*)&partition,
+								&assets.regular_rng_values, &assets.alg0_values, &assets.alg6_values,
+								&assets.rng_seed_forward_1, &assets.rng_seed_forward_128,
+								&assets.alg2_values, &assets.alg5_values, &assets.expansion_values,
+								&assets.schedule_data, &args.key_id, (void*)&fixed_value, (void*)&candidate_start,
+								(void*)&chunk, (void*)&insert_depth, (void*)&ki.support_mask };
+							const auto m10 = std::chrono::high_resolution_clock::now();
+							check_cuda(cuLaunchKernel(insert_mask_k, screen_kernel_grid_x_ilp(chunk, 1u), 1, 1,
+								kCudaThreadsPerBlock, 1, 1, 0, 0, miargs, nullptr), "launch(map1_worker_insert)");
+
+							check_cuda(cuMemsetD32(stream_counter, 0u, 1u), "memset(map1_worker_pack_counter)");
+							void* pa[] = { &stream_unique_flags, (void*)&chunk,
+								(void*)&fixed_value, (void*)&candidate_start, (void*)&ki.support_mask,
+								&stream_rep, &stream_counter };
+							check_cuda(cuLaunchKernel(compact_mask_k, (chunk + 255u) / 256u, 1, 1,
+								256, 1, 1, 0, 0, pa, nullptr), "launch(map1_worker_pack)");
+							uint32_t M0 = 0u;
+							check_cuda(cuMemcpyDtoH(&M0, stream_counter, sizeof(uint32_t)), "DtoH(map1_worker_pack_counter)");
+							const auto m11 = std::chrono::high_resolution_clock::now();
+							map1_ms += std::chrono::duration<double, std::milli>(m11 - m10).count();
+
+							if (M0 != 0u)
+							{
+								check_cuda(cuMemsetD8(stream_flag, 0u, M0), "memset(map1_worker_flag)");
+								if (verify_hits)
+									check_cuda(cuMemsetD32(verify_hit_counter, 0u, 1u), "memset(map1_worker_verify_hit_counter)");
+								const auto d0 = std::chrono::high_resolution_clock::now();
+								constexpr uint32_t F_WARPS = 8u;
+								constexpr uint32_t F_ILP = 10u;
+								constexpr uint32_t F_W = F_WARPS * F_ILP;
+								constexpr uint32_t F_BLOCK = F_WARPS * 32u;
+								CUdeviceptr cur_live = 0;
+								CUdeviceptr next_live = stream_live_a;
+								uint32_t M = M0;
+								int first = 1;
+								for (uint32_t sp = 0; sp + 1u < stream_cuts.size(); ++sp)
+								{
+									if (M == 0u) break;
+									const uint32_t m0 = stream_cuts[sp];
+									const uint32_t m1 = stream_cuts[sp + 1u];
+									const bool last = (sp + 2u == stream_cuts.size());
+									const int mode = (sp == 0u) ? 0 : (last ? 2 : 1);
+									CUdeviceptr null_mult = 0;
+									if (use_frontier_cap)
+									{
+										const uint32_t cap_index = args.map1_frontier_drain_cap_distinct && sp >= 1u && (sp - 1u) < frontier_cap_ntab
+											? static_cast<uint32_t>(sp - 1u)
+											: 0u;
+										CUdeviceptr frontier_cap_table = frontier_cap_tables[cap_index];
+										if (last && verify_hits)
+										{
+											const uint32_t hit_cap = M0;
+											void* sa[] = { &cur_live, &M, &stream_rep, &stream_state, &stream_alive, (void*)&m0, (void*)&m1, &first,
+												&stream_off_regular, &stream_off_alg0, &stream_off_alg6, &stream_off_alg2, &stream_off_alg5,
+												&assets.expansion_values, &assets.schedule_data, &args.key_id,
+												&assets.carnival_data, &stream_flag, (void*)&mode, &null_mult,
+												&frontier_cap_table, &args.map1_frontier_drain_cap_bits, &args.map1_frontier_drain_cap_ways,
+												&verify_hit_counter, &verify_hit_data, &verify_hit_flag, &verify_hit_state, (void*)&hit_cap };
+											check_cuda(cuLaunchKernel(frontier_span_cap_emit_k, (M + F_W - 1u) / F_W, 1, 1,
+												F_BLOCK, 1, 1, 0, 0, sa, nullptr), "launch(map1_worker_span_cap_emit)");
+										}
+										else
+										{
+											void* sa[] = { &cur_live, &M, &stream_rep, &stream_state, &stream_alive, (void*)&m0, (void*)&m1, &first,
+												&stream_off_regular, &stream_off_alg0, &stream_off_alg6, &stream_off_alg2, &stream_off_alg5,
+												&assets.expansion_values, &assets.schedule_data, &args.key_id,
+												&assets.carnival_data, &stream_flag, (void*)&mode, &null_mult,
+												&frontier_cap_table, &args.map1_frontier_drain_cap_bits, &args.map1_frontier_drain_cap_ways };
+											check_cuda(cuLaunchKernel(frontier_span_cap_k, (M + F_W - 1u) / F_W, 1, 1,
+												F_BLOCK, 1, 1, 0, 0, sa, nullptr), "launch(map1_worker_span_cap)");
+										}
+									}
+									else
+									{
+										if (last && verify_hits)
+										{
+											const uint32_t hit_cap = M0;
+											void* sa[] = { &cur_live, &M, &stream_rep, &stream_state, &stream_alive, (void*)&m0, (void*)&m1, &first,
+												&stream_off_regular, &stream_off_alg0, &stream_off_alg6, &stream_off_alg2, &stream_off_alg5,
+												&assets.expansion_values, &assets.schedule_data, &args.key_id,
+												&assets.carnival_data, &stream_flag, (void*)&mode, &null_mult,
+												&verify_hit_counter, &verify_hit_data, &verify_hit_flag, &verify_hit_state, (void*)&hit_cap };
+											check_cuda(cuLaunchKernel(frontier_span_emit_k, (M + F_W - 1u) / F_W, 1, 1,
+												F_BLOCK, 1, 1, 0, 0, sa, nullptr), "launch(map1_worker_span_emit)");
+										}
+										else
+										{
+											void* sa[] = { &cur_live, &M, &stream_rep, &stream_state, &stream_alive, (void*)&m0, (void*)&m1, &first,
+												&stream_off_regular, &stream_off_alg0, &stream_off_alg6, &stream_off_alg2, &stream_off_alg5,
+												&assets.expansion_values, &assets.schedule_data, &args.key_id,
+												&assets.carnival_data, &stream_flag, (void*)&mode, &null_mult };
+											check_cuda(cuLaunchKernel(frontier_span_k, (M + F_W - 1u) / F_W, 1, 1,
+												F_BLOCK, 1, 1, 0, 0, sa, nullptr), "launch(map1_worker_span)");
+										}
+									}
+									if (mode == 1)
+									{
+										check_cuda(cuMemsetD32(stream_counter, 0u, 1u), "memset(map1_worker_frontier_counter)");
+										int compact_first = (cur_live == 0) ? 1 : 0;
+										void* ca[] = { &stream_alive, &cur_live, &M, &next_live, &stream_counter, &compact_first };
+										check_cuda(cuLaunchKernel(frontier_compact_k, (M + 255u) / 256u, 1, 1,
+											256, 1, 1, 0, 0, ca, nullptr), "launch(map1_worker_frontier_compact)");
+										check_cuda(cuMemcpyDtoH(&M, stream_counter, sizeof(uint32_t)), "DtoH(map1_worker_frontier_counter)");
+										cur_live = next_live;
+										next_live = (next_live == stream_live_a) ? stream_live_b : stream_live_a;
+									}
+									first = 0;
+								}
+								check_cuda(cuCtxSynchronize(), "sync(map1_worker_deep)");
+								const auto d1 = std::chrono::high_resolution_clock::now();
+								deep_ms += std::chrono::duration<double, std::milli>(d1 - d0).count();
+								final_frontier += M;
+
+								check_cuda(cuMemcpyDtoH(h_rep.data(), stream_rep, static_cast<size_t>(M0) * sizeof(uint32_t)), "DtoH(map1_worker_rep)");
+								check_cuda(cuMemcpyDtoH(h_flag.data(), stream_flag, M0), "DtoH(map1_worker_flag)");
+								if (verify_hits)
+								{
+									uint32_t verify_hit_count = 0u;
+									const auto vc0 = std::chrono::high_resolution_clock::now();
+									check_cuda(cuMemcpyDtoH(&verify_hit_count, verify_hit_counter, sizeof(uint32_t)), "DtoH(map1_worker_verify_hit_counter)");
+									if (verify_hit_count > M0)
+										throw std::runtime_error("map1 verifier emitted more hits than the chunk frontier cap");
+									h_verify_data.resize(verify_hit_count);
+									h_verify_flag.resize(verify_hit_count);
+									h_verify_state.resize(static_cast<size_t>(verify_hit_count) * 128ull);
+									if (verify_hit_count != 0u)
+									{
+										check_cuda(cuMemcpyDtoH(h_verify_data.data(), verify_hit_data, static_cast<size_t>(verify_hit_count) * sizeof(uint32_t)), "DtoH(map1_worker_verify_hit_data)");
+										check_cuda(cuMemcpyDtoH(h_verify_flag.data(), verify_hit_flag, verify_hit_count), "DtoH(map1_worker_verify_hit_flag)");
+										check_cuda(cuMemcpyDtoH(h_verify_state.data(), verify_hit_state, static_cast<size_t>(verify_hit_count) * 128ull), "DtoH(map1_worker_verify_hit_state)");
+									}
+									const auto vc1 = std::chrono::high_resolution_clock::now();
+									verify_state_copy_ms += std::chrono::duration<double, std::milli>(vc1 - vc0).count();
+									verify_enqueued_hits += verify_hit_count;
+									verify_enqueue_ms += enqueue_verify_job(args.key_id, h_verify_data, h_verify_flag, h_verify_state);
+								}
+								for (uint32_t i = 0u; i < M0; ++i)
+								{
+									const uint8_t f = h_flag[i];
+									flag_sum += f;
+									if (f != 0u)
+									{
+										++hits_total;
+										if      (f == 0x0Bu) ++hits_dual;
+										else if (f == 0x09u) ++hits_other;
+										else                 ++hits_carnival;
+										if (hit_out.is_open())
+										{
+											const auto hw0 = std::chrono::high_resolution_clock::now();
+											hit_out << "0x" << std::hex << std::setw(8) << std::setfill('0') << h_rep[i]
+											        << "\t0x" << std::setw(2) << static_cast<uint32_t>(f)
+											        << std::dec << std::setfill(' ') << "\n";
+											const auto hw1 = std::chrono::high_resolution_clock::now();
+											hit_write_ms += std::chrono::duration<double, std::milli>(hw1 - hw0).count();
+										}
+										if (worker_hit_out.is_open())
+										{
+											const auto hw0 = std::chrono::high_resolution_clock::now();
+											worker_hit_out << key_hex8(args.key_id) << "\t0x"
+												<< std::hex << std::setw(8) << std::setfill('0') << h_rep[i]
+												<< "\t0x" << std::setw(2) << static_cast<uint32_t>(f)
+												<< std::dec << std::setfill(' ') << "\t"
+												<< ki.shed_bits << "\t" << ki.logical << "\n";
+											const auto hw1 = std::chrono::high_resolution_clock::now();
+											hit_write_ms += std::chrono::duration<double, std::milli>(hw1 - hw0).count();
+										}
+									}
+								}
+							}
+							done += chunk;
+						}
+						check_cuda(cuCtxSynchronize(), "sync(map1_worker_key)");
+						uint32_t F1 = 0u;
+						check_cuda(cuMemcpyDtoH(&F1, d_unique, sizeof(uint32_t)), "DtoH(map1_worker_unique)");
+						uint32_t overflow = 0u;
+						check_cuda(cuMemcpyDtoH(&overflow, d_overflow, sizeof(uint32_t)), "DtoH(map1_worker_overflow)");
+						const auto gpu1 = std::chrono::high_resolution_clock::now();
+						const double total_ms = std::chrono::duration<double, std::milli>(gpu1 - gpu0).count();
+						const auto wall1 = std::chrono::steady_clock::now();
+						const double elapsed_s = std::chrono::duration<double>(wall1 - wall0).count();
+						const double schedule_build_ms = prepared.schedule_build_ms;
+						const double schedule_copy_ms = std::chrono::duration<double, std::milli>(setup_sched2 - setup_sched1).count();
+						const double offset_build_ms = prepared.offset_build_ms;
+						const double offset_copy_ms = std::chrono::duration<double, std::milli>(setup_copy1 - setup_offset1).count();
+						const double hit_open_ms = std::chrono::duration<double, std::milli>(setup_hit1 - setup_hit0).count();
+						const double host_build_critical_ms = args.map1_frontier_overlap_setup ? setup_wait_ms : (schedule_build_ms + offset_build_ms);
+						const double host_setup_ms = host_build_critical_ms + schedule_copy_ms + offset_copy_ms + hit_open_ms;
+						if (hit_out.is_open())
+						{
+							hit_out.close();
+						}
+						std::cout << "[map1-frontier-worker-key] index=" << wi
+						          << " key=" << key_hex8(args.key_id)
+						          << " shed_bits=" << ki.shed_bits
+						          << " logical_window=" << ki.logical
+						          << " F1=" << F1
+						          << " final_frontier=" << final_frontier
+						          << " flag_sum=" << flag_sum
+						          << " hits=" << hits_total
+						          << " verify_enqueued=" << verify_enqueued_hits
+						          << " map1=" << std::fixed << std::setprecision(3) << map1_ms
+						          << " deep=" << deep_ms
+						          << " total=" << total_ms
+						          << " ms";
+						if (overflow != 0u) std::cout << " overflow=" << overflow;
+						if (!hit_path.empty())
+							std::cout << " hit_file=" << hit_path;
+						std::cout << "\n";
+							if (summary_out.is_open())
+							{
+							summary_out << wi << "\t" << key_hex8(args.key_id) << "\t0\t"
+								<< std::fixed << std::setprecision(6) << elapsed_s << "\t"
+								<< ki.shed_bits << "\t" << ki.logical << "\t"
+								<< F1 << "\t" << final_frontier << "\t"
+								<< flag_sum << "\t" << hits_total << "\t" << verify_enqueued_hits << "\t"
+								<< std::setprecision(3) << map1_ms << "\t" << deep_ms << "\t" << total_ms << "\t"
+								<< host_setup_ms << "\t" << setup_wait_ms << "\t" << schedule_build_ms << "\t" << schedule_copy_ms << "\t"
+								<< offset_build_ms << "\t" << offset_copy_ms << "\t" << hit_open_ms << "\t" << hit_write_ms << "\t"
+								<< verify_enqueue_ms << "\t" << verify_state_copy_ms << "\n";
+								summary_out.flush();
+							}
+							verify_state_copy_total_ms += verify_state_copy_ms;
+						}
+
+					if (verify_hits)
+					{
+						{
+							std::lock_guard<std::mutex> lock(verify_mutex);
+							verify_finish = true;
+						}
+						verify_cv.notify_one();
+						if (verifier_thread.joinable())
+							verifier_thread.join();
+						if (verify_error)
+							std::rethrow_exception(verify_error);
+							std::cout << "[map1-frontier-verifier] jobs=" << verify_totals.jobs
+							          << " input_hits=" << verify_totals.input_hits
+							          << " verified_hits=" << verify_totals.verified_hits
+							          << " state_copy=" << std::fixed << std::setprecision(3) << verify_state_copy_total_ms
+							          << " cpu=" << verify_totals.cpu_ms
+							          << " write=" << verify_totals.write_ms
+						          << " ms"
+						          << " output=" << verify_file << "\n";
+					}
+
+					if (stream_ostream) cuMemFree(stream_ostream);
+					for (CUdeviceptr cap_table : frontier_cap_tables) if (cap_table) cuMemFree(cap_table);
+					cuMemFree(table_fp); cuMemFree(d_unique); cuMemFree(d_overflow);
+						cuMemFree(stream_unique_flags); cuMemFree(stream_rep); cuMemFree(stream_state);
+						cuMemFree(stream_alive); cuMemFree(stream_live_a); cuMemFree(stream_live_b);
+						cuMemFree(stream_counter); cuMemFree(stream_flag);
+						if (verify_hit_state) cuMemFree(verify_hit_state);
+						if (verify_hit_flag) cuMemFree(verify_hit_flag);
+						if (verify_hit_data) cuMemFree(verify_hit_data);
+						if (verify_hit_counter) cuMemFree(verify_hit_counter);
+						release_assets(assets);
+					return 0;
+				}
 				if (args.map1_frontier_partitions > 1u && (args.map1_frontier_consume || args.map1_frontier_deep || args.map1_frontier_raceway))
 					throw std::runtime_error("--map1-frontier-partitions currently supports --map1-frontier-stream-deep only");
 				if (args.map1_frontier_raceway && (args.map1_frontier_axis_sweep || args.map1_frontier_mobile_bit_sweep || args.map1_frontier_backfill_sweep))
@@ -5242,8 +6993,8 @@ int main(int argc, char** argv)
 							throw std::runtime_error("--precert requires --workunit_size divisible by 2^certified_bits");
 						if (args.map1_frontier_partitions != 1u)
 							throw std::runtime_error("--precert currently does not support --map1-frontier-partitions (classifier is not mask-aware yet)");
-						if (args.map1_frontier_stream_deep || args.map1_frontier_consume || args.map1_frontier_raceway)
-							throw std::runtime_error("--precert currently supports count-only --map1-frontier; stream/consume/raceway need mask-aware rep packing");
+						if (args.map1_frontier_consume || args.map1_frontier_raceway)
+							throw std::runtime_error("--precert currently supports count-only or --map1-frontier-stream-deep; consume/raceway need mask-aware rep packing");
 						if (args.map1_frontier_multiplicity)
 							throw std::runtime_error("--precert currently does not support --map1-frontier-multiplicity");
 						if (args.map1_frontier_route_tau != 0u)
@@ -5903,7 +7654,11 @@ int main(int argc, char** argv)
 					check_cuda(cuModuleGetFunction(&frontier_compact_k, module, "compact_survivors_ordered_cuda"), "cuModuleGetFunction(frontier_compact)");
 				}
 					if (args.map1_frontier_stream_deep)
-						check_cuda(cuModuleGetFunction(&frontier_compact_data_k, module, "tm_map1_frontier_compact_data_cuda"), "cuModuleGetFunction(frontier_compact_data)");
+					{
+						check_cuda(cuModuleGetFunction(&frontier_compact_data_k, module,
+							precert_active ? "tm_map1_frontier_compact_data_mask_cuda" : "tm_map1_frontier_compact_data_cuda"),
+							"cuModuleGetFunction(frontier_compact_data)");
+					}
 					if (args.map1_frontier_multiplicity)
 						check_cuda(cuModuleGetFunction(&frontier_compact_data_mult_k, module, "tm_map1_frontier_compact_data_mult_cuda"), "cuModuleGetFunction(frontier_compact_data_mult)");
 				// Pool B: persistent cross-chunk deep cap (producer path). Cap kernel = the deep
@@ -6353,9 +8108,22 @@ int main(int argc, char** argv)
 								}
 								else
 								{
-									void* pa[] = { &stream_unique_flags, (void*)&chunk, (void*)&data_start, &stream_rep, &stream_counter };
-									check_cuda(cuLaunchKernel(frontier_compact_data_k, (chunk + 255u) / 256u, 1, 1,
-										256, 1, 1, 0, 0, pa, nullptr), "launch(stream_compact_data)");
+									if (precert_active)
+									{
+										const uint32_t fixed_value = 0u;
+										const uint32_t candidate_start = static_cast<uint32_t>(done);
+										void* pa[] = { &stream_unique_flags, (void*)&chunk,
+											(void*)&fixed_value, (void*)&candidate_start, (void*)&precert_support_mask,
+											&stream_rep, &stream_counter };
+										check_cuda(cuLaunchKernel(frontier_compact_data_k, (chunk + 255u) / 256u, 1, 1,
+											256, 1, 1, 0, 0, pa, nullptr), "launch(stream_compact_data_mask)");
+									}
+									else
+									{
+										void* pa[] = { &stream_unique_flags, (void*)&chunk, (void*)&data_start, &stream_rep, &stream_counter };
+										check_cuda(cuLaunchKernel(frontier_compact_data_k, (chunk + 255u) / 256u, 1, 1,
+											256, 1, 1, 0, 0, pa, nullptr), "launch(stream_compact_data)");
+									}
 								}
 							check_cuda(cuCtxSynchronize(), "sync(stream_compact_data)");
 							uint32_t M = 0u;

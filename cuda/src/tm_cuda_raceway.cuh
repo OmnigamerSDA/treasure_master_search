@@ -1164,7 +1164,7 @@ __device__ __forceinline__ void tm_raceway_continue_state_liveidx_offset_static_
 	}
 }
 
-extern "C" __global__ __launch_bounds__(256, 4) void tm_raceway_continue_state_liveidx_offset_ilp4_static_cuda(
+extern "C" __global__ __launch_bounds__(256, 6) void tm_raceway_continue_state_liveidx_offset_ilp4_static_cuda(
 	const uint32_t* live_idx,
 	uint32_t live_count,
 	const uint32_t* state,
@@ -1477,7 +1477,7 @@ __device__ __forceinline__ void tm_raceway_boundary_cap_state_offset_ilp_body(
 	}
 }
 
-extern "C" __global__ __launch_bounds__(256, 4) void tm_raceway_boundary_cap_state_offset_ilp4_cuda(
+extern "C" __global__ __launch_bounds__(256, 6) void tm_raceway_boundary_cap_state_offset_ilp4_cuda(
 	uint32_t candidate_count, uint32_t data_start, uint32_t* work_counter, uint8_t* alive_out,
 	uint8_t* drop_map_out, tm_raceway_stats* stats, uint32_t* state, unsigned long long** cap_tables,
 	const uint32_t* cap_bits, const uint32_t* cap_ways, uint32_t cap_count,
@@ -1536,7 +1536,7 @@ extern "C" __global__ __launch_bounds__(256, 3) void tm_raceway_boundary_cap_sta
 		expansion_values, schedule_data, key, schedule_count, first_cap_map, 0u, 0xFFFFFFFFu, 0u);
 }
 
-extern "C" __global__ __launch_bounds__(256, 4) void tm_raceway_boundary_cap_state_offset_ilp4_precert_cuda(
+extern "C" __global__ __launch_bounds__(256, 6) void tm_raceway_boundary_cap_state_offset_ilp4_precert_cuda(
 	uint32_t candidate_count, uint32_t logical_start, uint32_t* work_counter, uint8_t* alive_out,
 	uint8_t* drop_map_out, tm_raceway_stats* stats, uint32_t* state, unsigned long long** cap_tables,
 	const uint32_t* cap_bits, const uint32_t* cap_ways, uint32_t cap_count,
@@ -1687,7 +1687,7 @@ __device__ __forceinline__ void tm_raceway_span_state_liveidx_cap_offset_ilp_bod
 	}
 }
 
-extern "C" __global__ __launch_bounds__(256, 5) void tm_raceway_span_state_liveidx_cap_offset_ilp4_cuda(
+extern "C" __global__ __launch_bounds__(256, 6) void tm_raceway_span_state_liveidx_cap_offset_ilp4_cuda(
 	const uint32_t* live_idx, uint32_t live_count, uint32_t* work_counter, uint32_t* state, uint8_t* alive_out,
 	uint8_t* drop_map_out, tm_raceway_stats* stats, unsigned long long* cap_table, uint32_t cap_bits, uint32_t cap_ways,
 	const uint8_t* offset_regular_rng_values, const uint8_t* offset_alg0_values, const uint8_t* offset_alg6_values,
@@ -1956,4 +1956,160 @@ extern "C" __global__ __launch_bounds__(128) void tm_raceway_flat_parity_cuda(
 	}
 	atomicAdd(&counters[0], 1ull);
 	atomicAdd(&counters[1], 1ull);
+}
+
+// Hit compaction: scan the survivor list and emit ONLY survivors with a non-zero
+// continuation flag, packed as (orig << 8) | flag, into out_packed (count in out_count).
+// Replaces the host-side O(survivors) scan that walked ~2e7 survivors to find ~1e3 hits.
+// orig < wave_cap <= 2^23, so it fits in the upper 24 bits alongside the 8-bit flag.
+extern "C" __global__ void tm_raceway_collect_hits_cuda(
+	const uint32_t* live_idx,
+	uint32_t live_count,
+	const uint8_t* output_flags,
+	uint32_t* out_packed,
+	uint32_t* out_count,
+	uint32_t out_cap)
+{
+	const uint32_t stride = gridDim.x * blockDim.x;
+	for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < live_count; i += stride)
+	{
+		const uint32_t orig = live_idx[i];
+		const uint8_t f = output_flags[orig];
+		if (f != 0u)
+		{
+			const uint32_t idx = atomicAdd(out_count, 1u);
+			if (idx < out_cap) out_packed[idx] = (orig << 8) | static_cast<uint32_t>(f);
+		}
+	}
+}
+
+// ── Async device-driven cadence (2026-07-07) ────────────────────────────────
+// Device-count variants of the span/continue kernels: they read live_count from a
+// DEVICE pointer instead of a host value, so the host never has to DtoH the survivor
+// count between spans to size the next launch. Launched with a fixed fill-the-GPU
+// grid (span work-steals; continue's static map early-returns past *live_count_ptr),
+// so the whole per-batch cadence issues async on one stream with no per-span sync.
+// Math + FN-safe cap semantics are identical to the value-count kernels.
+extern "C" __global__ __launch_bounds__(256, 5) void tm_raceway_span_state_liveidx_cap_offset_ilp4_devcount_cuda(
+	const uint32_t* live_idx, const uint32_t* live_count_ptr, uint32_t* work_counter, uint32_t* state, uint8_t* alive_out,
+	uint8_t* drop_map_out, tm_raceway_stats* stats, unsigned long long* cap_table, uint32_t cap_bits, uint32_t cap_ways,
+	const uint8_t* offset_regular_rng_values, const uint8_t* offset_alg0_values, const uint8_t* offset_alg6_values,
+	const uint32_t* offset_alg2_values, const uint32_t* offset_alg5_values, const uint8_t* schedule_data,
+	uint32_t start_map, uint32_t end_map)
+{
+	tm_raceway_span_state_liveidx_cap_offset_ilp_body<4u>(live_idx, *live_count_ptr, work_counter, state, alive_out,
+		drop_map_out, stats, cap_table, cap_bits, cap_ways, offset_regular_rng_values, offset_alg0_values,
+		offset_alg6_values, offset_alg2_values, offset_alg5_values, schedule_data, start_map, end_map);
+}
+
+extern "C" __global__ __launch_bounds__(256, 4) void tm_raceway_continue_state_liveidx_offset_ilp4_static_devcount_cuda(
+	const uint32_t* live_idx, const uint32_t* live_count_ptr, const uint32_t* state, uint8_t* output_flags,
+	const uint8_t* offset_regular_rng_values, const uint8_t* offset_alg0_values, const uint8_t* offset_alg6_values,
+	const uint32_t* offset_alg2_values, const uint32_t* offset_alg5_values, const uint8_t* schedule_data,
+	const uint8_t* carnival_data, uint32_t schedule_start)
+{
+	tm_raceway_continue_state_liveidx_offset_static_body<4u>(live_idx, *live_count_ptr, state, output_flags,
+		offset_regular_rng_values, offset_alg0_values, offset_alg6_values, offset_alg2_values,
+		offset_alg5_values, schedule_data, carnival_data, schedule_start);
+}
+
+// ── Fused-tail megakernel (2026-07-07) ──────────────────────────────────────
+// Runs maps [start_map..26] entirely in REGISTERS for the post-first-cap survivors,
+// probing the inline tail caps (e.g. maps 6 and 16) and screening at map 26 — replacing
+// span+compact+span+compact+continue with ONE launch. State is read once from `state`
+// and NEVER written back (the whole point: eliminates the per-boundary 128B/candidate
+// VRAM round-trips). Dropped candidates (cap hit at a tail boundary) simply stop and go
+// idle for the rest of the maps (no work-stealing/repack) — the tradeoff we are measuring:
+// saved state I/O vs reduced effective occupancy in the later maps. FN-safe cap unchanged.
+// Flags: only survivors-to-26 get output_flags[orig] written (dropped ones stay 0 from the
+// batch memset), matching the compact+continue behaviour for hit extraction.
+template<uint32_t ILP>
+__device__ __forceinline__ void tm_raceway_fused_tail_body(
+	const uint32_t* live_idx, const uint32_t* live_count_ptr, uint32_t* work_counter,
+	const uint32_t* state, uint8_t* output_flags, uint32_t* survivor_counter,
+	unsigned long long** cap_tables, uint32_t cap_bits, uint32_t cap_ways,
+	const uint32_t* tail_boundary_maps, uint32_t n_tail_caps,
+	const uint8_t* offset_regular_rng_values, const uint8_t* offset_alg0_values, const uint8_t* offset_alg6_values,
+	const uint32_t* offset_alg2_values, const uint32_t* offset_alg5_values,
+	const uint8_t* schedule_data, const uint8_t* carnival_data, uint32_t start_map)
+{
+	const uint32_t lane = threadIdx.x & 31u;
+	const uint32_t live_count = *live_count_ptr;
+	uint32_t local_alive = 0u;
+
+	while (true)
+	{
+		uint32_t base = 0u;
+		if (lane == 0u) base = atomicAdd(work_counter, ILP);
+		base = __shfl_sync(0xFFFFFFFFu, base, 0);
+		if (base >= live_count) break;
+
+		const uint32_t valid = min(ILP, live_count - base);
+		uint32_t orig[ILP];
+		uint32_t working_value[ILP];
+		bool alive[ILP];
+		#pragma unroll
+		for (uint32_t j = 0u; j < ILP; ++j)
+		{
+			orig[j] = (j < valid) ? live_idx[base + j] : 0u;
+			working_value[j] = state[static_cast<size_t>(orig[j]) * 32u + lane];
+			alive[j] = (j < valid);
+		}
+
+		for (uint32_t map = start_map; map < 27u; ++map)
+		{
+			tm_raceway_run_one_map_offset_ilp<ILP>(working_value, lane, map,
+				offset_regular_rng_values, offset_alg0_values, offset_alg6_values,
+				offset_alg2_values, offset_alg5_values, schedule_data);
+
+			int cap_slot = -1;
+			#pragma unroll 1
+			for (uint32_t k = 0u; k < n_tail_caps; ++k)
+				if (tail_boundary_maps[k] == map) cap_slot = static_cast<int>(k);
+			if (cap_slot >= 0)
+			{
+				#pragma unroll
+				for (uint32_t j = 0u; j < ILP; ++j)
+				{
+					if (!alive[j]) continue;
+					const uint64_t fp = tm_strong64_state(working_value[j], lane);
+					bool drop = false;
+					if (lane == 0u)
+						drop = tm_raceway_cap_probe_or_keep(static_cast<unsigned long long>(fp),
+							cap_tables[cap_slot], cap_bits, cap_ways);
+					drop = __shfl_sync(0xFFFFFFFFu, drop, 0);
+					if (drop) alive[j] = false;
+				}
+			}
+		}
+
+		#pragma unroll
+		for (uint32_t j = 0u; j < ILP; ++j)
+		{
+			if (j >= valid || !alive[j]) continue;
+			const uint8_t flag = (carnival_data != nullptr) ? screen_candidate(working_value[j], lane, carnival_data) : 0u;
+			if (lane == 0u)
+			{
+				if (output_flags != nullptr) output_flags[orig[j]] = flag;
+				local_alive++;
+			}
+		}
+	}
+
+	if (lane == 0u && survivor_counter != nullptr) atomicAdd(survivor_counter, local_alive);
+}
+
+extern "C" __global__ __launch_bounds__(256, 5) void tm_raceway_fused_tail_ilp4_cuda(
+	const uint32_t* live_idx, const uint32_t* live_count_ptr, uint32_t* work_counter,
+	const uint32_t* state, uint8_t* output_flags, uint32_t* survivor_counter,
+	unsigned long long** cap_tables, uint32_t cap_bits, uint32_t cap_ways,
+	const uint32_t* tail_boundary_maps, uint32_t n_tail_caps,
+	const uint8_t* offset_regular_rng_values, const uint8_t* offset_alg0_values, const uint8_t* offset_alg6_values,
+	const uint32_t* offset_alg2_values, const uint32_t* offset_alg5_values,
+	const uint8_t* schedule_data, const uint8_t* carnival_data, uint32_t start_map)
+{
+	tm_raceway_fused_tail_body<4u>(live_idx, live_count_ptr, work_counter, state, output_flags, survivor_counter,
+		cap_tables, cap_bits, cap_ways, tail_boundary_maps, n_tail_caps,
+		offset_regular_rng_values, offset_alg0_values, offset_alg6_values, offset_alg2_values, offset_alg5_values,
+		schedule_data, carnival_data, start_map);
 }

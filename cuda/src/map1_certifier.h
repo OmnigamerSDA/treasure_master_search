@@ -141,15 +141,19 @@ inline void run_alg_for_trace(std::uint8_t alg_id, std::uint16_t* rng_seed, std:
 
 inline void ensure_rng_tables()
 {
-	RNG rng;
-	rng.generate_regular_rng_values_8();
-	rng.generate_alg0_values_8();
-	rng.generate_alg6_values_8();
-	rng.generate_seed_forward_1();
-	rng.generate_seed_forward_128();
-	rng.generate_alg2_values_32_8();
-	rng.generate_alg5_values_32_8();
-	rng.generate_expansion_values_8();
+	static const bool initialized = []() {
+		RNG rng;
+		rng.generate_regular_rng_values_8();
+		rng.generate_alg0_values_8();
+		rng.generate_alg6_values_8();
+		rng.generate_seed_forward_1();
+		rng.generate_seed_forward_128();
+		rng.generate_alg2_values_32_8();
+		rng.generate_alg5_values_32_8();
+		rng.generate_expansion_values_8();
+		return true;
+	}();
+	(void)initialized;
 }
 
 inline std::uint32_t certified_shed_mask_from_schedule_blob(

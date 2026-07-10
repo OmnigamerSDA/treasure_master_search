@@ -21,6 +21,7 @@ top-level directories.
 | `routing.h`                       | Shed-proxy routing helpers                 |
 | `key_file.h`                      | CSV/key-list parsing helper                |
 | `data_sizes.h`                    | Compile-time size constants                |
+| `other_world_shape.h`             | Other-world machine-code shape predicates (final-RTS / entry / control-flow / structural), used by the operator's CPU hit receiver |
 
 ## Caveats
 

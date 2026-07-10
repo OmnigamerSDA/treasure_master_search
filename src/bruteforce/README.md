@@ -15,7 +15,13 @@ make cpu        # research: native AVX/SIMD throughput benchmark
 make cpu-dedup  # research: state-dedup characterization tools
 make cuda
 make opencl
+make receiver   # inspect_bonus2_survivors — CPU hit verifier for the cert-tier operator
 ```
+
+`make receiver` (or `make -C src/bruteforce inspect_bonus2_survivors`) builds the
+CPU receiver that the operator's raceway clearing path forwards its checksum
+survivors to; see the repo-root README's "Clearing a keyspace (the operator)"
+section.
 
 Or build individual CPU tools in place:
 
@@ -106,8 +112,10 @@ README for raceway run + per-device calibration.
 
 ## Notes
 
-- `docs/forward_release_candidate_20260525.md` contains the current CPU/GPU
-  release-candidate profiling summary.
+- `docs/forward_release_candidate_20260525.md` is the historical (2026-05-25)
+  CPU/GPU screen/dedup release-candidate profiling summary — superseded by the
+  bounded-wave raceway, kept for provenance.
 - `docs/gpu_forward_benchmark_notes.md` contains the CUDA tuning history.
-- The public package is Makefile-first. Development-only legacy workers,
-  reverse search, and CNF/SAT tooling are intentionally omitted.
+- The public package is Makefile-first. The cert-tier operator
+  (`scripts/cert_tier_ops.py`) is included; development-only legacy BOINC/worker
+  packages, reverse search, and CNF/SAT tooling are intentionally omitted.

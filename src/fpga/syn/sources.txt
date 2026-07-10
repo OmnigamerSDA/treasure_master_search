@@ -1,0 +1,22 @@
+# Synthesis source manifest (VHDL-2008), compile order. Testbenches (tb_*.vhd)
+# and the ref/ dumpers are SIM-ONLY and excluded. All sources are vendor-neutral
+# VHDL-2008 (no primitives, no vendor IP) -> the same files synthesize under
+# Vivado / Quartus / Libero / Radiant; only constraints + flow scripts differ.
+tm_pkg.vhd
+tm_rng_gen.vhd
+tm_win_read.vhd
+tm_map_engine.vhd
+tm_map_engine_ram.vhd
+tm_map_engine_w.vhd
+tm_map_pipeline.vhd
+tm_screen_top.vhd
+tm_screen_batch.vhd
+tm_screen_w.vhd
+
+# Suggested OOC synthesis targets (top + what each measures):
+#   tm_map_engine     GROUP_UNROLL          per-core datapath + RNG row-select muxes
+#                                           (window is an external port -> excludes storage)
+#   tm_rng_gen        UNROLL_K              run_rng generator + window register/storage
+#   tm_map_engine_w   LANES, GROUP_UNROLL   W parallel lanes (throughput unit)
+#   tm_map_pipeline   N_STAGES, GROUP_UNROLL  unrolled forward (II=1.. throughput=clock)
+#   tm_screen_w       LANES, UNROLL_K, GROUP_UNROLL  integrated top

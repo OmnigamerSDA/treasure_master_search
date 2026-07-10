@@ -1983,7 +1983,9 @@ __device__ __forceinline__ void run_frontier_span_local_impl(
 	uint32_t fp_gate_log = 0u,
 	uint32_t* traj_sketch = nullptr, uint32_t traj_bits = 0u,
 	uint32_t traj_dens_tau = 0u, uint32_t traj_alg0_tau = 0u, uint32_t mult_tau = 0u,
-	unsigned long long* route_stats = nullptr)
+	unsigned long long* route_stats = nullptr,
+	uint32_t* hit_counter = nullptr, uint32_t* hit_data_out = nullptr, uint8_t* hit_flag_out = nullptr,
+	uint8_t* hit_state_out = nullptr, uint32_t hit_cap = 0u)
 {
 	constexpr uint32_t W = WARPS * ILP;
 	constexpr unsigned long long FP_MASK = 0xFFFFFFFFFFFFFF00ull;
@@ -2207,7 +2209,29 @@ __device__ __forceinline__ void run_frontier_span_local_impl(
 		{
 			const uint32_t s = block_base + cb + j;
 			const uint8_t f = screen_candidate(value[j], lane, carnival_data);
-			if (lane == 0u && s < M) flag_out[local_of[cb + j]] = f;
+			uint32_t hit_pos = 0xFFFFFFFFu;
+			if (lane == 0u && s < M)
+			{
+				const uint32_t local = local_of[cb + j];
+				flag_out[local] = f;
+				if (f != 0u && hit_counter != nullptr)
+					hit_pos = atomicAdd(hit_counter, 1u);
+			}
+			hit_pos = __shfl_sync(0xFFFFFFFFu, hit_pos, 0);
+			const uint8_t fb = __shfl_sync(0xFFFFFFFFu, f, 0);
+			if (hit_pos < hit_cap && fb != 0u && hit_data_out != nullptr && hit_flag_out != nullptr && hit_state_out != nullptr)
+			{
+				if (lane == 0u)
+				{
+					const uint32_t local = local_of[cb + j];
+					hit_data_out[hit_pos] = rep_data[local];
+					hit_flag_out[hit_pos] = fb;
+				}
+				const uint32_t decrypted_word = (fb & 0x01u)
+					? other_world_word(value[j], lane)
+					: (value[j] ^ reinterpret_cast<const uint32_t*>(carnival_data)[lane]);
+				reinterpret_cast<uint32_t*>(hit_state_out)[static_cast<size_t>(hit_pos) * 32u + lane] = decrypted_word;
+			}
 		}
 		return;
 	}
@@ -2259,6 +2283,24 @@ extern "C" __global__ __launch_bounds__((WARPS)*32u, 6) void NAME(              
 
 TM_FRONTIER_SPAN_LOCAL_KERNEL(run_frontier_span_local_w8i10_cuda, 8u, 10u, 256u)
 
+#define TM_FRONTIER_SPAN_LOCAL_EMIT_KERNEL(NAME, WARPS, ILP, NSLOTS)                             \
+extern "C" __global__ __launch_bounds__((WARPS) * 32u) void NAME(                                \
+	const uint32_t* live_idx, uint32_t M, const uint32_t* rep_data, uint32_t* state,              \
+	uint8_t* alive_out, uint32_t m0, uint32_t m1, int first_span,                                 \
+	const uint8_t* regular_rng_values, const uint8_t* alg0_values, const uint8_t* alg6_values,    \
+	const uint32_t* alg2_values, const uint32_t* alg5_values,                                     \
+	const uint8_t* expansion_values, const uint8_t* schedule_data,                                \
+	uint32_t key, const uint8_t* carnival_data, uint8_t* flag_out, int mode, uint32_t* multiplicity,\
+	uint32_t* hit_counter, uint32_t* hit_data_out, uint8_t* hit_flag_out, uint8_t* hit_state_out, uint32_t hit_cap)\
+{                                                                                                \
+	run_frontier_span_local_impl<(WARPS), (ILP), (NSLOTS)>(live_idx, M, rep_data, state, alive_out,\
+		m0, m1, first_span, regular_rng_values, alg0_values, alg6_values, alg2_values, alg5_values,\
+		expansion_values, schedule_data, key, carnival_data, flag_out, mode, multiplicity, nullptr, 0u, 0u, \
+		0u, 0u, 0u, nullptr, 0u, 0u, 0u, 0u, nullptr, hit_counter, hit_data_out, hit_flag_out, hit_state_out, hit_cap);\
+}
+
+TM_FRONTIER_SPAN_LOCAL_EMIT_KERNEL(run_frontier_span_local_emit_w8i10_cuda, 8u, 10u, 256u)
+
 // Pool B variant: same deep span but with a persistent cross-chunk cap probe at mode==1
 // (trailing cap_table/cap_bits/cap_ways params). The producer launches this when
 // --map1-frontier-drain-cap-bits is set; the cap is allocated + zeroed ONCE and persists
@@ -2279,6 +2321,25 @@ extern "C" __global__ __launch_bounds__((WARPS)*32u, 6) void NAME(              
 }
 
 TM_FRONTIER_SPAN_LOCAL_CAP_KERNEL(run_frontier_span_local_cap_w8i10_cuda, 8u, 10u, 256u)
+
+#define TM_FRONTIER_SPAN_LOCAL_CAP_EMIT_KERNEL(NAME, WARPS, ILP, NSLOTS)                         \
+extern "C" __global__ __launch_bounds__((WARPS) * 32u) void NAME(                                \
+	const uint32_t* live_idx, uint32_t M, const uint32_t* rep_data, uint32_t* state,              \
+	uint8_t* alive_out, uint32_t m0, uint32_t m1, int first_span,                                 \
+	const uint8_t* regular_rng_values, const uint8_t* alg0_values, const uint8_t* alg6_values,    \
+	const uint32_t* alg2_values, const uint32_t* alg5_values,                                     \
+	const uint8_t* expansion_values, const uint8_t* schedule_data,                                \
+	uint32_t key, const uint8_t* carnival_data, uint8_t* flag_out, int mode, uint32_t* multiplicity,\
+	unsigned long long* cap_table, uint32_t cap_bits, uint32_t cap_ways,                         \
+	uint32_t* hit_counter, uint32_t* hit_data_out, uint8_t* hit_flag_out, uint8_t* hit_state_out, uint32_t hit_cap)\
+{                                                                                                \
+	run_frontier_span_local_impl<(WARPS), (ILP), (NSLOTS)>(live_idx, M, rep_data, state, alive_out,\
+		m0, m1, first_span, regular_rng_values, alg0_values, alg6_values, alg2_values, alg5_values,\
+		expansion_values, schedule_data, key, carnival_data, flag_out, mode, multiplicity, cap_table, cap_bits, cap_ways, \
+		0u, 0u, 0u, nullptr, 0u, 0u, 0u, 0u, nullptr, hit_counter, hit_data_out, hit_flag_out, hit_state_out, hit_cap);\
+}
+
+TM_FRONTIER_SPAN_LOCAL_CAP_EMIT_KERNEL(run_frontier_span_local_cap_emit_w8i10_cuda, 8u, 10u, 256u)
 
 // Pool B + shed-routing variant: extends the cap variant with shed-proxy pre-filtering at
 // MAP1. During mode==0 (MAP1 span), survivors with shed-count (alg0/alg6 ops) < shed_tau
@@ -2410,6 +2471,37 @@ extern "C" __global__ __launch_bounds__(256) void compact_survivors_ordered_cuda
 	if (a)
 	{
 		const uint32_t pos = s_base + s_scan[threadIdx.x] - 1u;  // inclusive→exclusive
+		out_live[pos] = first_span ? tid : live_idx_in[tid];
+	}
+}
+
+// Device-count compaction (2026-07-07, async cadence): identical to
+// compact_survivors_ordered_cuda but reads the input length M from a DEVICE pointer,
+// so the host does not DtoH the prior stage's survivor count to size this launch. Grid
+// is fixed to cover the batch max; blocks with tid >= *M_ptr fall through the guard.
+extern "C" __global__ __launch_bounds__(256) void compact_survivors_ordered_devcount_cuda(
+	const uint8_t* alive_in, const uint32_t* live_idx_in, const uint32_t* M_ptr,
+	uint32_t* out_live, uint32_t* counter, int first_span)
+{
+	__shared__ uint32_t s_scan[256];
+	__shared__ uint32_t s_base;
+	const uint32_t M = *M_ptr;
+	const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+	const uint32_t a = (tid < M && alive_in[tid] != 0u) ? 1u : 0u;
+	s_scan[threadIdx.x] = a;
+	__syncthreads();
+	for (uint32_t off = 1u; off < blockDim.x; off <<= 1)
+	{
+		uint32_t v = (threadIdx.x >= off) ? s_scan[threadIdx.x - off] : 0u;
+		__syncthreads();
+		s_scan[threadIdx.x] += v;
+		__syncthreads();
+	}
+	if (threadIdx.x == blockDim.x - 1u) s_base = atomicAdd(counter, s_scan[threadIdx.x]);
+	__syncthreads();
+	if (a)
+	{
+		const uint32_t pos = s_base + s_scan[threadIdx.x] - 1u;
 		out_live[pos] = first_span ? tid : live_idx_in[tid];
 	}
 }
@@ -5789,6 +5881,33 @@ extern "C" __global__ __launch_bounds__(256) void tm_map1_frontier_compact_data_
 	{
 		const uint32_t pos = s_base + s_scan[threadIdx.x] - 1u;
 		rep_out[pos] = data_start + tid;
+	}
+}
+
+extern "C" __global__ __launch_bounds__(256) void tm_map1_frontier_compact_data_mask_cuda(
+	const uint8_t* unique_in, uint32_t candidate_count,
+	uint32_t fixed_value, uint32_t candidate_start, uint32_t selected_mask,
+	uint32_t* rep_out, uint32_t* counter)
+{
+	__shared__ uint32_t s_scan[256];
+	__shared__ uint32_t s_base;
+	const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+	const uint32_t a = (tid < candidate_count && unique_in[tid] != 0u) ? 1u : 0u;
+	s_scan[threadIdx.x] = a;
+	__syncthreads();
+	for (uint32_t off = 1u; off < blockDim.x; off <<= 1)
+	{
+		uint32_t v = (threadIdx.x >= off) ? s_scan[threadIdx.x - off] : 0u;
+		__syncthreads();
+		s_scan[threadIdx.x] += v;
+		__syncthreads();
+	}
+	if (threadIdx.x == blockDim.x - 1u) s_base = atomicAdd(counter, s_scan[threadIdx.x]);
+	__syncthreads();
+	if (a)
+	{
+		const uint32_t pos = s_base + s_scan[threadIdx.x] - 1u;
+		rep_out[pos] = fixed_value | tm_deposit_bits32(candidate_start + tid, selected_mask);
 	}
 }
 

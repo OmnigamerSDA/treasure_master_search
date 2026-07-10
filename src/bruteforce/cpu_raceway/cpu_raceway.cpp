@@ -329,7 +329,7 @@ static void worker(int id, std::uint64_t lo, std::uint64_t hi){
 
   if(g_cap_on){
     if(recompute) dwave.reserve(g_wave_N);                                            // 4 B/rep, 32x smaller
-    else { in_buf.resize((std::size_t)g_wave_N*128); out_buf.resize((std::size_t)g_wave_N*128); }
+    else { in_buf.resize((std::size_t)g_wave_N*128); (void)out_buf; }   // out_buf is unused by drain_wave_cap (it compacts in place) — don't allocate it
   } else { o.set_dynamic(false); sc.set_dynamic(false); o.reset(g_wave_N); }
 
   auto stream_rep=[&](const std::uint8_t* st, std::uint32_t dval){

@@ -1,0 +1,24 @@
+{
+  "created_utc": "2026-07-10T04:50:28.329471+00:00",
+  "rank_array": "common/results/certify_sweep/rank_array.bin",
+  "rank_array_size": 4294967296,
+  "min_bits": 16,
+  "max_bits_exclusive": 18,
+  "format": "bin32u8",
+  "max_keys": 64,
+  "shard_weights": [
+    1.0
+  ],
+  "total_keys": 64,
+  "tier_counts": {
+    "16": 64
+  },
+  "shards": [
+    {
+      "index": 0,
+      "path": "examples/cert16_sample/keys_cert_ge16_shard00.bin5",
+      "count": 64,
+      "bytes": 320
+    }
+  ]
+}
