@@ -1731,9 +1731,23 @@ def command_run(args: argparse.Namespace) -> int:
                 dev_state[_d]["drained"] = True
                 print(f"device={_d} no pending work", flush=True)
 
+        daemon_stop_signalled = False
         while True:
             stop = stop_requested(conn)
             time_up = bool(args.stop_after_min) and (time.monotonic() - start) >= args.stop_after_min * 60.0
+            # Mid-batch stop: a resident daemon only reads a stdin STOP *between* batches, which can be many
+            # minutes into an 8000-key batch. Writing its per-device stop-file (stable across batches) makes
+            # the engine break at its next key boundary (checked per key), so q / request-stop / stop-after-min
+            # take effect in ~1 key instead of a whole batch. The batch-boundary STOP below still covers a
+            # daemon caught between batches.
+            if (stop or time_up) and not daemon_stop_signalled:
+                daemon_stop_signalled = True
+                for _d in devices:
+                    st_d = dev_state[_d]
+                    if st_d.get("daemon") is not None and st_d.get("batch") is not None and not st_d.get("drained"):
+                        request_worker_stop(st_d["batch"])
+                print(f"{'stop requested' if stop else 'stop-after-min reached'}; "
+                      "daemon workers stop after their current key", flush=True)
             harvest_pending_verifies()
             if not any(dev_state[_d].get("daemon") is not None for _d in devices):
                 drain_pending_verifies()
@@ -1745,7 +1759,10 @@ def command_run(args: argparse.Namespace) -> int:
             st = dev_state[dev]
             if ev == "done":
                 batch = st["batch"]
-                ingest_summary(conn, batch, 0, missing_pending=False)
+                stopping = bool(stop or time_up or (args.loops and st["batches"] >= args.loops))
+                # On a mid-batch stop the summary is PARTIAL; return the unprocessed leased keys to 'pending'
+                # (missing_pending) rather than failing them, so a resumed run re-leases them.
+                ingest_summary(conn, batch, 0, missing_pending=stopping)
                 if args.engine == "raceway" and not args.sync_verify:
                     pv = start_raceway_verify(batch.run_id, dev, batch, args.alert_linear_score,
                                               args.inspect_binary, alerts_path, args.keep_raceway_provenance)
@@ -1755,7 +1772,7 @@ def command_run(args: argparse.Namespace) -> int:
                 else:
                     alerts = alerts_for_batch(conn, args, batch, alerts_path)
                     print(f"{batch.run_id} device={dev} batch-done alerts={alerts}", flush=True)
-                if stop or time_up or (args.loops and st["batches"] >= args.loops):
+                if stopping:
                     send_stop(dev)
                     continue
                 nb = lease_batch(conn, args, dev, out_dir)
