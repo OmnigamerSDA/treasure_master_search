@@ -36,6 +36,22 @@ Development-tree raw logs and CSV summaries:
 | `0xceadd933` | diffuse | 0 | 221.6 M/s | 131.8 M/s | 12.0 M/s |
 | `0xdeadbeef` | mid | 2 | 857.8 M/s | 542.9 M/s | 52.8 M/s |
 
+## Update 2026-07-15 (current in-tree binary)
+
+Re-measured on the same 8-key set / methodology (represented `W=268435456`, cadence
+`2,5,10,16`, wave 4M, cap `2^27x4`, span-ILP 4), current in-tree CUDA fatbin, median-of-5:
+
+| Backend | Hardware/config | 8-key HM | Diffuse HM |
+|---|---|---:|---:|
+| CUDA | RTX 5090, production wave-state raceway | ~480 M/s | ~290 M/s |
+| CUDA | RTX PRO 6000 Blackwell Max-Q | ~344 M/s | — |
+
+~+15% vs the 2026-06-18 baseline above, uniform across all 8 keys — the cumulative effect
+of everything landed since (13.3+ACF fatbin, the `(256,5)` occupancy fix, offset-stream
+prefetch, GPU hit-compaction, and the wave-buffer memfree / drain-placement cleanups). Per-key
+5090 (median-of-5, represented M/s): `0xb2e8c4ac` 46210, `0x65a37ee7` 55577, `0x2ca5b42d` 530,
+`0x9e3779b9` 318, `0x6f2c81a4` 346, `0x9e9d137b` 262, `0xceadd933` 254, `0xdeadbeef` 983.
+
 ## Reading
 
 Precert changes the workload shape sharply for certified collapse keys. The two

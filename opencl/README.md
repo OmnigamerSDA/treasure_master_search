@@ -67,7 +67,7 @@ Regime-dependent: collapse keys are fast, the diffuse keys are the long pole.
 
 | Device | Raceway throughput |
 |---|---:|
-| NVIDIA RTX 5090 | ~264 M represented/s default-precert HM (8-key W256M); ~64% of CUDA |
+| NVIDIA RTX 5090 | ~264 M represented/s default-precert HM (8-key W256M; 2026-06-18) |
 | AMD RX 7800 XT (RDNA3, 30 CU, 16 GB, fp64 cap) | ~58 M/s cap-span aggregate; ~40 M/s diffuse, ~120 M/s collapse (≈0.21× a 5090's OpenCL raceway) |
 | AMD Ryzen iGPU (gfx1036, 1 CU) | ~2.2–2.8 M/s — runs the full fp64-cap pipeline; viable as a floor / CI smoke target |
 

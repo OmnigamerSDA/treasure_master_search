@@ -4361,8 +4361,14 @@ int main(int argc, char** argv)
 					const uint32_t cadence_wave_cap = (!wave_cadence_plans.empty())
 						? static_cast<uint32_t>(std::min<uint64_t>(args.raceway_direct_wave_continue_batch, direct_total))
 						: 0u;
+					// Invalidate the device-buffer cache when this key's shape (wave_cap, cap geometry,
+					// capture toggles) differs from the cached allocation. The "cache populated" signal is
+					// wave_work_counter, NOT d_direct_ostream: in the offset-prefetch fast path the offset
+					// stream is served from race_stage.dbuf and cache.d_direct_ostream is never repopulated,
+					// so gating on it would silently disable this guard after the first release() (leaving the
+					// wave buffers frozen at a stale size -> memset overflow on a later wider-window key).
 					if (raceway_worker_batch_reuse
-						&& raceway_worker_cache.d_direct_ostream != 0
+						&& raceway_worker_cache.wave_work_counter != 0
 						&& !raceway_worker_cache.matches(osb.data.size(), cap_count, args.raceway_cap_bits,
 							args.raceway_cap_ways, cadence_wave_cap, raceway_capture_flags,
 							args.raceway_direct_wave_parity, args.raceway_drop_hist))
@@ -4379,6 +4385,10 @@ int main(int argc, char** argv)
 							// wait on the upload event -- always already signalled, so no host stall and no per-key
 							// synchronous HtoD (the ~0.8-1.6ms upload is fully hidden behind the previous key's compute).
 							d_direct_ostream = race_stage.dbuf[race_prepared.upload_slot];
+							// The offset stream is served from race_stage.dbuf here, so the cache never allocates
+							// its own copy -- but matches() still compares offset_bytes, so keep it current (it
+							// otherwise reverts to 0 after a release(), forcing a needless realloc every key).
+							raceway_worker_cache.offset_bytes = osb.data.size();
 							const auto htod0 = std::chrono::high_resolution_clock::now();
 							check_cuda(cuStreamWaitEvent(0, race_stage.ev_upload[race_prepared.upload_slot], 0), "raceway prefetch offset wait");
 							const auto htod1 = std::chrono::high_resolution_clock::now();

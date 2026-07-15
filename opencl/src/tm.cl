@@ -23,7 +23,7 @@
 //   resolve_flags           — union-find chain resolution for compaction
 //
 // Kernels (PRODUCTION engine: bounded-wave raceway — best across throughput AND memory,
-// the 2026-06-16 default; OpenCL reaches ~64% of CUDA on RTX 5090 default-precert HM):
+// the 2026-06-16 default; OpenCL reaches ~264 M represented/s on RTX 5090 default-precert HM, 2026-06-18):
 //   raceway_boundary_cap_mark_offset   — direct offset-stream cap mark pass
 //   raceway_boundary_cap_state_offset  — cap-span originate (carries boundary state)
 //   raceway_span_state_liveidx_cap_offset — per-boundary cap-drain span

@@ -77,7 +77,10 @@ struct RacewayWorkerDeviceCache
 		uint32_t cap_ways_in, uint32_t wave_cap_in, bool wave_flags_in,
 		bool flat_parity_in, bool drop_hist_in) const
 	{
-		return d_direct_ostream != 0
+		// wave_work_counter is the "cache populated" signal (present in both the sync and
+		// offset-prefetch paths); d_direct_ostream is NOT, because the prefetch fast path serves
+		// the offset stream from race_stage.dbuf and never populates the cache's own copy.
+		return wave_work_counter != 0
 			&& offset_bytes == offset_bytes_in
 			&& cap_count == cap_count_in
 			&& cap_bits == cap_bits_in

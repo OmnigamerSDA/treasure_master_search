@@ -22,7 +22,7 @@ BOINC/worker packages remain in the development repo.
 |------------------|------------------------------------------------------------------------|
 | Forward CPU      | **Bounded-wave raceway (production)** + AVX/SIMD screen baseline        |
 | Forward CUDA     | **Raceway (production)**, per-device `--calibrate-raceway`; screen baseline |
-| Forward OpenCL   | **Raceway (production)**, ~64% of CUDA on same-GPU default-precert HM; screen baseline |
+| Forward OpenCL   | **Raceway (production)**, ~264 M represented/s on an RTX 5090 (2026-06-18); screen baseline |
 | Forward FPGA     | VHDL map/RNG/screen engines + self-checking testbenches + OOC synth scripts (`src/fpga/`) |
 | Operator         | Durable cert-tier queue/runner (`scripts/cert_tier_ops.py`): background verify, event-driven reap, optional persistent-worker `--daemon`; ships with a runnable cert16 sample DB |
 
@@ -52,9 +52,9 @@ Production raceway, full-key `2^32`, FN-safe (flat memory set by the cap):
 
 | Backend | Hardware | Raceway throughput |
 |---|---|---:|
-| CUDA   | RTX 5090 | ~415 M represented/s default-precert HM (8-key W256M); ~252 M/s diffuse HM |
-| CUDA   | RTX PRO 6000 Blackwell Max-Q | ~0.8x the 5090 (clock-bound) |
-| OpenCL | RTX 5090 | ~264 M represented/s default-precert HM (same 8-key W256M); ~64% of CUDA |
+| CUDA   | RTX 5090 | ~480 M represented/s default-precert HM (8-key W256M); ~290 M/s diffuse HM (2026-07-15) |
+| CUDA   | RTX PRO 6000 Blackwell Max-Q | ~344 M represented/s (same 8-key W256M, clock-bound; 2026-07-15) |
+| OpenCL | RTX 5090 | ~264 M represented/s default-precert HM (same 8-key W256M; 2026-06-18) |
 | OpenCL | non-NVIDIA GPU | portable raceway; RDNA3 remains the main non-NVIDIA validation target |
 | CPU    | Ryzen 9 9900X, AVX-512, 24t | ~22.9 M represented/s default-precert HM (same 8-key W256M); ~13.5 diffuse HM |
 

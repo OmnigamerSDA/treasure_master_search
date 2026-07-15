@@ -25,6 +25,8 @@ runs ONE resident worker per device (batches fed over its stdin, no per-batch CU
 low-cert tiers; needs a daemon-capable --binary. Per-tier wave geometry is operator-driven via the
 --raceway-* flags; you may plug in validated per-tier tuning through a cert_tier_geometry_override.py hook
 (see _load_tier_geometry_override).
+--resume replays the most-recently-used run/operate flags (saved under ~/.cert_tier_ops/), so a recurring
+launch is just `operate --resume`; flags passed alongside it override the saved values.
 """
 
 from __future__ import annotations
@@ -1711,7 +1713,11 @@ def command_run(args: argparse.Namespace) -> int:
             conn.execute("UPDATE runs SET status='running' WHERE run_id=?", (batch.run_id,))
             conn.commit()
             st = dev_state[device]
-            st.update(daemon=proc, batch=batch, batches=st["batches"] + 1, daemon_log=log_fh, last_ingested=0)
+            # The daemon is launched with THIS batch's stop-file (--worker-stop-file) and watches only that
+            # path for its whole life; later batches (fed over stdin) get new run_ids/stop-files the engine
+            # never sees. Remember the launch path so a mid-batch stop writes the one the daemon is watching.
+            st.update(daemon=proc, batch=batch, batches=st["batches"] + 1, daemon_log=log_fh, last_ingested=0,
+                      daemon_stop_file=batch.stop_file)
 
             def _reader(p=proc, dev=device):
                 try:
@@ -1736,16 +1742,19 @@ def command_run(args: argparse.Namespace) -> int:
             stop = stop_requested(conn)
             time_up = bool(args.stop_after_min) and (time.monotonic() - start) >= args.stop_after_min * 60.0
             # Mid-batch stop: a resident daemon only reads a stdin STOP *between* batches, which can be many
-            # minutes into an 8000-key batch. Writing its per-device stop-file (stable across batches) makes
-            # the engine break at its next key boundary (checked per key), so q / request-stop / stop-after-min
-            # take effect in ~1 key instead of a whole batch. The batch-boundary STOP below still covers a
-            # daemon caught between batches.
+            # minutes into an 8000-key batch. Writing the daemon's LAUNCH stop-file (the fixed --worker-stop-file
+            # it was started with — NOT the current batch's, which is a different per-run_id path it never
+            # watches) makes the engine break at its next key boundary (checked per key), so q / request-stop /
+            # stop-after-min take effect in ~1 key instead of a whole batch. The batch-boundary STOP below still
+            # covers a daemon caught between batches.
             if (stop or time_up) and not daemon_stop_signalled:
                 daemon_stop_signalled = True
                 for _d in devices:
                     st_d = dev_state[_d]
-                    if st_d.get("daemon") is not None and st_d.get("batch") is not None and not st_d.get("drained"):
-                        request_worker_stop(st_d["batch"])
+                    sf = st_d.get("daemon_stop_file")
+                    if st_d.get("daemon") is not None and sf is not None and not st_d.get("drained"):
+                        sf.parent.mkdir(parents=True, exist_ok=True)
+                        sf.write_text(f"stop_requested_at={utc_now()}\n", encoding="ascii")
                 print(f"{'stop requested' if stop else 'stop-after-min reached'}; "
                       "daemon workers stop after their current key", flush=True)
             harvest_pending_verifies()
@@ -2036,6 +2045,9 @@ def add_run_args(run: argparse.ArgumentParser) -> None:
         default="src/bruteforce/inspect_bonus2_survivors",
         help="CPU receiver that forwards+verifies raceway other-world/dual hit candidates.",
     )
+    run.add_argument("--resume", action="store_true",
+        help="Reuse the most-recently-launched run/operate args (db/out-dir/devices/tuning/etc.) saved under "
+        "~/.cert_tier_ops/. Flags passed alongside --resume override the saved values.")
     run.add_argument("--loops", type=int, default=1, help="Batch rounds to run; 0 means until no pending work.")
     run.add_argument("--stop-after-min", type=float, default=0.0, help="Do not lease a new batch after this many minutes.")
     run.add_argument("--daemon", action="store_true",
@@ -2105,6 +2117,36 @@ def add_run_args(run: argparse.ArgumentParser) -> None:
     run.add_argument("--dry-run", action="store_true")
 
 
+# "Most recent" launch memory: every real run/operate records its resolved launch args here, and
+# `run --resume` / `operate --resume` replays them so a recurring launch needs no flags. Explicit
+# flags passed alongside --resume still win (they override the saved values, which enter as defaults).
+_RESUME_STATE_FILE = Path.home() / ".cert_tier_ops" / "last-processing.json"
+# Never persisted/replayed: the subcommand itself, --resume, and one-shot preview flag --dry-run.
+_RESUME_EXCLUDE = {"command", "resume", "dry_run"}
+
+
+def _load_resume_state() -> dict:
+    try:
+        with _RESUME_STATE_FILE.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_resume_state(args: argparse.Namespace) -> None:
+    payload = {
+        k: v for k, v in vars(args).items()
+        if k not in _RESUME_EXCLUDE and isinstance(v, (str, int, float, bool, type(None)))
+    }
+    try:
+        _RESUME_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with _RESUME_STATE_FILE.open("w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2, sort_keys=True)
+    except OSError:
+        pass  # best-effort; a state-save failure must never block a run
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -2155,11 +2197,30 @@ def parse_args() -> argparse.Namespace:
 
     clear_stop = sub.add_parser("clear-stop", help="RESUME: clear a pending pause/stop request so a subsequent run continues.")
     clear_stop.add_argument("--db", default="common/results/tier_ops/queue.sqlite")
+
+    # --resume: fold the last-launched run/operate args in as defaults so any flags the user does pass
+    # still override them. A pre-parse just detects the subcommand + --resume before the real parse.
+    resume_targets = {"run": run, "operate": operate}
+    pre, _ = parser.parse_known_args()
+    if getattr(pre, "resume", False) and pre.command in resume_targets:
+        saved = _load_resume_state()
+        if saved:
+            target = resume_targets[pre.command]
+            valid = {a.dest for a in target._actions}
+            target.set_defaults(**{k: v for k, v in saved.items() if k in valid})
+            print(f"[cert_tier_ops] --resume: reusing last {pre.command} args from {_RESUME_STATE_FILE}",
+                  file=sys.stderr)
+        else:
+            print(f"[cert_tier_ops] --resume: no saved args at {_RESUME_STATE_FILE}; using defaults",
+                  file=sys.stderr)
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    # Record this launch as the new "most recent" for --resume (skip dry-run previews).
+    if args.command in ("run", "operate") and not getattr(args, "dry_run", False):
+        _save_resume_state(args)
     if args.command == "init":
         return command_init(args)
     if args.command == "status":

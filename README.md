@@ -20,7 +20,7 @@ retained as **research / A-B comparisons** and as the bit-exact parity
 reference, but are no longer the default.
 
 - **CUDA** — fastest; the raceway on NVIDIA GPUs.
-- **OpenCL** — portable raceway for AMD/Intel/Apple/other non-NVIDIA GPUs; ~64% of CUDA on the same RTX 5090 default-precert HM.
+- **OpenCL** — portable raceway for AMD/Intel/Apple/other non-NVIDIA GPUs (~264 M represented/s on an RTX 5090, 2026-06-18).
 - **CPU** — the raceway for hosts without a GPU (AVX-512 / AVX2), auto-configured per host.
 
 ## Quick Build
@@ -139,8 +139,11 @@ plug in a validated per-tier table via a `cert_tier_geometry_override.py` hook
 (see `_load_tier_geometry_override`). For the big low-cert tiers add `--daemon`
 (one resident worker per device). `--sync-verify` forces blocking verification;
 `request-stop` / `clear-stop` pause and resume; `reset-running` recovers leases
-after a hard crash. `cert_tier_ops.py --help` and each subcommand's `--help`
-document the full surface.
+after a hard crash. `--resume` re-launches with the most-recently-used
+`run`/`operate` flags (saved under `~/.cert_tier_ops/`), so a recurring launch
+needs no flags — e.g. `cert_tier_ops.py operate --resume`; any flag you pass
+alongside it overrides the saved value. `cert_tier_ops.py --help` and each
+subcommand's `--help` document the full surface.
 
 ## Reference Performance
 
@@ -150,12 +153,12 @@ a representative key mix.
 
 | Path | Hardware | Raceway throughput |
 |---|---|---:|
-| CUDA | RTX 5090 | ~415 M represented/s default-precert HM (8-key W256M); ~252 M/s diffuse HM |
-| CUDA | RTX PRO 6000 Blackwell Max-Q | ~0.8× the 5090 (clock-bound) |
-| OpenCL | NVIDIA RTX 5090 | ~264 M represented/s default-precert HM (same 8-key W256M); ~64% of CUDA |
+| CUDA | RTX 5090 | ~480 M represented/s default-precert HM (8-key W256M); ~290 M/s diffuse HM (2026-07-15) |
+| CUDA | RTX PRO 6000 Blackwell Max-Q | ~344 M represented/s (same 8-key W256M, clock-bound; 2026-07-15) |
+| OpenCL | NVIDIA RTX 5090 | ~264 M represented/s default-precert HM (same 8-key W256M; 2026-06-18) |
 | OpenCL | AMD RX 7800 XT (RDNA3) | ~70 M/s (updated OpenCL raceway) |
 | OpenCL | AMD Ryzen iGPU (1 CU) | runs the full pipeline (portability floor / CI-smoke) |
-| CPU (AVX-512) | Ryzen 9 9900X, 24 threads | ~22.9 M represented/s default-precert HM (same 8-key W256M); ~13.5 M/s diffuse HM |
+| CPU (AVX-512) | Ryzen 9 9900X, 24 threads | ~22.9 M represented/s default-precert HM (same 8-key W256M); ~13.5 M/s diffuse HM (2026-06-18) |
 | CPU (AVX2) | host without AVX-512 | ~0.7× the AVX-512 raceway |
 
 Per-device GPU tuning: `tm_cuda --calibrate-raceway` sweeps span-ILP × cap-bits

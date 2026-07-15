@@ -104,7 +104,7 @@ origin tracking) are documented in each tool's `--help`.
 
 The GPU engines live in `cuda/` and `opencl/` with their own READMEs. Both run
 the **bounded-wave raceway** as the production engine (CUDA fastest on NVIDIA;
-OpenCL measured ~64% of CUDA on the same RTX 5090 default-precert HM); the flat screen / compaction paths
+OpenCL measured ~264 M represented/s on an RTX 5090, 2026-06-18); the flat screen / compaction paths
 are research/baseline only. Supported production raceway launches enable the
 same MAP1 certified-shed pre-exclusion by default; disable with `--no-precert`.
 Build with `make cuda` / `make opencl` from the repo root, then see the package

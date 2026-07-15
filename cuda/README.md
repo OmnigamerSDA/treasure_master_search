@@ -58,8 +58,8 @@ Full-key `2^32`, FN-safe, flat memory (set by the cap, not the window):
 
 | GPU | Raceway throughput |
 |---|---:|
-| RTX 5090 | ~415 M represented/s default-precert HM (8-key W256M); ~252 M/s diffuse HM |
-| RTX PRO 6000 Blackwell Max-Q | ~0.8× the 5090 (clock-bound) |
+| RTX 5090 | ~480 M represented/s default-precert HM (8-key W256M); ~290 M/s diffuse HM (2026-07-15) |
+| RTX PRO 6000 Blackwell Max-Q | ~344 M represented/s (same 8-key W256M, clock-bound; 2026-07-15) |
 
 Tune once per device with `tm_cuda --calibrate-raceway` (sweeps span-ILP ×
 cap-bits, records `engine=raceway …` to `tm_compaction.conf`); production raceway
